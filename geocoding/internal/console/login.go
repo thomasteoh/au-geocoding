@@ -243,6 +243,10 @@ func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
 	s.IDs.DeleteSession(r.Context(), v.Session.IDHash)
 	clearCookie(w, sessionCookie, http.SameSiteLaxMode)
 	s.audit(r, 0, "logout", "", v.Session.Method)
+	if u, ok := s.samlLogoutURL(r, v.Session); ok {
+		http.Redirect(w, r, u, http.StatusSeeOther)
+		return
+	}
 	if v.Session.ConnectionID != 0 && (v.Session.Method == identity.KindOIDC) {
 		if c, err := s.IDs.ConnectionByID(r.Context(), v.Session.ConnectionID); err == nil {
 			if u, ok := s.RP.EndSessionURL(r.Context(), c, v.Session.IDToken, s.abs("/auth/login")); ok {
