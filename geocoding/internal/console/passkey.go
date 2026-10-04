@@ -228,6 +228,12 @@ func (s *Server) handlePasskeyDelete(w http.ResponseWriter, r *http.Request) {
 		redirectFlash(w, r, "/console/account", "That passkey was not found.")
 		return
 	}
+	// Same freshness rule as registering: a stolen passkey session must not
+	// be able to strip the owner's other passkeys.
+	if v.Session.Method == "passkey" || passkeyNow().Sub(v.Session.Created) > passkeyFreshness {
+		redirectFlash(w, r, "/console/account", "Sign in again with single sign-on to remove a passkey.")
+		return
+	}
 	if err := s.IDs.DeletePasskey(r.Context(), v.User.ID, id); err != nil {
 		if errors.Is(err, identity.ErrNotFound) {
 			redirectFlash(w, r, "/console/account", "That passkey was not found.")

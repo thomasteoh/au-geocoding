@@ -209,7 +209,7 @@ func (b *browser) signedIn() bool {
 	return b.get("/console/account").Status == http.StatusOK
 }
 
-func (h *harness) lastAudit(orgID int64) identity.AuditEvent {
+func (h *harness) latestAudit(orgID int64) identity.AuditEvent {
 	h.t.Helper()
 	ev, err := h.ids.AuditLog(h.ctx, orgID, 0, 1)
 	if err != nil || len(ev) == 0 {
@@ -243,7 +243,7 @@ func TestSAMLLoginEndToEnd(t *testing.T) {
 	if err != nil || u.Name != "Ada Lovelace" {
 		t.Fatalf("user: %+v %v", u, err)
 	}
-	if e := h.lastAudit(0); e.Action != "login.success" || !strings.Contains(e.Detail, "saml via corp-saml") {
+	if e := h.latestAudit(0); e.Action != "login.success" || !strings.Contains(e.Detail, "saml via corp-saml") {
 		t.Fatalf("audit: %+v", e)
 	}
 
@@ -311,7 +311,7 @@ func TestSAMLRejectsBadSignatures(t *testing.T) {
 			if r.Status != http.StatusBadRequest || !strings.Contains(r.Body, "did not complete") || b.signedIn() {
 				t.Fatalf("accepted: %d %s", r.Status, r.Location)
 			}
-			if e := h.lastAudit(0); e.Action != "login.failed" || e.Detail != "saml_invalid" {
+			if e := h.latestAudit(0); e.Action != "login.failed" || e.Detail != "saml_invalid" {
 				t.Fatalf("audit: %+v", e)
 			}
 			if _, err := h.ids.UserByEmail(h.ctx, "ada@example.com"); err == nil {
@@ -353,7 +353,7 @@ func TestSAMLRejectsWrongRequestAndReplay(t *testing.T) {
 	if r = b3.samlPost("corp-saml", form); r.Status != http.StatusBadRequest || b3.signedIn() {
 		t.Fatalf("replay under new flow: %d %s", r.Status, r.Location)
 	}
-	if e := h.lastAudit(0); e.Detail != "saml_invalid" {
+	if e := h.latestAudit(0); e.Detail != "saml_invalid" {
 		t.Fatalf("audit: %+v", e)
 	}
 }
@@ -369,7 +369,7 @@ func TestSAMLRejectsIdPInitiated(t *testing.T) {
 	if r.Status != http.StatusBadRequest || b.signedIn() {
 		t.Fatalf("idp-initiated: %d %s", r.Status, r.Location)
 	}
-	if e := h.lastAudit(0); e.Detail != "saml_idp_initiated" {
+	if e := h.latestAudit(0); e.Detail != "saml_idp_initiated" {
 		t.Fatalf("audit: %+v", e)
 	}
 }
@@ -399,7 +399,7 @@ func TestSAMLFlowBoundToConnection(t *testing.T) {
 	if r.Status != http.StatusBadRequest || b.signedIn() {
 		t.Fatalf("flow used at another connection: %d %s", r.Status, r.Location)
 	}
-	if e := h.lastAudit(0); e.Detail != "saml_wrong_connection" {
+	if e := h.latestAudit(0); e.Detail != "saml_wrong_connection" {
 		t.Fatalf("audit: %+v", e)
 	}
 }

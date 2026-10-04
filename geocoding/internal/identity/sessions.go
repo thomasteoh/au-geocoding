@@ -239,9 +239,11 @@ func (s *Store) StartFlow(ctx context.Context, f Flow) (state, binding string, e
 // cookie must match; the row is deleted whether or not it does, so a state
 // can be tried once.
 func (s *Store) TakeFlow(ctx context.Context, state, binding string) (Flow, error) {
-	if state == "" || binding == "" {
+	if state == "" {
 		return Flow{}, ErrNotFound
 	}
+	// The row is consumed even with no binding, so a state lured into a
+	// cookie-less browser cannot be retried elsewhere.
 	h := HashToken(state)
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
