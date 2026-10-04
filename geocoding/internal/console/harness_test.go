@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"io"
+	"net"
 	"net/http"
 	"net/http/cookiejar"
 	"net/http/httptest"
@@ -57,6 +58,21 @@ func newHarness(t *testing.T, policy identity.LoginPolicy) *harness {
 	h.srv = httptest.NewUnstartedServer(mux)
 	h.srv.StartTLS()
 	t.Cleanup(h.srv.Close)
+	// Serve as localhost: WebAuthn refuses IP addresses as RP IDs. The test
+	// certificate names 127.0.0.1, so clients verify against that and dial
+	// the listener directly.
+	h.srv.URL = strings.Replace(h.srv.URL, "://127.0.0.1:", "://localhost:", 1)
+	tr := h.srv.Client().Transport.(*http.Transport).Clone()
+	tr.TLSClientConfig.ServerName = "127.0.0.1"
+	addr := h.srv.Listener.Addr().String()
+	host := strings.TrimPrefix(h.srv.URL, "https://")
+	tr.DialContext = func(ctx context.Context, network, a string) (net.Conn, error) {
+		if a == host {
+			a = addr
+		}
+		return (&net.Dialer{}).DialContext(ctx, network, a)
+	}
+	h.srv.Client().Transport = tr
 	rp := &oidcrp.RP{CallbackURL: h.srv.URL + "/auth/oidc/callback", HTTP: h.idp.Server.Client()}
 	h.con, err = New(Config{PublicURL: h.srv.URL, Session: identity.SessionPolicy{Idle: time.Hour, Max: 24 * time.Hour}, Login: policy},
 		ids, keys, rp, slog.New(io.Discard, slog.LevelError, nil), h.idp.Server.Client())
