@@ -92,9 +92,10 @@ func newHarness(t *testing.T, policy identity.LoginPolicy) *harness {
 // browser is a cookie-holding client that does not follow redirects, so
 // tests can see each hop.
 type browser struct {
-	h      *harness
-	c      *http.Client
-	origin string
+	h         *harness
+	c         *http.Client
+	origin    string
+	crossSite bool // GETs arrive as if from another site
 }
 
 func (h *harness) browser() *browser {
@@ -128,6 +129,10 @@ func (b *browser) get(u string) resp {
 		u = b.h.srv.URL + u
 	}
 	req, _ := http.NewRequest(http.MethodGet, u, nil)
+	if strings.HasPrefix(u, b.h.srv.URL) && !b.crossSite {
+		// What a browser sends for navigation within this site.
+		req.Header.Set("Sec-Fetch-Site", "same-origin")
+	}
 	return b.do(req)
 }
 

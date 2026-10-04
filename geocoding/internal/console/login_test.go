@@ -195,3 +195,26 @@ func TestDiscoveryAndSSOEnforcement(t *testing.T) {
 		t.Fatalf("enforced: %d %s", r.Status, r.Body)
 	}
 }
+
+// TestCrossSiteStartNeedsConfirmation covers login CSRF through an
+// attacker-owned connection: a start linked from another site shows a
+// confirmation page instead of redirecting to the IdP.
+func TestCrossSiteStartNeedsConfirmation(t *testing.T) {
+	h := newHarness(t, open)
+	b := h.browser()
+	b.crossSite = true
+	r := b.get("/auth/oidc/test-idp/start?return_to=/console/account")
+	if r.Status != http.StatusOK || !strings.Contains(r.Body, "Continue to sign in") || !strings.Contains(r.Body, `method="post"`) {
+		t.Fatalf("cross-site start: %d %s", r.Status, r.Location)
+	}
+	// The confirmation POST must be same-origin.
+	b.origin = "https://evil.example"
+	if r := b.post("/auth/oidc/test-idp/start", url.Values{"return_to": {"/console/account"}}, false); r.Status != http.StatusForbidden {
+		t.Fatalf("cross-origin confirm: %d", r.Status)
+	}
+	b.origin = h.srv.URL
+	r = b.post("/auth/oidc/test-idp/start", url.Values{"return_to": {"/console/account"}}, false)
+	if r.Status != http.StatusFound || !strings.HasPrefix(r.Location, h.idp.Issuer) {
+		t.Fatalf("confirmed start: %d %s", r.Status, r.Location)
+	}
+}

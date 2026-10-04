@@ -137,6 +137,12 @@ func (s *Server) handleKeyCreate(w http.ResponseWriter, r *http.Request) {
 		redirectFlash(w, r, back, "Choose at least one scope.")
 		return
 	}
+	for _, sc := range scopes {
+		if sc == "batch" && oc.Org.Tier != "batch" {
+			redirectFlash(w, r, back, "The batch scope needs the batch tier. Ask a platform admin to change your tier.")
+			return
+		}
+	}
 	var expires *time.Time
 	if ds := strings.TrimSpace(r.PostFormValue("expires_days")); ds != "" {
 		n, err := strconv.Atoi(ds)

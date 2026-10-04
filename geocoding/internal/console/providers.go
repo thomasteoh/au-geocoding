@@ -31,17 +31,19 @@ type ProviderSpec struct {
 }
 
 // LoadProviders upserts the file's platform connections, marked managed so
-// the console shows them read-only.
-func LoadProviders(ctx context.Context, ids *identity.Store, path string) error {
+// the console shows them read-only. A slug already taken by an org
+// connection is skipped and reported in warnings rather than failing boot,
+// so an org cannot stop the server by squatting a slug.
+func LoadProviders(ctx context.Context, ids *identity.Store, path string) (warnings []string, err error) {
 	b, err := os.ReadFile(path)
 	if err != nil {
-		return err
+		return warnings, err
 	}
 	var specs []ProviderSpec
 	dec := json.NewDecoder(strings.NewReader(string(b)))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&specs); err != nil {
-		return fmt.Errorf("%s: %w", path, err)
+		return warnings, fmt.Errorf("%s: %w", path, err)
 	}
 	for _, p := range specs {
 		secret := ""
@@ -49,14 +51,14 @@ func LoadProviders(ctx context.Context, ids *identity.Store, path string) error 
 		case p.ClientSecretFile != "":
 			sb, err := os.ReadFile(p.ClientSecretFile)
 			if err != nil {
-				return fmt.Errorf("provider %s: %w", p.Slug, err)
+				return warnings, fmt.Errorf("provider %s: %w", p.Slug, err)
 			}
 			secret = strings.TrimSpace(string(sb))
 		case p.ClientSecretEnv != "":
 			secret = os.Getenv(p.ClientSecretEnv)
 		}
 		if secret == "" {
-			return fmt.Errorf("provider %s: client secret is empty (set client_secret_file or client_secret_env)", p.Slug)
+			return warnings, fmt.Errorf("provider %s: client secret is empty (set client_secret_file or client_secret_env)", p.Slug)
 		}
 		kind := p.Kind
 		if kind == "" {
@@ -77,15 +79,16 @@ func LoadProviders(ctx context.Context, ids *identity.Store, path string) error 
 		switch {
 		case errors.Is(err, identity.ErrNotFound):
 		case err != nil:
-			return err
+			return warnings, err
 		case existing.OrgID != 0:
-			return fmt.Errorf("provider %s: slug is used by an org connection", p.Slug)
+			warnings = append(warnings, fmt.Sprintf("provider %s skipped: slug is used by an org connection", p.Slug))
+			continue
 		default:
 			c.ID = existing.ID
 		}
 		if _, err := ids.SaveConnection(ctx, c); err != nil {
-			return fmt.Errorf("provider %s: %w", p.Slug, err)
+			return warnings, fmt.Errorf("provider %s: %w", p.Slug, err)
 		}
 	}
-	return nil
+	return warnings, nil
 }

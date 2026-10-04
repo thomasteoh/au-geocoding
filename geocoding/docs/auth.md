@@ -57,8 +57,8 @@ with Google" for anyone). Connections with an org are **org connections**
 |------|-----|
 | `viewer` | See the org, its usage, members and key metadata |
 | `developer` | + create API keys, revoke keys they created |
-| `admin` | + manage all keys, members, invites, SSO connections, domains, group mappings, SCIM tokens, JWT issuers; read the audit log |
-| `owner` | + org settings (SSO enforcement, JIT, default role, tier request), delete the org. The last owner cannot be removed or demoted |
+| `admin` | + manage all keys, members, invites, domains, JWT issuers; read the audit log |
+| `owner` | + SSO connections, group mappings, SCIM tokens (whoever controls the org's IdP or SCIM feed decides its members and roles), org settings (SSO enforcement, JIT, default role), delete the org. The last owner cannot be removed or demoted |
 
 Platform admins (`users.platform_admin`) manage platform connections, all
 orgs (including each org's quota tier) and users. The first platform admins
@@ -146,8 +146,14 @@ into a user:
 1. **Known identity.** If `(connection, subject)` exists, that is the user.
 2. **Org connection.** The email domain must be a verified domain of the
    connection's org; otherwise deny. Find the user by email or, if the org
-   has JIT on, create one. Link the identity. Pending invites for the email
-   are accepted.
+   has JIT on (or an invite exists), create one. An existing user is linked
+   only if they have no access outside this org (no other org except their
+   own personal workspace, not a platform admin); otherwise deny, because the
+   org's IdP decides what email it asserts. Pending invites from this org
+   are accepted. Multi-tenant Entra issuers (`common`, `organizations`,
+   `consumers`) are refused on org connections, and changing a connection's
+   issuer, client ID or SAML metadata drops its linked identities and
+   sessions.
 3. **Platform connection.** If the email's domain is verified by an org with
    SSO enforcement, deny and point the user to that org's SSO. Otherwise, if
    the email is trusted, link to an existing user with that email or create
@@ -155,6 +161,8 @@ into a user:
    exists). If the email is **not** trusted and a user with that email already
    exists, deny: linking on an unverified email is how accounts get taken over.
 4. **Status.** Suspended or deprovisioned users are denied.
+   Bootstrap admins are promoted once, when their account is created; a
+   later revocation sticks.
 5. **Group mappings.** For org connections with mappings, the member's role
    becomes the highest role whose group appears in the assertion; with no
    match, the org's default role (JIT) or the existing manual role.
@@ -191,7 +199,9 @@ used as a login method afterwards, through discoverable credentials. They are
 meant for break-glass access when an IdP is down, so:
 
 - A user in an org with SSO enforcement can sign in with a passkey only if
-  they are an owner of that org or a platform admin.
+  they are an owner of that org or a platform admin. Owners are not exempt
+  from enforcement on platform IdP logins; the passkey is their break-glass
+  path.
 - Registration requires a session younger than 10 minutes (fresh SSO login).
 - User verification is required; the sign count is checked for clones.
 
@@ -336,7 +346,7 @@ labels, never secrets, raw tokens or queries.
 
 | ID | Threat | Guard |
 |----|--------|-------|
-| A1 | Login CSRF / session fixation | Flow-binding cookie; new session ID per login |
+| A1 | Login CSRF / session fixation | Flow-binding cookie; new session ID per login; a sign-in start that did not come from this site (`Sec-Fetch-Site`) shows a confirmation page whose button POSTs back, origin-checked |
 | A2 | Account takeover via unverified email claim (nOAuth) | Email trusted per preset and `email_verified`; org connections require a verified domain; no linking on untrusted email |
 | A3 | IdP mix-up | One callback URL, connection chosen by state, RFC 9207 `iss` check, ID token `iss` check |
 | A4 | Open redirect after login | `return_to` restricted to `/console…` relative paths |
@@ -347,3 +357,10 @@ labels, never secrets, raw tokens or queries.
 | A9 | SCIM token theft | Hashed at rest, org-scoped, revocable, audited; SCIM can only touch its own org |
 | A10 | Stolen session cookie | `__Host-`, `HttpOnly`, `Secure`, `SameSite=Lax`; idle and absolute expiry; user-visible session list |
 | A11 | Secrets exposure via DB copy | Client secrets and SAML keys sealed with `AUGEO_SECRET_KEY`; tokens hashed |
+
+## Invites
+
+An invite is always a pending row, even for an email that already has an
+account: the person joins when they next sign in with a trusted address, so
+nobody is added to an org without acting, and the response never reveals
+whether an account exists. Invites expire after 14 days.

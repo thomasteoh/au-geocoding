@@ -116,13 +116,37 @@ func (s *Server) loginConnection(w http.ResponseWriter, r *http.Request, kinds .
 	return identity.Connection{}, false
 }
 
+// confirmStart guards sign-in starts against login CSRF: a link on another
+// site could send someone through an IdP whose account the attacker owns,
+// leaving them signed in as the attacker. A start that did not come from
+// this site (Sec-Fetch-Site) gets a page with a button that POSTs back,
+// origin-checked. It reports whether the handler should continue.
+func (s *Server) confirmStart(w http.ResponseWriter, r *http.Request, c identity.Connection) bool {
+	if r.Method == http.MethodPost || r.Header.Get("Sec-Fetch-Site") == "same-origin" {
+		return true
+	}
+	org := ""
+	if !c.Platform() {
+		if o, err := s.IDs.OrgByID(r.Context(), c.OrgID); err == nil {
+			org = o.Name
+		}
+	}
+	s.render(w, r, http.StatusOK, "login_confirm", Page{Title: "Continue to sign in", Data: struct {
+		Conn     identity.Connection
+		Org      string
+		Action   string
+		ReturnTo string
+	}{c, org, r.URL.Path, safeReturn(r.FormValue("return_to"))}})
+	return false
+}
+
 func (s *Server) handleOIDCStart(w http.ResponseWriter, r *http.Request) {
 	c, ok := s.loginConnection(w, r, identity.KindOIDC, identity.KindGitHub)
-	if !ok {
+	if !ok || !s.confirmStart(w, r, c) {
 		return
 	}
 	f := identity.Flow{Kind: "oidc", ConnectionID: c.ID, Nonce: identity.RandomToken(24), PKCEVerifier: identity.RandomToken(48),
-		ReturnTo: safeReturn(r.URL.Query().Get("return_to"))}
+		ReturnTo: safeReturn(r.FormValue("return_to"))}
 	state, ok := s.beginFlow(w, r, f)
 	if !ok {
 		return

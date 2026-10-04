@@ -80,6 +80,8 @@ func (s *Server) Register(mux *http.ServeMux) {
 	mux.Handle("POST /auth/oidc/{conn}/backchannel-logout", http.HandlerFunc(s.handleBackchannelLogout))
 	mux.Handle("GET /auth/saml/{conn}/metadata", http.HandlerFunc(s.handleSAMLMetadata))
 	mux.Handle("GET /auth/saml/{conn}/start", s.secure(http.HandlerFunc(s.handleSAMLStart)))
+	mux.Handle("POST /auth/oidc/{conn}/start", s.secure(s.checkOrigin(http.HandlerFunc(s.handleOIDCStart))))
+	mux.Handle("POST /auth/saml/{conn}/start", s.secure(s.checkOrigin(http.HandlerFunc(s.handleSAMLStart))))
 	mux.Handle("POST /auth/saml/{conn}/acs", s.secure(http.HandlerFunc(s.handleSAMLACS)))
 	mux.Handle("POST /auth/passkey/login/begin", s.secure(s.checkOrigin(http.HandlerFunc(s.handlePasskeyLoginBegin))))
 	mux.Handle("POST /auth/passkey/login/finish", s.secure(s.checkOrigin(http.HandlerFunc(s.handlePasskeyLoginFinish))))

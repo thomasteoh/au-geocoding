@@ -65,6 +65,13 @@ func TestKeyCreateShownOnceAndEscaped(t *testing.T) {
 	org := h.org("acme", h.user("owner@acme.example"))
 	b, dev := h.member("dev@acme.example", org, identity.RoleDeveloper)
 
+	// The batch scope needs the batch tier.
+	b.post("/console/orgs/acme/keys", url.Values{"label": {"x"}, "scope": {"batch"}}, true)
+	if keys, _ := h.keys.OrgKeys(org.ID); len(keys) != 0 {
+		t.Fatalf("batch key on demo tier: %+v", keys)
+	}
+	h.ids.SetOrgTier(h.ctx, org.ID, "batch")
+
 	r := b.post("/console/orgs/acme/keys", url.Values{"label": {"<script>alert(1)</script>"}, "scope": {"search", "batch", "admin"}, "expires_days": {"30"}}, true)
 	if r.Status != http.StatusOK {
 		t.Fatalf("create: %d %s", r.Status, r.Body)
@@ -80,7 +87,7 @@ func TestKeyCreateShownOnceAndEscaped(t *testing.T) {
 	if err != nil {
 		t.Fatalf("raw key does not authenticate: %v", err)
 	}
-	if k.OrgID != org.ID || k.CreatedBy != dev.ID || k.Tier != publicapi.QuotaTier(org.Tier) || k.Expires == nil || strings.Join(k.Scopes, " ") != "search batch" {
+	if k.OrgID != org.ID || k.CreatedBy != dev.ID || k.Tier != publicapi.TierBatch || k.Expires == nil || strings.Join(k.Scopes, " ") != "search batch" {
 		t.Fatalf("issued key: %+v", k)
 	}
 	list := b.get("/console/orgs/acme/keys")

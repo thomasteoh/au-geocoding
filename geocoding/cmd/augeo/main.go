@@ -115,9 +115,13 @@ func main() {
 	var con *console.Server
 	if cfg.Auth.ConsoleEnabled() {
 		if cfg.Auth.ProvidersFile != "" {
-			if err := console.LoadProviders(context.Background(), ids, cfg.Auth.ProvidersFile); err != nil {
+			warnings, err := console.LoadProviders(context.Background(), ids, cfg.Auth.ProvidersFile)
+			if err != nil {
 				log.Error("boot_failed", "reason", "providers_file", "error", err.Error())
 				os.Exit(1)
+			}
+			for _, w := range warnings {
+				log.Warn("providers_file", "warning", w)
 			}
 		}
 		rp := &oidcrp.RP{CallbackURL: cfg.Auth.PublicURL + "/auth/oidc/callback", HTTP: fetch}

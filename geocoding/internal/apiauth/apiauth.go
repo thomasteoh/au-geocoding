@@ -58,7 +58,12 @@ type Authenticator struct {
 type keySet struct {
 	set     *oidc.RemoteKeySet
 	fetched time.Time
+	failed  bool // discovery failed; retried after failTTL
 }
+
+// failTTL is how long a failed discovery is remembered, so junk tokens that
+// name a registered issuer cannot trigger an outbound fetch per request.
+const failTTL = time.Minute
 
 // Leeway is the allowed clock skew for exp/nbf/iat.
 const Leeway = 60 * time.Second
@@ -215,6 +220,11 @@ func (a *Authenticator) bearer(ctx context.Context, authz string) (publicapi.Pri
 		return publicapi.Principal{}, a.reject("issuer_org")
 	}
 	scopes := MapScopes(c.Scope, c.Scp, c.Roles, iss.ScopePrefix)
+	if org.Tier != "batch" {
+		// /batch is a batch-tier feature; a token cannot grant more than the
+		// org holds.
+		scopes = without(scopes, "batch")
+	}
 	if len(scopes) == 0 {
 		return publicapi.Principal{}, a.reject("no_scope")
 	}
@@ -284,9 +294,15 @@ func (a *Authenticator) keySet(ctx context.Context, iss identity.JWTIssuer) (*oi
 	if a.sets == nil {
 		a.sets = map[string]*keySet{}
 	}
-	if ks, ok := a.sets[cacheKey]; ok && time.Since(ks.fetched) < keySetTTL {
-		a.mu.Unlock()
-		return ks.set, nil
+	if ks, ok := a.sets[cacheKey]; ok {
+		if ks.failed && time.Since(ks.fetched) < failTTL {
+			a.mu.Unlock()
+			return nil, fmt.Errorf("discovery for %s failed recently", iss.Issuer)
+		}
+		if !ks.failed && time.Since(ks.fetched) < keySetTTL {
+			a.mu.Unlock()
+			return ks.set, nil
+		}
 	}
 	a.mu.Unlock()
 
@@ -294,6 +310,9 @@ func (a *Authenticator) keySet(ctx context.Context, iss identity.JWTIssuer) (*oi
 	if jwksURL == "" {
 		var err error
 		if jwksURL, err = a.discoverJWKS(ctx, iss.Issuer); err != nil {
+			a.mu.Lock()
+			a.sets[cacheKey] = &keySet{fetched: time.Now(), failed: true}
+			a.mu.Unlock()
 			return nil, err
 		}
 	}
@@ -332,6 +351,16 @@ func (a *Authenticator) discoverJWKS(ctx context.Context, issuer string) (string
 		return doc.JWKSURI, nil
 	}
 	return "", fmt.Errorf("discovery failed for %s", issuer)
+}
+
+func without(list []string, s string) []string {
+	var out []string
+	for _, v := range list {
+		if v != s {
+			out = append(out, v)
+		}
+	}
+	return out
 }
 
 func firstNonEmpty(v ...string) string {

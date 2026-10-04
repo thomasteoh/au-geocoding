@@ -1,0 +1,16 @@
+{{define "head"}}<meta name="robots" content="noindex">{{end}}
+{{define "content"}}
+<section class="login">
+  <h1>Continue to sign in</h1>
+  {{with .Data}}
+  <div class="card">
+    <p>You are about to sign in with <strong>{{.Conn.Name}}</strong>{{if .Org}}, the sign-in for <strong>{{.Org}}</strong>{{end}}.</p>
+    <p class="muted">If you did not start this, close this page.</p>
+    <form method="post" action="{{.Action}}">
+      <input type="hidden" name="return_to" value="{{.ReturnTo}}">
+      <button type="submit">Continue</button>
+    </form>
+  </div>
+  {{end}}
+</section>
+{{end}}

@@ -213,10 +213,12 @@ func (rp *RP) Callback(ctx context.Context, c identity.Connection, f identity.Fl
 		subject = cl.TenantID + ":" + cl.Subject
 	}
 	return identity.Assertion{
-		Connection:   c,
-		Subject:      subject,
-		Email:        email,
-		EmailTrusted: (pr.TrustEmail != nil && pr.TrustEmail(cl) && cl.Email != "") || c.TrustEmail,
+		Connection: c,
+		Subject:    subject,
+		Email:      email,
+		// Only a real email claim is ever trusted, never the user-chosen
+		// preferred_username fallback.
+		EmailTrusted: cl.Email != "" && ((pr.TrustEmail != nil && pr.TrustEmail(cl)) || c.TrustEmail),
 		Name:         truncate(name, 100),
 		Groups:       stringList(cl.Raw[groupsClaim]),
 		IdPSID:       cl.SID,

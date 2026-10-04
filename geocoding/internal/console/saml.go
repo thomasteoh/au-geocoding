@@ -31,7 +31,7 @@ func (s *Server) handleSAMLMetadata(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleSAMLStart(w http.ResponseWriter, r *http.Request) {
 	c, ok := s.loginConnection(w, r, identity.KindSAML)
-	if !ok {
+	if !ok || !s.confirmStart(w, r, c) {
 		return
 	}
 	sp, err := samlsp.New(s.Cfg.PublicURL, c)
@@ -47,7 +47,7 @@ func (s *Server) handleSAMLStart(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	state, ok := s.beginFlow(w, r, identity.Flow{Kind: "saml", ConnectionID: c.ID, RequestID: req.ID,
-		ReturnTo: safeReturn(r.URL.Query().Get("return_to"))})
+		ReturnTo: safeReturn(r.FormValue("return_to"))})
 	if !ok {
 		return
 	}
