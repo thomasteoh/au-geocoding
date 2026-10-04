@@ -207,19 +207,48 @@ email") and SSO enforcement (rule 3).
 
 `/scim/v2` with an org SCIM token as `Authorization: Bearer`. Implements
 `ServiceProviderConfig`, `ResourceTypes`, `Schemas`, `Users` and `Groups`:
-create, get, list with `filter` (`eq` on `userName`, `externalId`,
-`emails.value`, `displayName`) and `startIndex`/`count`, replace (`PUT`),
-`PATCH` (including Entra's path-less and string-boolean forms) and delete.
+create, get, list with `filter` (`eq` on `id`, `userName`, `externalId`,
+`emails.value`, `emails[type eq "work"].value` for users; `id`,
+`displayName`, `externalId` for groups; joined by `and`/`or` with
+parentheses) and `startIndex`/`count` (count capped at 200), replace (`PUT`),
+`PATCH` (including Entra's capitalised ops, path-less value objects,
+`name.givenName`-style paths and `"True"`/`"False"` string booleans) and
+delete. Bulk, sort, ETags and `/.search` are not supported. Every request is
+scoped to the token's org; another org's IDs answer 404. Bodies are capped
+at 1 MiB. Unknown attributes (enterprise extension, `title`, phone numbers)
+are accepted and ignored.
 
-- Users are matched by `userName` (email). Creating a user adds an org
-  membership with the default role and source `scim`.
-- `active: false` or `DELETE` removes the membership and deletes the user's
-  sessions; a user left with no memberships and no platform role is marked
-  deprovisioned.
-- Group membership feeds the same group→role mappings as SSO (mappings with
-  source `scim`), so roles follow IdP groups.
+- `userName` is the email. SCIM may only provision an address whose domain
+  is a **verified domain of the token's org**; anything else is 400
+  `invalidValue`. Domains verify to one org only, so a SCIM token can never
+  create, link or rename an account outside its org's domains. The check
+  applies to new addresses only, so an org that drops a domain can still
+  deactivate its users.
+- Creating a user whose email already exists links that user (409
+  `uniqueness` if already provisioned in this org) and adds an org
+  membership with source `scim` and the role from SCIM group mappings, else
+  the org default role. An existing membership (e.g. manual) is kept as is.
+- The SCIM `id` is a random UUID (`scim_users.scim_id`), never the database
+  user ID. Name parts, `displayName`, `externalId`, emails and `active` are
+  stored per org in `scim_users` and returned as sent.
+- The global user row (`users.email`, `users.name`) only changes when the
+  user belongs to no other org and is not a platform admin; changing
+  `userName` for a shared user is 400 `mutability`.
+- `active: false` or `DELETE` removes the org membership (any source) and
+  deletes all the user's sessions; a user left with no memberships and no
+  platform role is marked deprovisioned. `active: true` (or re-creating
+  after delete) restores the membership and reactivates a deprovisioned
+  user. Removing the org's last owner is 400 and changes nothing.
+- Group members must be SCIM users of the same org (400 otherwise). After any
+  group change the affected users' roles are recomputed from SCIM group
+  mappings (matched on `displayName`): highest mapped role, else the org
+  default. Only memberships with source `scim` follow groups; manual,
+  invite and other memberships are never changed. A change that would
+  demote the last owner is refused as a whole. Group `PATCH` answers 204.
 - Tokens are shown once, stored hashed, revocable, and every SCIM write is
-  audited.
+  audited with actor `scim` (`scim.user.create`, `.update`, `.deactivate`,
+  `.reactivate`, `.delete`, `scim.group.create`, `.update`, `.delete`).
+  Mapping edits in the console apply at the next SCIM change for each user.
 
 ## API: bearer tokens
 
