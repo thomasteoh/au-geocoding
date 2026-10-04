@@ -334,6 +334,17 @@ origin checks, and an audit event.
 | `AUGEO_AUTH_SESSION_IDLE` | `28800` | Seconds |
 | `AUGEO_AUTH_SESSION_MAX` | `604800` | Seconds |
 | `AUGEO_AUTH_PROVIDERS_FILE` | | JSON list of platform connections to upsert at boot (see below) |
+| `AUGEO_SMTP_HOST` | (unset: no invite emails) | SMTP submission server for invite emails. STARTTLS is required unless the host is `localhost` or a loopback address |
+| `AUGEO_SMTP_PORT` | `587` | SMTP port (STARTTLS; implicit TLS on 465 is not supported) |
+| `AUGEO_SMTP_USERNAME` | | Enables SMTP PLAIN auth (only over TLS, or to localhost) |
+| `AUGEO_SMTP_PASSWORD` / `_FILE` | | SMTP password; redacted in the boot log |
+| `AUGEO_SMTP_FROM` | (required with host) | Sender, `noreply@geo.example.com` or `Geocoder <noreply@geo.example.com>` |
+
+When SMTP is configured, inviting someone emails them a plain-text message
+naming the inviter, organisation, role, the `{AUGEO_PUBLIC_URL}/auth/login`
+link and the expiry. A failed send never fails the invite: the console says
+the email could not be sent and logs `invite_email_failed` with the org ID and
+the error, never the recipient's address.
 
 Platform connections can be managed in the admin console or declared in the
 providers file so deployments are reproducible:

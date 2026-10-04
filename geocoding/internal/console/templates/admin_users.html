@@ -15,12 +15,12 @@
     <td>{{when .LastLogin}}</td>
     <td>{{if eq .ID $d.SelfID}}<span class="muted">you</span>{{else}}
       <form method="post" action="/console/admin/users/{{.ID}}/status" class="inline">
-        <input type="hidden" name="csrf" value="{{$.CSRF}}"><input type="hidden" name="q" value="{{$d.Query}}">
+        <input type="hidden" name="csrf" value="{{$.CSRF}}">{{template "users_page" $d}}
         {{if eq .Status "active"}}<input type="hidden" name="status" value="suspended"><button type="submit" class="danger" aria-label="Suspend {{.Email}}">Suspend</button>
         {{else}}<input type="hidden" name="status" value="active"><button type="submit" class="danger" aria-label="Reactivate {{.Email}}">Reactivate</button>{{end}}
       </form>
       <form method="post" action="/console/admin/users/{{.ID}}/admin" class="inline">
-        <input type="hidden" name="csrf" value="{{$.CSRF}}"><input type="hidden" name="q" value="{{$d.Query}}">
+        <input type="hidden" name="csrf" value="{{$.CSRF}}">{{template "users_page" $d}}
         {{if .PlatformAdmin}}<input type="hidden" name="admin" value="0"><button type="submit" class="danger" aria-label="Remove platform admin from {{.Email}}">Remove admin</button>
         {{else}}<input type="hidden" name="admin" value="1"><button type="submit" class="danger" aria-label="Make {{.Email}} a platform admin">Make admin</button>{{end}}
       </form>
@@ -28,6 +28,12 @@
   </tr>{{end}}
   </tbody>
 </table>
-<p class="note">Showing up to 200 users, newest first. Suspending a user ends all their sessions.</p>
 {{else}}<p>No users match.</p>{{end}}
+<nav aria-label="Pages">
+  {{if $d.Newer}}<a href="/console/admin/users?{{if $d.Query}}q={{$d.Query}}&amp;{{end}}after={{$d.Newer}}">Newer users</a>
+  {{else if or $d.Before $d.After}}<a href="/console/admin/users{{if $d.Query}}?q={{$d.Query}}{{end}}">Newest users</a>{{end}}
+  {{if $d.Older}}<a href="/console/admin/users?{{if $d.Query}}q={{$d.Query}}&amp;{{end}}before={{$d.Older}}">Older users</a>{{end}}
+</nav>
+<p class="note">Up to 100 users per page, newest first. Suspending a user ends all their sessions.</p>
 {{end}}
+{{define "users_page"}}<input type="hidden" name="q" value="{{.Query}}">{{if .Before}}<input type="hidden" name="before" value="{{.Before}}">{{end}}{{if .After}}<input type="hidden" name="after" value="{{.After}}">{{end}}{{end}}

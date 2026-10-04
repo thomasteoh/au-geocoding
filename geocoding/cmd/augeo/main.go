@@ -27,6 +27,7 @@ import (
 	"augeocoding/internal/identity"
 	"augeocoding/internal/ladder"
 	"augeocoding/internal/llm"
+	"augeocoding/internal/mail"
 	"augeocoding/internal/oidcrp"
 	"augeocoding/internal/placesclient"
 	"augeocoding/internal/publicapi"
@@ -134,7 +135,15 @@ func main() {
 			log.Error("boot_failed", "reason", "console", "error", err.Error())
 			os.Exit(1)
 		}
-		log.Info("console_enabled", "public_url", cfg.Auth.PublicURL, "signup", cfg.Auth.Signup)
+		if cfg.SMTP.Host != "" {
+			sender, err := mail.NewSMTP(mail.Config{Host: cfg.SMTP.Host, Port: cfg.SMTP.Port, Username: cfg.SMTP.Username, Password: cfg.SMTP.Password, From: cfg.SMTP.From})
+			if err != nil {
+				log.Error("boot_failed", "reason", "smtp", "error", err.Error())
+				os.Exit(1)
+			}
+			con.Mail = sender
+		}
+		log.Info("console_enabled", "public_url", cfg.Auth.PublicURL, "signup", cfg.Auth.Signup, "invite_email", cfg.SMTP.Host != "")
 	}
 
 	// LLM: runtime-configurable provider client (rung 5). The holder is seeded

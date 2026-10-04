@@ -110,27 +110,6 @@ func (s *Store) CreateUser(ctx context.Context, email, name string) (User, error
 	return s.UserByID(ctx, id)
 }
 
-// ListUsers returns users for the platform admin, newest first.
-func (s *Store) ListUsers(ctx context.Context, q string, limit int) ([]User, error) {
-	if limit <= 0 || limit > 500 {
-		limit = 200
-	}
-	rows, err := s.db.QueryContext(ctx, `SELECT `+userCols+` FROM users WHERE email LIKE ? ESCAPE '\' ORDER BY id DESC LIMIT ?`, "%"+likeEscape(q)+"%", limit)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var out []User
-	for rows.Next() {
-		u, err := scanUser(rows)
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, u)
-	}
-	return out, rows.Err()
-}
-
 // SetUserName updates the display name.
 func (s *Store) SetUserName(ctx context.Context, id int64, name string) error {
 	_, err := s.db.ExecContext(ctx, `UPDATE users SET name=? WHERE id=?`, strings.TrimSpace(name), id)

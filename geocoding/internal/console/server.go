@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"augeocoding/internal/identity"
+	"augeocoding/internal/mail"
 	"augeocoding/internal/oidcrp"
 	"augeocoding/internal/publicapi"
 	"ausystem/shared/slog"
@@ -48,6 +49,8 @@ type Server struct {
 	HTTP *http.Client
 	// LookupTXT resolves DNS TXT records for domain verification.
 	LookupTXT func(ctx context.Context, name string) ([]string, error)
+	// Mail sends invite emails; mail.Nop when SMTP is not configured.
+	Mail mail.Sender
 
 	pages  map[string]*template.Template
 	origin string
@@ -60,7 +63,7 @@ func New(cfg Config, ids *identity.Store, keys *publicapi.Store, rp *oidcrp.RP, 
 		return nil, fmt.Errorf("console: bad public URL %q", cfg.PublicURL)
 	}
 	s := &Server{Cfg: cfg, IDs: ids, Keys: keys, RP: rp, Log: log, HTTP: httpClient, origin: u.Scheme + "://" + u.Host,
-		LookupTXT: net.DefaultResolver.LookupTXT}
+		LookupTXT: net.DefaultResolver.LookupTXT, Mail: mail.Nop{}}
 	if err := s.loadTemplates(); err != nil {
 		return nil, err
 	}
@@ -161,8 +164,15 @@ func staticHandler(fsys fs.FS) http.Handler {
 // abs makes an absolute URL on the public origin.
 func (s *Server) abs(path string) string { return s.Cfg.PublicURL + path }
 
+// platformAdminTag prefixes the audit detail of actions a platform admin
+// takes in an org they hold no (or a lower) role in.
+const platformAdminTag = "[platform-admin] "
+
 // audit records an event; a failure is logged, never fatal.
 func (s *Server) audit(r *http.Request, orgID int64, action, target, detail string) {
+	if oc := orgFrom(r.Context()); oc != nil && oc.ViaPlatformAdmin {
+		detail = platformAdminTag + detail
+	}
 	e := identity.AuditEvent{OrgID: orgID, Action: action, Target: target, Detail: detail, Actor: "anonymous"}
 	if v := viewerFrom(r.Context()); v != nil {
 		e.ActorID, e.Actor = v.User.ID, v.User.Email

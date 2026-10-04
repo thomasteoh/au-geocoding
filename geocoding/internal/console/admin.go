@@ -1,6 +1,7 @@
 package console
 
 import (
+	"database/sql"
 	"errors"
 	"net/http"
 	"net/url"
@@ -96,7 +97,13 @@ func (s *Server) handleAdminOrgTier(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	tier := r.PostFormValue("tier")
-	if err := s.IDs.SetOrgTier(r.Context(), org.ID, tier); err != nil {
+	// The org and its existing keys change tier in one transaction; the
+	// in-memory key index follows once it commits.
+	qt := publicapi.QuotaTier(tier)
+	err = s.IDs.SetOrgTierWith(r.Context(), org.ID, tier, func(tx *sql.Tx) error {
+		return s.Keys.SetOrgTierTx(r.Context(), tx, org.ID, qt)
+	})
+	if err != nil {
 		if errors.Is(err, identity.ErrInvalid) {
 			redirectFlash(w, r, "/console/admin/orgs", "Choose one of the listed tiers.")
 			return
@@ -104,42 +111,75 @@ func (s *Server) handleAdminOrgTier(w http.ResponseWriter, r *http.Request) {
 		s.serverError(w, r, err)
 		return
 	}
-	// Existing keys carry the tier too; update them and the in-memory index.
-	if err := s.Keys.SetOrgTier(org.ID, publicapi.QuotaTier(tier)); err != nil {
-		s.serverError(w, r, err)
-		return
-	}
+	s.Keys.ApplyOrgTier(org.ID, qt)
 	s.audit(r, 0, "org.tier", org.Slug, "from="+org.Tier+" to="+tier)
 	redirectFlash(w, r, "/console/admin/orgs", org.Name+" is now on the "+tier+" tier.")
 }
+
+// adminUsersPage is how many users the admin users page lists at once.
+const adminUsersPage = 100
 
 type adminUsersData struct {
 	Query  string
 	Users  []identity.User
 	SelfID int64
+	// Older and Newer are the before= and after= cursors of the neighbouring
+	// pages, 0 when there is none. Before and After echo this page's cursor
+	// so actions return to it.
+	Older, Newer  int64
+	Before, After int64
 }
 
 func (s *Server) handleAdminUsers(w http.ResponseWriter, r *http.Request) {
-	q := strings.TrimSpace(r.URL.Query().Get("q"))
+	qs := r.URL.Query()
+	q := strings.TrimSpace(qs.Get("q"))
 	if len(q) > 200 {
 		q = q[:200]
 	}
-	users, err := s.IDs.ListUsers(r.Context(), q, 200)
+	before, _ := strconv.ParseInt(qs.Get("before"), 10, 64)
+	after, _ := strconv.ParseInt(qs.Get("after"), 10, 64)
+	if before < 0 {
+		before = 0
+	}
+	if after < 0 || before > 0 {
+		after = 0
+	}
+	// One extra row says whether another page exists in the paging direction.
+	users, err := s.IDs.ListUsers(r.Context(), q, before, after, adminUsersPage+1)
 	if err != nil {
 		s.serverError(w, r, err)
 		return
 	}
-	s.render(w, r, http.StatusOK, "admin_users", Page{Title: "Users", Active: "admin",
-		Data: adminUsersData{Query: q, Users: users, SelfID: viewerFrom(r.Context()).User.ID}})
+	d := adminUsersData{Query: q, SelfID: viewerFrom(r.Context()).User.ID, Before: before, After: after}
+	more := len(users) > adminUsersPage
+	var hasOlder, hasNewer bool
+	if after > 0 {
+		if more {
+			users = users[1:] // the newest row belongs to the page above
+		}
+		hasOlder, hasNewer = true, more
+	} else {
+		if more {
+			users = users[:adminUsersPage]
+		}
+		hasOlder, hasNewer = more, before > 0
+	}
+	d.Users = users
+	if len(users) > 0 {
+		if hasOlder {
+			d.Older = users[len(users)-1].ID
+		}
+		if hasNewer {
+			d.Newer = users[0].ID
+		}
+	}
+	s.render(w, r, http.StatusOK, "admin_users", Page{Title: "Users", Active: "admin", Data: d})
 }
 
 // adminTargetUser loads the user named in the path; the viewer cannot act
 // on themselves.
 func (s *Server) adminTargetUser(w http.ResponseWriter, r *http.Request) (identity.User, string, bool) {
-	back := "/console/admin/users"
-	if q := r.PostFormValue("q"); q != "" {
-		back += "?q=" + url.QueryEscape(q)
-	}
+	back := adminUsersBack(r)
 	id := pathInt(r, "id")
 	u, err := s.IDs.UserByID(r.Context(), id)
 	if id == 0 || errors.Is(err, identity.ErrNotFound) {
@@ -157,13 +197,22 @@ func (s *Server) adminTargetUser(w http.ResponseWriter, r *http.Request) (identi
 	return u, back, true
 }
 
-// lastAdmin reports whether u is the only active platform admin.
-func (s *Server) lastAdmin(r *http.Request, u identity.User) (bool, error) {
-	if !u.PlatformAdmin || !u.Active() {
-		return false, nil
+// adminUsersBack returns the users page an action was posted from: its
+// search and page cursor.
+func adminUsersBack(r *http.Request) string {
+	v := url.Values{}
+	if q := r.PostFormValue("q"); q != "" {
+		v.Set("q", q)
 	}
-	n, err := s.IDs.CountPlatformAdmins(r.Context())
-	return n <= 1, err
+	for _, k := range []string{"before", "after"} {
+		if n, err := strconv.ParseInt(r.PostFormValue(k), 10, 64); err == nil && n > 0 {
+			v.Set(k, strconv.FormatInt(n, 10))
+		}
+	}
+	if len(v) == 0 {
+		return "/console/admin/users"
+	}
+	return "/console/admin/users?" + v.Encode()
 }
 
 func (s *Server) handleAdminUserStatus(w http.ResponseWriter, r *http.Request) {
@@ -176,19 +225,13 @@ func (s *Server) handleAdminUserStatus(w http.ResponseWriter, r *http.Request) {
 		redirectFlash(w, r, back, "Unknown status.")
 		return
 	}
-	if status == identity.StatusSuspended {
-		last, err := s.lastAdmin(r, u)
-		if err != nil {
-			s.serverError(w, r, err)
-			return
-		}
-		if last {
+	// Suspension deletes the user's sessions in the same transaction, and
+	// refuses (atomically) to suspend the last active platform admin.
+	if err := s.IDs.SetUserStatusGuarded(r.Context(), u.ID, status); err != nil {
+		if errors.Is(err, identity.ErrLastPlatformAdmin) {
 			redirectFlash(w, r, back, "You cannot suspend the last active platform admin.")
 			return
 		}
-	}
-	// Suspension deletes the user's sessions in the same transaction.
-	if err := s.IDs.SetUserStatus(r.Context(), u.ID, status); err != nil {
 		s.serverError(w, r, err)
 		return
 	}
@@ -207,18 +250,18 @@ func (s *Server) handleAdminUserAdmin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	grant := r.PostFormValue("admin") == "1"
-	if !grant {
-		last, err := s.lastAdmin(r, u)
-		if err != nil {
-			s.serverError(w, r, err)
-			return
-		}
-		if last {
+	var err error
+	if grant {
+		err = s.IDs.SetPlatformAdmin(r.Context(), u.ID, true)
+	} else {
+		// Refuses, atomically, to remove the last active platform admin.
+		err = s.IDs.RevokePlatformAdmin(r.Context(), u.ID)
+	}
+	if err != nil {
+		if errors.Is(err, identity.ErrLastPlatformAdmin) {
 			redirectFlash(w, r, back, "You cannot remove the last active platform admin.")
 			return
 		}
-	}
-	if err := s.IDs.SetPlatformAdmin(r.Context(), u.ID, grant); err != nil {
 		s.serverError(w, r, err)
 		return
 	}

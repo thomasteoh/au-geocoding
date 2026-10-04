@@ -12,6 +12,8 @@ import (
 	"os"
 	"strconv"
 	"strings"
+
+	"augeocoding/internal/mail"
 )
 
 // Config is the effective configuration for the geocoder.
@@ -93,6 +95,17 @@ type Config struct {
 	} `json:"log"`
 	PlacesURL string `json:"places_url"` // split-mode au-places base URL; "" = single-binary
 	Auth      Auth   `json:"auth"`
+	SMTP      SMTP   `json:"smtp"`
+}
+
+// SMTP configures outbound mail (console invite emails). Mail is off when
+// Host is empty.
+type SMTP struct {
+	Host     string `json:"host"`
+	Port     int    `json:"port"`
+	Username string `json:"username"`
+	Password string `json:"password"`
+	From     string `json:"from"`
 }
 
 // Auth configures the console, SSO, SCIM and API bearer tokens
@@ -184,6 +197,7 @@ func Load(args []string, filePath string) (Config, error) {
 		cfg.Limits.MaxBodyBytes = 1 << 20
 	}
 	errs = append(errs, validateAuth(&cfg.Auth)...)
+	errs = append(errs, validateSMTP(&cfg.SMTP)...)
 	if len(errs) > 0 {
 		return cfg, fmt.Errorf("invalid config: %s", strings.Join(errs, "; "))
 	}
@@ -214,6 +228,30 @@ func validateAuth(a *Auth) []string {
 	}
 	if a.SessionIdle <= 0 || a.SessionMax <= 0 || a.SessionIdle > a.SessionMax {
 		errs = append(errs, "auth session idle and max must be positive, idle <= max")
+	}
+	return errs
+}
+
+func validateSMTP(m *SMTP) []string {
+	var errs []string
+	m.Host = strings.TrimSpace(m.Host)
+	if m.Host == "" {
+		if m.Username != "" || m.Password != "" || m.From != "" {
+			errs = append(errs, "AUGEO_SMTP_HOST required with other SMTP settings")
+		}
+		return errs
+	}
+	if strings.ContainsAny(m.Host, " /\r\n") {
+		errs = append(errs, "smtp host must be a host name")
+	}
+	if m.Port < 1 || m.Port > 65535 {
+		errs = append(errs, "smtp port must be 1-65535")
+	}
+	if _, err := mail.ParseFrom(m.From); err != nil {
+		errs = append(errs, "AUGEO_SMTP_FROM must be an email address when AUGEO_SMTP_HOST is set")
+	}
+	if m.Password != "" && m.Username == "" {
+		errs = append(errs, "AUGEO_SMTP_PASSWORD needs AUGEO_SMTP_USERNAME")
 	}
 	return errs
 }
@@ -278,6 +316,7 @@ func setDefaults(c *Config) {
 	c.Auth.SessionIdle = 8 * 3600
 	c.Auth.SessionMax = 7 * 24 * 3600
 	c.Auth.JWTBearer = true
+	c.SMTP.Port = 587
 }
 
 func loadFile(path string, c *Config) error {
@@ -395,6 +434,11 @@ func applyEnv(c *Config) {
 		}
 	}
 	secretFromEnv("SECRET_KEY", &c.Auth.SecretKey)
+	str("SMTP_HOST", &c.SMTP.Host)
+	num("SMTP_PORT", &c.SMTP.Port)
+	str("SMTP_USERNAME", &c.SMTP.Username)
+	str("SMTP_FROM", &c.SMTP.From)
+	secretFromEnv("SMTP_PASSWORD", &c.SMTP.Password)
 
 	// LLM enabled only when BaseURL is set.
 	c.LLM.Enabled = c.LLM.BaseURL != ""
@@ -421,6 +465,9 @@ func (c Config) Redacted() Config {
 	}
 	if cp.Auth.SecretKey != "" {
 		cp.Auth.SecretKey = "REDACTED"
+	}
+	if cp.SMTP.Password != "" {
+		cp.SMTP.Password = "REDACTED"
 	}
 	return cp
 }
