@@ -6,8 +6,9 @@
 // P1 build (INV-4).
 //
 // Usage:
-//   enrich -store data/assertions.db -source mydata -version gnaf-aug26 -rule v1 \
-//         -register mydata "My Data" CC-BY-4.0 bulk 0.9 -in batch.ndjson
+//
+//	enrich -store data/assertions.db -source mydata -version gnaf-aug26 -rule v1 \
+//	      -register mydata "My Data" CC-BY-4.0 bulk 0.9 -in batch.ndjson
 package main
 
 import (

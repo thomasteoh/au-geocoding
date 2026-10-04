@@ -124,4 +124,3 @@ func HaversineM(lat1, lon1, lat2, lon2 float64) float64 {
 	a := math.Sin(dlat/2)*math.Sin(dlat/2) + math.Cos(lat1r)*math.Cos(lat2r)*math.Sin(dlon/2)*math.Sin(dlon/2)
 	return 2 * r * math.Atan2(math.Sqrt(a), math.Sqrt(1-a))
 }
-

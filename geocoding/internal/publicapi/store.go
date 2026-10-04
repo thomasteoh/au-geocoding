@@ -23,9 +23,9 @@ import (
 // Errors for the public API. Uniform responses for unknown vs revoked vs
 // over-quota keys (T6) — never confirm which keys exist.
 var (
-	ErrInvalidKey   = errors.New("invalid api key")
+	ErrInvalidKey    = errors.New("invalid api key")
 	ErrQuotaExceeded = errors.New("daily quota exceeded")
-	ErrRateLimited  = errors.New("rate limited")
+	ErrRateLimited   = errors.New("rate limited")
 )
 
 // Tier is a quota tier. Anonymous and keyed access get separate ceilings (T1).
@@ -95,31 +95,31 @@ func KeyPrefix(key string) string {
 
 // Key is the in-memory form of an api_keys row.
 type Key struct {
-	ID         int64
-	Prefix     string
-	Hash       [32]byte
-	Label      string
-	Tier       Tier
-	Enabled    bool
-	Scopes     []string
-	Created    time.Time
-	Revoked    *time.Time
+	ID      int64
+	Prefix  string
+	Hash    [32]byte
+	Label   string
+	Tier    Tier
+	Enabled bool
+	Scopes  []string
+	Created time.Time
+	Revoked *time.Time
 }
 
 // Store is the app.db service-state store. It owns api_keys, usage and
 // request_log, in a SQLite file separate from the geocoding DBs.
 type Store struct {
-	db      *sql.DB
-	pepper  Pepper
-	mu      sync.Mutex
-	keys    map[string]Key // prefix → Key (non-secret index)
+	db     *sql.DB
+	pepper Pepper
+	mu     sync.Mutex
+	keys   map[string]Key // prefix → Key (non-secret index)
 
 	// AnonDaily tracks anonymous daily usage per IP, in memory only (D-026:
 	// per-IP quota is per-replica and resets on restart — accepted weakness,
 	// capped by the global ceiling). Never persisted, never logged.
-	anonMu   sync.Mutex
-	anonDay  string
-	anonIPs  map[string]int64 // ip → rows consumed today
+	anonMu  sync.Mutex
+	anonDay string
+	anonIPs map[string]int64 // ip → rows consumed today
 }
 
 // Open opens app.db (creating the schema on first run) and loads keys. The
@@ -135,9 +135,9 @@ func Open(path string) (*Store, error) {
 		return nil, err
 	}
 	s := &Store{
-		db:     db,
-		pepper: GeneratePepper(),
-		keys:   make(map[string]Key),
+		db:      db,
+		pepper:  GeneratePepper(),
+		keys:    make(map[string]Key),
 		anonIPs: make(map[string]int64),
 	}
 	if err := s.migrate(); err != nil {
@@ -399,12 +399,12 @@ func (s *Store) LogRequest(keyID int64, endpoint string, status int, latencyMS i
 // tokenBucket is a per-key token bucket (D-006). Tokens refill continuously;
 // a burst up to the bucket size is allowed, then the steady rate.
 type tokenBucket struct {
-	mu      sync.Mutex
-	rate    float64 // tokens per second
-	burst   float64
-	tokens  float64
-	last    time.Time
-	used    time.Time // last touch for LRU eviction
+	mu     sync.Mutex
+	rate   float64 // tokens per second
+	burst  float64
+	tokens float64
+	last   time.Time
+	used   time.Time // last touch for LRU eviction
 }
 
 // newTokenBucket creates a bucket with the given per-second rate and burst.

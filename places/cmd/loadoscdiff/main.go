@@ -17,9 +17,9 @@ import (
 
 	_ "modernc.org/sqlite"
 
-	pm "github.com/paulmach/osm"
 	"auplaces/internal/osm"
 	"auplaces/internal/schema"
+	pm "github.com/paulmach/osm"
 )
 
 func main() {

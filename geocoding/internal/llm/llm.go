@@ -35,8 +35,8 @@ type Config struct {
 // Holder is a thread-safe runtime config holder. Reads and writes are safe to
 // call concurrently; the ladder reads the effective config per call.
 type Holder struct {
-	mu   sync.RWMutex
-	cfg  Config
+	mu  sync.RWMutex
+	cfg Config
 }
 
 // NewHolder returns a holder seeded with the boot config. Enabled is derived

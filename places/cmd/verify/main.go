@@ -81,8 +81,8 @@ func main() {
 	// are the published G-NAF numbers, which the build may legitimately differ
 	// from by the locality filter).
 	counts := map[string]int64{
-		"address": 4184145,
-		"poi":     59720,
+		"address":  4184145,
+		"poi":      59720,
 		"boundary": 2979,
 	}
 	for tbl, want := range counts {
@@ -140,11 +140,11 @@ func main() {
 }
 
 type verifyReport struct {
-	DB       string        `json:"db"`
-	OK       bool          `json:"ok"`
-	Integrity string       `json:"integrity_check"`
-	SHA256   string        `json:"sha256"`
-	Checks   []checkResult `json:"checks"`
+	DB        string        `json:"db"`
+	OK        bool          `json:"ok"`
+	Integrity string        `json:"integrity_check"`
+	SHA256    string        `json:"sha256"`
+	Checks    []checkResult `json:"checks"`
 }
 
 type checkResult struct {

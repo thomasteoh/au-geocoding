@@ -7,8 +7,8 @@ import (
 	"strings"
 	"testing"
 
-	"ausystem/shared/contract"
 	"augeocoding/internal/llm"
+	"ausystem/shared/contract"
 	"ausystem/shared/slog"
 )
 

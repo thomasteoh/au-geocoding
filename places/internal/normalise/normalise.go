@@ -36,11 +36,11 @@ var Alias = map[string]string{
 // truncates the true match. Street name is the strongest discriminator —
 // generation narrows by street+locality, then scoring picks the number.
 var reliableSet = map[string]bool{
-	"locality_name":   true,
-	"state":           true,
-	"postcode":        true,
-	"street_number":   true,
-	"street_name":     true,
+	"locality_name": true,
+	"state":         true,
+	"postcode":      true,
+	"street_number": true,
+	"street_name":   true,
 }
 
 // Tokenise splits text into normalised tokens. Discards operator chars,

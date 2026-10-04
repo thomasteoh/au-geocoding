@@ -27,8 +27,8 @@ type Client struct {
 // New returns a Client for the au-places base URL.
 func New(baseURL string) *Client {
 	return &Client{
-		baseURL:                baseURL,
-		http:                   &http.Client{Timeout: 30 * time.Second},
+		baseURL:                 baseURL,
+		http:                    &http.Client{Timeout: 30 * time.Second},
 		ExpectedContractVersion: contract.Version,
 	}
 }

@@ -57,19 +57,19 @@ type scene5 struct {
 		Lon float64 `json:"lon"`
 	} `json:"anchor"`
 	Candidates []struct {
-		ID         string  `json:"id,omitempty"`
-		Name       string  `json:"name"`
-		Lat        float64 `json:"lat"`
-		Lon        float64 `json:"lon"`
-		DistanceM  int     `json:"distanceM"`
+		ID        string  `json:"id,omitempty"`
+		Name      string  `json:"name"`
+		Lat       float64 `json:"lat"`
+		Lon       float64 `json:"lon"`
+		DistanceM int     `json:"distanceM"`
 	} `json:"candidates"`
 }
 
 type panelB struct {
-	Name                string  `json:"name"`
-	Candidates          int     `json:"candidates"`
-	States              int     `json:"states"`
-	Percentages         struct {
+	Name        string `json:"name"`
+	Candidates  int    `json:"candidates"`
+	States      int    `json:"states"`
+	Percentages struct {
 		Base          float64 `json:"base"`
 		State         float64 `json:"state"`
 		StatePostcode float64 `json:"statePostcode"`

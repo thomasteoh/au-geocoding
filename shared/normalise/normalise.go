@@ -34,13 +34,13 @@ var stateCodes = map[string]string{
 
 // Result is the normalised form of one query.
 type Result struct {
-	Tokens      []string // full normalised token set — scoring
-	Generate    []string // reliable tokens — candidate generation
-	State       string   // hint, "" if absent
-	Postcode    string   // hint, "" if absent
-	IsPOI       bool     // no numeric street number → likely a named place
-	HadNumbers  bool
-	HadStreet   bool
+	Tokens     []string // full normalised token set — scoring
+	Generate   []string // reliable tokens — candidate generation
+	State      string   // hint, "" if absent
+	Postcode   string   // hint, "" if absent
+	IsPOI      bool     // no numeric street number → likely a named place
+	HadNumbers bool
+	HadStreet  bool
 }
 
 // Normalise folds case, strips punctuation, expands abbreviations, and pulls

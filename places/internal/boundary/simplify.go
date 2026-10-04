@@ -588,7 +588,6 @@ func orient(a, b, c IPoint) int {
 	return 0
 }
 
-
 // convexHull is the monotone-chain hull, used only as the R10.4 fallback.
 func convexHull(pts []Point) []Point {
 	if len(pts) < 4 {

@@ -84,9 +84,9 @@ type nodeCoord struct{ lat, lon float64 }
 
 // wayNode is a POI way and its node-ID list (for centroid computation).
 type wayNode struct {
-	osmID  osm.WayID
-	tags   osm.Tags
-	nodes  []osm.NodeID
+	osmID osm.WayID
+	tags  osm.Tags
+	nodes []osm.NodeID
 }
 
 // LoadPOI runs the two-pass load. It returns the number of POIs inserted.

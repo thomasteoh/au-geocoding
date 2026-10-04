@@ -67,7 +67,7 @@ DROP TABLE IF EXISTS poi_meta;
 // MigratePOISchema upgrades an older pipeline/serving DB to the R2.5 schema
 // in place: adds sequence_number/timestamp to poi and creates the poi_meta
 // anchor table if they're missing. Never destructive — existing rows keep
-// their values; new columns default to 0/'' (provenance unknown until the next
+// their values; new columns default to 0/” (provenance unknown until the next
 // full load stamps them). Call before reading poi_meta or writing seq/ts.
 func MigratePOISchema(db *sql.DB) error {
 	// Does poi have the sequence_number column?

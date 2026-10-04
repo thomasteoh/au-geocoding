@@ -39,11 +39,11 @@ type Anchor struct {
 // reading: "doncaster and blackburn road" = Doncaster Rd × Blackburn Rd
 // intersection. Detect the two-street pattern first.
 // Resolution order (presentation-agnostic):
-//   1. Whole fragment IS a locality ("DONCASTER EAST", "BOX HILL") → locality.
-//   2. Two streets cross ("DONCASTER AND BLACKBURN ROAD", "CORNER OF X AND Y",
-//      "X ROAD Y ROAD", "X AND Y") → intersection.
-//   3. Street-in-locality ("BLACKBURN ROAD IN DONCASTER EAST") → street anchor.
-//   4. Locality centroid (fallback).
+//  1. Whole fragment IS a locality ("DONCASTER EAST", "BOX HILL") → locality.
+//  2. Two streets cross ("DONCASTER AND BLACKBURN ROAD", "CORNER OF X AND Y",
+//     "X ROAD Y ROAD", "X AND Y") → intersection.
+//  3. Street-in-locality ("BLACKBURN ROAD IN DONCASTER EAST") → street anchor.
+//  4. Locality centroid (fallback).
 func ResolveAnchor(ctx context.Context, db *sql.DB, fragment string, locality string) (*Anchor, error) {
 	frag := strings.ToUpper(strings.TrimSpace(fragment))
 
