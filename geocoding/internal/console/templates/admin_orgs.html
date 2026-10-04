@@ -1,0 +1,24 @@
+{{define "content"}}{{$d := .Data}}
+<p class="note"><a href="/console/admin">Platform admin</a></p>
+<h1>Organisations</h1>
+{{if $d.Orgs}}
+<table>
+  <thead><tr><th>Slug</th><th>Name</th><th>Members</th><th>SSO enforced</th><th>Tier</th></tr></thead>
+  <tbody>
+  {{range $d.Orgs}}{{$o := .}}<tr>
+    <td><a href="/console/orgs/{{.Slug}}"><code>{{.Slug}}</code></a></td>
+    <td>{{.Name}}{{if .Personal}} <span class="muted">(personal)</span>{{end}}</td>
+    <td>{{.Members}}</td>
+    <td>{{if .SSOEnforced}}Yes{{else}}<span class="muted">No</span>{{end}}</td>
+    <td><form method="post" action="/console/admin/orgs/{{.ID}}/tier" class="inline">
+      <input type="hidden" name="csrf" value="{{$.CSRF}}">
+      <label for="tier-{{.ID}}" class="muted">Tier for {{.Slug}}</label>
+      <select id="tier-{{.ID}}" name="tier">{{range $d.Tiers}}<option value="{{.}}" {{if eq . $o.Tier}}selected{{end}}>{{.}}</option>{{end}}</select>
+      <button type="submit">Set tier</button>
+    </form></td>
+  </tr>{{end}}
+  </tbody>
+</table>
+{{else}}<p>No organisations.</p>{{end}}
+<p class="note">Changing the tier also moves the organisation's existing API keys to it straight away.</p>
+{{end}}

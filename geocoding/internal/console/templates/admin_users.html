@@ -1,0 +1,33 @@
+{{define "content"}}{{$d := .Data}}
+<p class="note"><a href="/console/admin">Platform admin</a></p>
+<h1>Users</h1>
+<form method="get" action="/console/admin/users" role="search">
+  <label for="q">Search by email</label>
+  <input id="q" name="q" type="search" maxlength="200" value="{{$d.Query}}">
+  <button type="submit">Search</button>
+</form>
+{{if $d.Users}}
+<table>
+  <thead><tr><th>Email</th><th>Name</th><th>Status</th><th>Platform admin</th><th>Last sign-in</th><th>Actions</th></tr></thead>
+  <tbody>
+  {{range $d.Users}}<tr>
+    <td>{{.Email}}</td><td>{{.Name}}</td><td>{{.Status}}</td><td>{{if .PlatformAdmin}}Yes{{else}}<span class="muted">No</span>{{end}}</td>
+    <td>{{when .LastLogin}}</td>
+    <td>{{if eq .ID $d.SelfID}}<span class="muted">you</span>{{else}}
+      <form method="post" action="/console/admin/users/{{.ID}}/status" class="inline">
+        <input type="hidden" name="csrf" value="{{$.CSRF}}"><input type="hidden" name="q" value="{{$d.Query}}">
+        {{if eq .Status "active"}}<input type="hidden" name="status" value="suspended"><button type="submit" class="danger" aria-label="Suspend {{.Email}}">Suspend</button>
+        {{else}}<input type="hidden" name="status" value="active"><button type="submit" class="danger" aria-label="Reactivate {{.Email}}">Reactivate</button>{{end}}
+      </form>
+      <form method="post" action="/console/admin/users/{{.ID}}/admin" class="inline">
+        <input type="hidden" name="csrf" value="{{$.CSRF}}"><input type="hidden" name="q" value="{{$d.Query}}">
+        {{if .PlatformAdmin}}<input type="hidden" name="admin" value="0"><button type="submit" class="danger" aria-label="Remove platform admin from {{.Email}}">Remove admin</button>
+        {{else}}<input type="hidden" name="admin" value="1"><button type="submit" class="danger" aria-label="Make {{.Email}} a platform admin">Make admin</button>{{end}}
+      </form>
+    {{end}}</td>
+  </tr>{{end}}
+  </tbody>
+</table>
+<p class="note">Showing up to 200 users, newest first. Suspending a user ends all their sessions.</p>
+{{else}}<p>No users match.</p>{{end}}
+{{end}}

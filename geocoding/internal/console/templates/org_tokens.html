@@ -1,0 +1,53 @@
+{{define "content"}}{{$d := .Data}}{{$f := $d.Form}}{{$base := printf "/console/orgs/%s/tokens" .Org.Org.Slug}}
+<h1>OAuth tokens</h1>
+<p class="muted">Machine clients can call the API with an access token from your own identity provider instead of an API key. Register the issuer here, then have the client use the client-credentials grant at your IdP.</p>
+
+{{if $d.Issuers}}
+<table>
+  <thead><tr><th>Issuer</th><th>Audience</th><th>Scope prefix</th><th>Subjects</th><th>Status</th><th></th></tr></thead>
+  <tbody>
+  {{range $d.Issuers}}<tr>
+    <td><a href="{{$base}}/{{.ID}}">{{.Issuer}}</a></td><td><code>{{.Audience}}</code></td>
+    <td>{{if .ScopePrefix}}<code>{{.ScopePrefix}}</code>{{else}}<span class="muted">none</span>{{end}}</td>
+    <td>{{if .AllowedSubjects}}{{len .AllowedSubjects}} allowed{{else}}any{{end}}</td>
+    <td>{{if .Enabled}}Enabled{{else}}<span class="muted">Disabled</span>{{end}}</td>
+    <td><form method="post" action="{{$base}}/{{.ID}}/delete" class="inline"><input type="hidden" name="csrf" value="{{$.CSRF}}"><button type="submit" class="danger" aria-label="Remove issuer {{.Issuer}}">Remove</button></form></td>
+  </tr>{{end}}
+  </tbody>
+</table>
+{{else}}
+<p>No issuers registered.</p>
+{{end}}
+
+<form method="post" action="{{if $f.ID}}{{$base}}/{{$f.ID}}{{else}}{{$base}}{{end}}" class="card">
+  <h2>{{if $f.ID}}Edit issuer{{else}}Register an issuer{{end}}</h2>
+  <input type="hidden" name="csrf" value="{{.CSRF}}">
+  <label for="issuer">Issuer URL</label>
+  <input id="issuer" name="issuer" type="url" required pattern="https://.*" value="{{$f.Issuer}}" placeholder="https://login.microsoftonline.com/{tenant-id}/v2.0" aria-describedby="issuer-help">
+  <p id="issuer-help" class="note">Must match the token's <code>iss</code> exactly.</p>
+  <label for="audience">Audience</label>
+  <input id="audience" name="audience" required maxlength="512" value="{{$f.Audience}}" placeholder="api://au-geocoder" aria-describedby="aud-help">
+  <p id="aud-help" class="note">Tokens must list this value in <code>aud</code>.</p>
+  <label for="jwks_url">JWKS URL (optional)</label>
+  <input id="jwks_url" name="jwks_url" type="url" pattern="https://.*" value="{{$f.JWKSURL}}" aria-describedby="jwks-help">
+  <p id="jwks-help" class="note">Leave blank to find the keys through the issuer's OpenID discovery document.</p>
+  <label for="scope_prefix">Scope prefix</label>
+  <input id="scope_prefix" name="scope_prefix" maxlength="64" value="{{$f.ScopePrefix}}" placeholder="geo." aria-describedby="scope-help">
+  <p id="scope-help" class="note">Tokens need the scope <code>{{$f.ScopePrefix}}search</code> for search, geocode, reverse, POI, parse and suggest, and <code>{{$f.ScopePrefix}}batch</code> for batch. The prefix is stripped before the check.</p>
+  <label for="allowed_subjects">Allowed subjects (optional)</label>
+  <textarea id="allowed_subjects" name="allowed_subjects" aria-describedby="subs-help">{{$f.AllowedSubjects}}</textarea>
+  <p id="subs-help" class="note">One <code>sub</code> per line (or space-separated). Leave blank to accept any client of this issuer and audience.</p>
+  <label class="check"><input type="checkbox" name="enabled" value="1" {{if $f.Enabled}}checked{{end}}> Enabled</label>
+  <button type="submit">{{if $f.ID}}Save{{else}}Register issuer{{end}}</button>
+  {{if $f.ID}} <a href="{{$base}}">Cancel</a>{{end}}
+</form>
+
+<div class="card">
+  <h2>Calling the API</h2>
+  <p>Get a token from your IdP with the client-credentials grant, then:</p>
+  <pre><code>curl -X POST -H "Authorization: Bearer $ACCESS_TOKEN" \
+  --data-binary '1 Martin Place Sydney' \
+  {{$d.APIBase}}/search</code></pre>
+  <p class="note">Usage counts against this organisation's daily row quota at its tier. Do not send <code>X-Api-Key</code> as well; a request with both is refused.</p>
+</div>
+{{end}}
