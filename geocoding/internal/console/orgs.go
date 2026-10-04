@@ -7,9 +7,14 @@ import (
 	"augeocoding/internal/publicapi"
 )
 
-// registerOrgRoutes mounts /console/orgs/{org}/... pages.
+// registerOrgRoutes mounts /console/orgs/{org}/... pages. Core pages (keys,
+// members, domains, audit, settings) are in org_core.go; identity pages
+// (SSO connections, group mappings, SCIM tokens, OAuth issuers) in
+// org_identity.go.
 func (s *Server) registerOrgRoutes(mux *http.ServeMux) {
 	mux.Handle("GET /console/orgs/{org}", s.orgRoute(identity.RoleViewer, s.handleOrgOverview))
+	s.registerOrgCoreRoutes(mux)
+	s.registerOrgIdentityRoutes(mux)
 }
 
 type overviewData struct {
