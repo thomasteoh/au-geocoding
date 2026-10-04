@@ -346,29 +346,33 @@ func urlq(s string) string {
 func TestLinkExistingUser(t *testing.T) {
 	f := setup(t)
 	ctx := context.Background()
-	// A user with an acme.example address who already belongs to org B.
+	// An account that already belongs to org B cannot be captured by org A's
+	// SCIM token, even on org A's verified domain.
 	u, _ := f.ids.CreateUser(ctx, "shared@acme.example", "Original")
 	f.ids.SetMembership(ctx, f.orgB.ID, u.ID, identity.RoleDeveloper, "manual")
 	r := f.do(t, f.tokA, "POST", "/Users", userBody("shared@acme.example", map[string]any{"displayName": "From IdP"}))
+	if r.code != 400 || r.body["scimType"] != "invalidValue" {
+		t.Fatalf("foreign account linked: %d %v", r.code, r.body)
+	}
+	if f.role(t, f.orgA.ID, u.Email) != identity.RoleNone {
+		t.Fatal("foreign account got a membership")
+	}
+	// A platform admin is never linkable either.
+	adm, _ := f.ids.CreateUser(ctx, "ops@acme.example", "")
+	f.ids.SetPlatformAdmin(ctx, adm.ID, true)
+	if r := f.do(t, f.tokA, "POST", "/Users", userBody("ops@acme.example", nil)); r.code != 400 {
+		t.Fatalf("platform admin linked: %d", r.code)
+	}
+	// An account with no other access links, keeps its name, and a
+	// deactivate leaves its manual membership alone.
+	solo, _ := f.ids.CreateUser(ctx, "solo@acme.example", "Original")
+	f.ids.SetMembership(ctx, f.orgA.ID, solo.ID, identity.RoleDeveloper, "manual")
+	r = f.do(t, f.tokA, "POST", "/Users", userBody("solo@acme.example", nil))
 	f.mustCode(t, r, 201)
 	id := r.body["id"].(string)
-	got, _ := f.ids.UserByEmail(ctx, "shared@acme.example")
-	if got.ID != u.ID || got.Name != "Original" {
-		t.Fatalf("linked user changed globally: %+v", got)
-	}
-	if f.role(t, f.orgA.ID, u.Email) != identity.RoleViewer || f.role(t, f.orgB.ID, u.Email) != identity.RoleDeveloper {
-		t.Fatal("memberships wrong")
-	}
-	// userName change on a shared user is refused.
-	r = f.do(t, f.tokA, "PATCH", "/Users/"+id, patch(map[string]any{"op": "replace", "path": "userName", "value": "renamed@acme.example"}))
-	if r.code != 400 || r.body["scimType"] != "mutability" {
-		t.Fatalf("rename shared: %d %v", r.code, r.body)
-	}
-	// Deactivating leaves the user active (still in org B).
 	f.mustCode(t, f.do(t, f.tokA, "PATCH", "/Users/"+id, patch(map[string]any{"op": "replace", "value": map[string]any{"active": false}})), 200)
-	got, _ = f.ids.UserByEmail(ctx, "shared@acme.example")
-	if got.Status != identity.StatusActive || f.role(t, f.orgA.ID, u.Email) != identity.RoleNone || f.role(t, f.orgB.ID, u.Email) != identity.RoleDeveloper {
-		t.Fatalf("deactivate shared: %+v", got)
+	if f.role(t, f.orgA.ID, solo.Email) != identity.RoleDeveloper {
+		t.Fatal("SCIM deactivate removed a console-added membership")
 	}
 }
 
@@ -618,25 +622,20 @@ func TestManualMembershipNotChanged(t *testing.T) {
 func TestLastOwner(t *testing.T) {
 	f := setup(t)
 	ctx := context.Background()
-	// Linking the org's only owner and deactivating them is refused.
+	// Linking the org's manual owner and deactivating them leaves the
+	// owner membership in place: SCIM only removes what SCIM created.
 	owner := f.createUser(t, f.tokA, "owner@acme.example")
-	r := f.do(t, f.tokA, "PATCH", "/Users/"+owner, patch(map[string]any{"op": "replace", "path": "active", "value": false}))
-	if r.code != 400 || !strings.Contains(r.body["detail"].(string), "owner") {
-		t.Fatalf("last owner deactivate %d %v", r.code, r.body)
-	}
-	f.mustCode(t, f.do(t, f.tokA, "DELETE", "/Users/"+owner, nil), 400)
+	f.mustCode(t, f.do(t, f.tokA, "PATCH", "/Users/"+owner, patch(map[string]any{"op": "replace", "path": "active", "value": false})), 200)
+	f.mustCode(t, f.do(t, f.tokA, "DELETE", "/Users/"+owner, nil), 204)
 	if f.role(t, f.orgA.ID, "owner@acme.example") != identity.RoleOwner {
-		t.Fatal("owner removed")
-	}
-	if g := f.do(t, f.tokA, "GET", "/Users/"+owner, nil); g.body["active"] != true {
-		t.Fatal("refused deactivate was persisted")
+		t.Fatal("owner removed through SCIM")
 	}
 
 	// A SCIM-mapped owner becomes the last owner; removing them from the
 	// group is refused and changes nothing.
 	f.ids.AddGroupMapping(ctx, identity.GroupMapping{OrgID: f.orgA.ID, Source: identity.SourceSCIM, Group: "Owners", Role: identity.RoleOwner})
 	carol := f.createUser(t, f.tokA, "carol@acme.example")
-	r = f.do(t, f.tokA, "POST", "/Groups", map[string]any{"displayName": "Owners", "members": []any{map[string]any{"value": carol}}})
+	r := f.do(t, f.tokA, "POST", "/Groups", map[string]any{"displayName": "Owners", "members": []any{map[string]any{"value": carol}}})
 	f.mustCode(t, r, 201)
 	grp := r.body["id"].(string)
 	if f.role(t, f.orgA.ID, "carol@acme.example") != identity.RoleOwner {

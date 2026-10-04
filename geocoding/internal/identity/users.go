@@ -577,15 +577,15 @@ func (s *Store) hasInvite(ctx context.Context, email string) bool {
 	return n > 0
 }
 
-// acceptInvites turns a user's pending invites into memberships. An invite
-// never lowers an existing role.
-func (s *Store) acceptInvites(ctx context.Context, u User) ([]int64, error) {
+// acceptInvites turns a user's pending invites into memberships, all of them
+// or (orgID != 0) only that org's. An invite never lowers an existing role.
+func (s *Store) acceptInvites(ctx context.Context, u User, orgID int64) ([]int64, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, err
 	}
 	defer tx.Rollback()
-	rows, err := tx.QueryContext(ctx, `SELECT org_id, role FROM invites WHERE email=? AND expires>?`, u.Email, now())
+	rows, err := tx.QueryContext(ctx, `SELECT org_id, role FROM invites WHERE email=? AND expires>? AND (?=0 OR org_id=?)`, u.Email, now(), orgID, orgID)
 	if err != nil {
 		return nil, err
 	}
@@ -622,7 +622,7 @@ func (s *Store) acceptInvites(ctx context.Context, u User) ([]int64, error) {
 		}
 		orgs = append(orgs, i.org)
 	}
-	if _, err := tx.ExecContext(ctx, `DELETE FROM invites WHERE email=?`, u.Email); err != nil {
+	if _, err := tx.ExecContext(ctx, `DELETE FROM invites WHERE email=? AND (?=0 OR org_id=?)`, u.Email, orgID, orgID); err != nil {
 		return nil, err
 	}
 	return orgs, tx.Commit()

@@ -148,7 +148,26 @@ func validateConn(c *Connection) error {
 	default:
 		return ErrInvalid
 	}
+	// A multi-tenant Entra issuer accepts every tenant's users; on an org
+	// connection any tenant admin could assert the org's addresses.
+	if c.OrgID != 0 && c.Kind == KindOIDC && MultiTenantIssuer(c.Issuer) {
+		return ErrInvalid
+	}
 	return nil
+}
+
+// MultiTenantIssuer reports whether issuer is a shared Microsoft endpoint
+// (common, organizations, consumers) rather than one tenant.
+func MultiTenantIssuer(issuer string) bool {
+	if !strings.Contains(issuer, "login.microsoftonline.com") {
+		return false
+	}
+	for _, t := range []string{"/common/", "/organizations/", "/consumers/"} {
+		if strings.Contains(issuer+"/", t) {
+			return true
+		}
+	}
+	return false
 }
 
 func isLoopback(h string) bool {
@@ -187,7 +206,16 @@ func (s *Store) SaveConnection(ctx context.Context, c Connection) (Connection, e
 		id, _ := res.LastInsertId()
 		return s.ConnectionByID(ctx, id)
 	}
-	res, err := s.db.ExecContext(ctx, `UPDATE connections SET slug=?, preset=?, name=?, enabled=?, issuer=?, client_id=?,
+	old, err := s.OrgConnection(ctx, c.OrgID, c.ID)
+	if err != nil {
+		return c, err
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return c, err
+	}
+	defer tx.Rollback()
+	res, err := tx.ExecContext(ctx, `UPDATE connections SET slug=?, preset=?, name=?, enabled=?, issuer=?, client_id=?,
 		client_secret_enc=CASE WHEN ?='' THEN client_secret_enc ELSE ? END, scopes=?, groups_claim=?, trust_email=?, allowed_orgs=?,
 		saml_idp_metadata=?, saml_sp_key_enc=CASE WHEN ?='' THEN saml_sp_key_enc ELSE ? END,
 		saml_sp_cert=CASE WHEN ?='' THEN saml_sp_cert ELSE ? END, saml_email_attr=?, saml_name_attr=?, saml_groups_attr=?, managed=?
@@ -203,6 +231,21 @@ func (s *Store) SaveConnection(ctx context.Context, c Connection) (Connection, e
 	}
 	if n, _ := res.RowsAffected(); n == 0 {
 		return c, ErrNotFound
+	}
+	// Subjects are only meaningful to the IdP that issued them. If the
+	// connection now points at a different IdP, its old identities and
+	// sessions must not carry over, or the new IdP could replay a known
+	// subject to become that user.
+	if old.Issuer != c.Issuer || old.ClientID != c.ClientID || (c.SAMLIdPMetadata != "" && old.SAMLIdPMetadata != c.SAMLIdPMetadata) {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM identities WHERE connection_id=?`, c.ID); err != nil {
+			return c, err
+		}
+		if _, err := tx.ExecContext(ctx, `DELETE FROM sessions WHERE connection_id=?`, c.ID); err != nil {
+			return c, err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return c, err
 	}
 	return s.ConnectionByID(ctx, c.ID)
 }

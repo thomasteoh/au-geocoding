@@ -229,9 +229,104 @@ func TestSSOEnforcementBlocksPlatformLogin(t *testing.T) {
 	if !errors.As(err, &d) || d.Code != "sso_required" || d.SSOOrg != "acme" {
 		t.Fatalf("member via google: %v", err)
 	}
-	// Owner keeps break-glass access.
-	if _, err := s.ResolveLogin(ctx, Assertion{Connection: google, Subject: "o", Email: owner.Email, EmailTrusted: true}, LoginPolicy{}); err != nil {
+	// Owners are not exempt from platform logins (their break-glass path
+	// is a passkey); platform admins are.
+	_, err = s.ResolveLogin(ctx, Assertion{Connection: google, Subject: "o", Email: owner.Email, EmailTrusted: true}, LoginPolicy{})
+	if denialCode(err) != "sso_required" {
 		t.Fatalf("owner via google: %v", err)
+	}
+	if d := s.EnforcedSSO(ctx, owner); d != nil {
+		t.Fatal("owner lost passkey break-glass")
+	}
+	s.SetPlatformAdmin(ctx, owner.ID, true)
+	if _, err := s.ResolveLogin(ctx, Assertion{Connection: google, Subject: "o", Email: owner.Email, EmailTrusted: true}, LoginPolicy{}); err != nil {
+		t.Fatalf("platform admin via google: %v", err)
+	}
+}
+
+// TestOrgConnectionCannotTakeOverOutsideAccounts covers the review's account
+// takeover: an org IdP asserting an address must not capture an account that
+// has access outside the org.
+func TestOrgConnectionCannotTakeOverOutsideAccounts(t *testing.T) {
+	s := newStore(t)
+	org, c, owner := setupOrgWithDomain(t, s, "acme", "acme.example", true)
+	google := platformConn(t, s, "google", true)
+	// owner@acme.example also owns another org.
+	other, _ := s.CreateOrg(ctx, "Other", "other", owner.ID, false, false)
+	_, err := s.ResolveLogin(ctx, Assertion{Connection: c, Subject: "evil", Email: owner.Email}, LoginPolicy{})
+	if denialCode(err) != "link_not_allowed" {
+		t.Fatalf("takeover of multi-org owner: %v", err)
+	}
+	// A platform admin in the domain is never linkable.
+	admin, _ := s.CreateUser(ctx, "ops@acme.example", "")
+	s.SetPlatformAdmin(ctx, admin.ID, true)
+	if _, err := s.ResolveLogin(ctx, Assertion{Connection: c, Subject: "evil2", Email: admin.Email}, LoginPolicy{}); denialCode(err) != "link_not_allowed" {
+		t.Fatalf("takeover of platform admin: %v", err)
+	}
+	// Someone whose only other org is their personal workspace links fine.
+	res, err := s.ResolveLogin(ctx, Assertion{Connection: google, Subject: "g1", Email: "dev@acme.example", EmailTrusted: true}, LoginPolicy{SignupOpen: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.ResolveLogin(ctx, Assertion{Connection: c, Subject: "okta-dev", Email: "dev@acme.example"}, LoginPolicy{}); err != nil {
+		t.Fatalf("personal-only user: %v", err)
+	}
+	if r, _ := s.Role(ctx, org.ID, res.User.ID); r == RoleNone {
+		t.Fatal("JIT membership missing")
+	}
+	_ = other
+}
+
+func TestOrgConnectionInvitesScopedToOrg(t *testing.T) {
+	s := newStore(t)
+	_, c, _ := setupOrgWithDomain(t, s, "acme", "acme.example", true)
+	u, _ := s.CreateUser(ctx, "x@y.example", "")
+	victim, _ := s.CreateOrg(ctx, "Victim", "victim", u.ID, false, false)
+	s.CreateInvite(ctx, victim.ID, "new@acme.example", RoleAdmin, u.ID, time.Hour)
+	res, err := s.ResolveLogin(ctx, Assertion{Connection: c, Subject: "n", Email: "new@acme.example"}, LoginPolicy{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r, _ := s.Role(ctx, victim.ID, res.User.ID); r != RoleNone {
+		t.Fatalf("org connection accepted another org's invite: %v", r)
+	}
+}
+
+func TestBootstrapOnlyOnCreation(t *testing.T) {
+	s := newStore(t)
+	c := platformConn(t, s, "google", true)
+	p := LoginPolicy{BootstrapAdmins: []string{"boss@example.com"}}
+	a := Assertion{Connection: c, Subject: "1", Email: "boss@example.com", EmailTrusted: true}
+	res, _ := s.ResolveLogin(ctx, a, p)
+	s.SetPlatformAdmin(ctx, res.User.ID, false)
+	res, err := s.ResolveLogin(ctx, a, p)
+	if err != nil || res.User.PlatformAdmin {
+		t.Fatalf("bootstrap re-applied: %+v %v", res.User, err)
+	}
+}
+
+func TestOrgConnectionRules(t *testing.T) {
+	s := newStore(t)
+	org, c, _ := setupOrgWithDomain(t, s, "acme", "acme.example", true)
+	if _, err := s.SaveConnection(ctx, Connection{OrgID: org.ID, Slug: "acme-entra", Kind: KindOIDC, Preset: "entra", Name: "E", Enabled: true,
+		Issuer: "https://login.microsoftonline.com/organizations/v2.0", ClientID: "x"}); err != ErrInvalid {
+		t.Fatalf("multi-tenant org connection: %v", err)
+	}
+	// Repointing a connection drops its identities and sessions.
+	res, err := s.ResolveLogin(ctx, Assertion{Connection: c, Subject: "s1", Email: "a@acme.example"}, LoginPolicy{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.CreateSession(ctx, NewSession{UserID: res.User.ID, ConnectionID: c.ID, Method: "oidc"}, SessionPolicy{Idle: time.Hour, Max: time.Hour})
+	c.Issuer = "https://other-idp.example"
+	if _, err := s.SaveConnection(ctx, c); err != nil {
+		t.Fatal(err)
+	}
+	var ids, sess int
+	s.db.QueryRow(`SELECT COUNT(*) FROM identities WHERE connection_id=?`, c.ID).Scan(&ids)
+	s.db.QueryRow(`SELECT COUNT(*) FROM sessions WHERE connection_id=?`, c.ID).Scan(&sess)
+	if ids != 0 || sess != 0 {
+		t.Fatalf("identities=%d sessions=%d after issuer change", ids, sess)
 	}
 }
 

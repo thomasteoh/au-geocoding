@@ -18,23 +18,27 @@ import (
 // (mapping a group to owner) are checked in the handler.
 func (s *Server) registerOrgIdentityRoutes(mux *http.ServeMux) {
 	a := identity.RoleAdmin
+	// Whoever controls an org's IdP or SCIM feed decides who its members are
+	// and what roles they get, so those are owner-only. OAuth issuers only
+	// admit API callers, which admins already manage through keys.
+	o := identity.RoleOwner
 	org := func(h func(http.ResponseWriter, *http.Request, connScope)) http.HandlerFunc {
 		return func(w http.ResponseWriter, r *http.Request) { h(w, r, orgScope(r)) }
 	}
-	mux.Handle("GET /console/orgs/{org}/sso", s.orgRoute(a, org(s.handleConnList)))
-	mux.Handle("GET /console/orgs/{org}/sso/new", s.orgRoute(a, org(s.handleConnNew)))
-	mux.Handle("POST /console/orgs/{org}/sso", s.orgPost(a, org(s.handleConnCreate)))
-	mux.Handle("GET /console/orgs/{org}/sso/{id}", s.orgRoute(a, org(s.handleConnEdit)))
-	mux.Handle("POST /console/orgs/{org}/sso/{id}", s.orgPost(a, org(s.handleConnUpdate)))
-	mux.Handle("POST /console/orgs/{org}/sso/{id}/delete", s.orgPost(a, org(s.handleConnDelete)))
-	mux.Handle("POST /console/orgs/{org}/sso/{id}/mappings", s.orgPost(a, s.handleSSOMappingAdd))
-	mux.Handle("POST /console/orgs/{org}/sso/{id}/mappings/{mid}/delete", s.orgPost(a, s.handleSSOMappingDelete))
+	mux.Handle("GET /console/orgs/{org}/sso", s.orgRoute(o, org(s.handleConnList)))
+	mux.Handle("GET /console/orgs/{org}/sso/new", s.orgRoute(o, org(s.handleConnNew)))
+	mux.Handle("POST /console/orgs/{org}/sso", s.orgPost(o, org(s.handleConnCreate)))
+	mux.Handle("GET /console/orgs/{org}/sso/{id}", s.orgRoute(o, org(s.handleConnEdit)))
+	mux.Handle("POST /console/orgs/{org}/sso/{id}", s.orgPost(o, org(s.handleConnUpdate)))
+	mux.Handle("POST /console/orgs/{org}/sso/{id}/delete", s.orgPost(o, org(s.handleConnDelete)))
+	mux.Handle("POST /console/orgs/{org}/sso/{id}/mappings", s.orgPost(o, s.handleSSOMappingAdd))
+	mux.Handle("POST /console/orgs/{org}/sso/{id}/mappings/{mid}/delete", s.orgPost(o, s.handleSSOMappingDelete))
 
-	mux.Handle("GET /console/orgs/{org}/scim", s.orgRoute(a, s.handleSCIM))
-	mux.Handle("POST /console/orgs/{org}/scim/tokens", s.orgPost(a, s.handleSCIMTokenCreate))
-	mux.Handle("POST /console/orgs/{org}/scim/tokens/{id}/revoke", s.orgPost(a, s.handleSCIMTokenRevoke))
-	mux.Handle("POST /console/orgs/{org}/scim/mappings", s.orgPost(a, s.handleSCIMMappingAdd))
-	mux.Handle("POST /console/orgs/{org}/scim/mappings/{mid}/delete", s.orgPost(a, s.handleSCIMMappingDelete))
+	mux.Handle("GET /console/orgs/{org}/scim", s.orgRoute(o, s.handleSCIM))
+	mux.Handle("POST /console/orgs/{org}/scim/tokens", s.orgPost(o, s.handleSCIMTokenCreate))
+	mux.Handle("POST /console/orgs/{org}/scim/tokens/{id}/revoke", s.orgPost(o, s.handleSCIMTokenRevoke))
+	mux.Handle("POST /console/orgs/{org}/scim/mappings", s.orgPost(o, s.handleSCIMMappingAdd))
+	mux.Handle("POST /console/orgs/{org}/scim/mappings/{mid}/delete", s.orgPost(o, s.handleSCIMMappingDelete))
 
 	mux.Handle("GET /console/orgs/{org}/tokens", s.orgRoute(a, s.handleIssuers))
 	mux.Handle("POST /console/orgs/{org}/tokens", s.orgPost(a, s.handleIssuerCreate))

@@ -160,6 +160,8 @@ func mapStoreErr(err error) *scimError {
 		return errBad("invalidValue", "an org must keep at least one owner; assign another owner first")
 	case errors.Is(err, identity.ErrSCIMDomain):
 		return errBad("invalidValue", identity.ErrSCIMDomain.Error())
+	case errors.Is(err, identity.ErrSCIMForeign):
+		return errBad("invalidValue", identity.ErrSCIMForeign.Error())
 	case errors.Is(err, identity.ErrSCIMShared):
 		return errBad("mutability", identity.ErrSCIMShared.Error())
 	case errors.Is(err, identity.ErrSCIMMember):

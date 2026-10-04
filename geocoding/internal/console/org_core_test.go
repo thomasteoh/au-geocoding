@@ -283,9 +283,14 @@ func TestInvites(t *testing.T) {
 	if r := admin.post("/console/orgs/acme/invites", url.Values{"email": {"Existing@Example.com"}, "role": {"developer"}}, true); r.Status != http.StatusSeeOther {
 		t.Fatalf("invite existing: %d", r.Status)
 	}
-	if role, _ := h.ids.Role(h.ctx, org.ID, existing.ID); role != identity.RoleDeveloper {
-		t.Fatalf("existing user not added: %v", role)
+	// Existing accounts are invited, not added: they accept by signing in.
+	if role, _ := h.ids.Role(h.ctx, org.ID, existing.ID); role != identity.RoleNone {
+		t.Fatalf("existing user added without accepting: %v", role)
 	}
+	if inv, _ := h.ids.Invites(h.ctx, org.ID); len(inv) != 1 || inv[0].Email != "existing@example.com" {
+		t.Fatalf("existing user invite: %+v", inv)
+	}
+	h.ids.DeleteInvite(h.ctx, org.ID, mustInviteID(t, h, org.ID, "existing@example.com"))
 	if r := admin.post("/console/orgs/acme/invites", url.Values{"email": {"new@example.com"}, "role": {"viewer"}}, true); r.Status != http.StatusSeeOther {
 		t.Fatalf("invite new: %d", r.Status)
 	}
@@ -294,7 +299,7 @@ func TestInvites(t *testing.T) {
 		t.Fatalf("invites: %+v", inv)
 	}
 	page := admin.get("/console/orgs/acme/members")
-	if !strings.Contains(page.Body, "new@example.com") || !strings.Contains(page.Body, "existing@example.com") {
+	if !strings.Contains(page.Body, "new@example.com") || !strings.Contains(page.Body, "admin@acme.example") {
 		t.Fatal("members page missing invite or member")
 	}
 	if r := admin.post(fmt.Sprintf("/console/orgs/acme/invites/%d/delete", inv[0].ID), nil, true); r.Status != http.StatusSeeOther {
@@ -462,4 +467,16 @@ func TestSettings(t *testing.T) {
 	if !h.hasAudit(org, "org.delete") || !h.hasAudit(org, "org.settings") {
 		t.Fatal("missing audit")
 	}
+}
+
+func mustInviteID(t *testing.T, h *harness, orgID int64, email string) int64 {
+	t.Helper()
+	inv, _ := h.ids.Invites(h.ctx, orgID)
+	for _, i := range inv {
+		if i.Email == email {
+			return i.ID
+		}
+	}
+	t.Fatalf("no invite for %s", email)
+	return 0
 }

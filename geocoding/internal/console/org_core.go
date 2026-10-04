@@ -373,28 +373,14 @@ func (s *Server) handleInviteCreate(w http.ResponseWriter, r *http.Request) {
 		s.renderError(w, r, http.StatusForbidden, "Only owners can invite owners.")
 		return
 	}
-	u, err := s.IDs.UserByEmail(r.Context(), email)
-	switch {
-	case err == nil:
-		cur, err := s.IDs.Role(r.Context(), oc.Org.ID, u.ID)
-		if err != nil {
-			s.serverError(w, r, err)
-			return
-		}
-		if cur != identity.RoleNone {
+	// Existing accounts get a pending invite like anyone else: they accept it
+	// by signing in, so nobody is added to an org without acting, and the
+	// response never reveals whether an account exists.
+	if u, err := s.IDs.UserByEmail(r.Context(), email); err == nil {
+		if cur, err := s.IDs.Role(r.Context(), oc.Org.ID, u.ID); err == nil && cur != identity.RoleNone {
 			redirectFlash(w, r, back, email+" is already a member.")
 			return
 		}
-		if err := s.IDs.SetMembership(r.Context(), oc.Org.ID, u.ID, role, "invite"); err != nil {
-			s.serverError(w, r, err)
-			return
-		}
-		s.audit(r, oc.Org.ID, "invite.create", email, "role="+role.String()+"; existing user added")
-		redirectFlash(w, r, back, "Added "+email+" as "+role.String()+".")
-		return
-	case !errors.Is(err, identity.ErrNotFound):
-		s.serverError(w, r, err)
-		return
 	}
 	if err := s.IDs.CreateInvite(r.Context(), oc.Org.ID, email, role, v.User.ID, inviteTTL); err != nil {
 		if errors.Is(err, identity.ErrInvalid) {
@@ -405,7 +391,7 @@ func (s *Server) handleInviteCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.audit(r, oc.Org.ID, "invite.create", email, "role="+role.String())
-	redirectFlash(w, r, back, "Invited "+email+". They join as "+role.String()+" when they first sign in.")
+	redirectFlash(w, r, back, "Invited "+email+". They join as "+role.String()+" when they next sign in.")
 }
 
 func (s *Server) handleInviteDelete(w http.ResponseWriter, r *http.Request) {

@@ -85,12 +85,12 @@ func (s *Store) ResolveLogin(ctx context.Context, a Assertion, p LoginPolicy) (L
 		// A platform login is still subject to later SSO enforcement on the
 		// person's email domain.
 		if c.Platform() {
-			if d := s.enforcedSSO(ctx, u.Email, u); d != nil {
+			if d := s.enforcedSSO(ctx, u.Email, u, false); d != nil {
 				return LoginResult{}, d
 			}
 		}
 		s.db.ExecContext(ctx, `UPDATE identities SET last_login=?, email=? WHERE connection_id=? AND subject=?`, now(), a.Email, c.ID, a.Subject)
-		if err := s.afterLogin(ctx, u, a, p); err != nil {
+		if err := s.afterLogin(ctx, u, a, p, false); err != nil {
 			return LoginResult{}, err
 		}
 		return LoginResult{User: u}, nil
@@ -125,11 +125,24 @@ func (s *Store) ResolveLogin(ctx context.Context, a Assertion, p LoginPolicy) (L
 			created = true
 		case err != nil:
 			return LoginResult{}, err
+		default:
+			// An org connection is configured by that org's own owners and its
+			// IdP decides what email it asserts, so it may only take over
+			// accounts that belong to the org anyway. Anyone with access
+			// elsewhere (other orgs, platform admin) links only by signing in
+			// the way they did before (A2).
+			ok, err := s.orgLinkable(ctx, u, c.OrgID)
+			if err != nil {
+				return LoginResult{}, err
+			}
+			if !ok {
+				return LoginResult{}, deny("link_not_allowed", "An account with this email already exists outside this organisation. Sign in the way you did before.")
+			}
 		}
 	} else {
 		// 3. Platform connection.
 		u, err = s.UserByEmail(ctx, a.Email)
-		if d := s.enforcedSSO(ctx, a.Email, u); d != nil {
+		if d := s.enforcedSSO(ctx, a.Email, u, false); d != nil {
 			return LoginResult{}, d
 		}
 		switch {
@@ -167,7 +180,7 @@ func (s *Store) ResolveLogin(ctx context.Context, a Assertion, p LoginPolicy) (L
 		}
 		return LoginResult{}, err
 	}
-	if err := s.afterLogin(ctx, u, a, p); err != nil {
+	if err := s.afterLogin(ctx, u, a, p, created); err != nil {
 		return LoginResult{}, err
 	}
 	u, err = s.UserByID(ctx, u.ID)
@@ -177,10 +190,11 @@ func (s *Store) ResolveLogin(ctx context.Context, a Assertion, p LoginPolicy) (L
 	return LoginResult{User: u, Created: created}, nil
 }
 
-// enforcedSSO denies a platform login (or a passkey login, by callers) for an
-// address whose domain belongs to an org that enforces SSO. Owners of that
-// org and platform admins are exempt so they keep break-glass access.
-func (s *Store) enforcedSSO(ctx context.Context, email string, u User) *Denial {
+// enforcedSSO denies a platform login or a passkey login for an address
+// whose domain belongs to an org that enforces SSO. Platform admins are
+// exempt; owners of that org are exempt only for passkeys (allowOwner), their
+// break-glass path when the IdP is down.
+func (s *Store) enforcedSSO(ctx context.Context, email string, u User, allowOwner bool) *Denial {
 	org, err := s.OrgForDomain(ctx, EmailDomain(email))
 	if err != nil || !org.SSOEnforced {
 		return nil
@@ -189,7 +203,7 @@ func (s *Store) enforcedSSO(ctx context.Context, email string, u User) *Denial {
 		if u.PlatformAdmin {
 			return nil
 		}
-		if r, _ := s.Role(ctx, org.ID, u.ID); r == RoleOwner {
+		if r, _ := s.Role(ctx, org.ID, u.ID); allowOwner && r == RoleOwner {
 			return nil
 		}
 	}
@@ -207,28 +221,47 @@ func (s *Store) membership(ctx context.Context, orgID, userID int64) (Role, stri
 
 // EnforcedSSO is the exported check for passkey login.
 func (s *Store) EnforcedSSO(ctx context.Context, u User) *Denial {
-	return s.enforcedSSO(ctx, u.Email, u)
+	return s.enforcedSSO(ctx, u.Email, u, true)
+}
+
+// orgLinkable reports whether an org connection may attach a new identity to
+// u: u is not a platform admin and belongs to no org other than orgID and
+// their own personal workspace.
+func (s *Store) orgLinkable(ctx context.Context, u User, orgID int64) (bool, error) {
+	if u.PlatformAdmin {
+		return false, nil
+	}
+	var n int
+	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM memberships m JOIN orgs o ON o.id=m.org_id
+		WHERE m.user_id=? AND m.org_id<>? AND NOT (o.personal=1 AND m.role='owner'
+			AND (SELECT COUNT(*) FROM memberships x WHERE x.org_id=o.id)=1)`, u.ID, orgID).Scan(&n)
+	return n == 0, err
 }
 
 // afterLogin applies invites, bootstrap admin, org-connection membership and
 // group mappings, and gives a member-less user a personal org.
-func (s *Store) afterLogin(ctx context.Context, u User, a Assertion, p LoginPolicy) error {
+func (s *Store) afterLogin(ctx context.Context, u User, a Assertion, p LoginPolicy, created bool) error {
 	trusted := a.EmailTrusted && strings.EqualFold(u.Email, a.Email)
 	c := a.Connection
-	if !c.Platform() && s.orgHasVerifiedDomain(ctx, c.OrgID, EmailDomain(u.Email)) {
-		// Verified-domain org connections vouch for the address.
-		trusted = true
-	}
-	if trusted {
-		if _, err := s.acceptInvites(ctx, u); err != nil {
+	switch {
+	case trusted:
+		if _, err := s.acceptInvites(ctx, u, 0); err != nil {
 			return err
 		}
-		if p.bootstrap(u.Email) && !u.PlatformAdmin {
-			if err := s.SetPlatformAdmin(ctx, u.ID, true); err != nil {
-				return err
-			}
-			s.Audit(ctx, AuditEvent{ActorID: u.ID, Actor: "system", Action: "platform_admin.bootstrap", Target: u.Email})
+	case !c.Platform() && s.orgHasVerifiedDomain(ctx, c.OrgID, EmailDomain(u.Email)):
+		// An org connection on its verified domain vouches for the address
+		// within that org only.
+		if _, err := s.acceptInvites(ctx, u, c.OrgID); err != nil {
+			return err
 		}
+	}
+	// Bootstrap applies once, when the account is created through a trusted
+	// address; a platform admin who later revokes it stays revoked.
+	if trusted && created && p.bootstrap(u.Email) && !u.PlatformAdmin {
+		if err := s.SetPlatformAdmin(ctx, u.ID, true); err != nil {
+			return err
+		}
+		s.Audit(ctx, AuditEvent{ActorID: u.ID, Actor: "system", Action: "platform_admin.bootstrap", Target: u.Email})
 	}
 	if !c.Platform() {
 		org, err := s.OrgByID(ctx, c.OrgID)
@@ -278,7 +311,15 @@ func (s *Store) afterLogin(ctx context.Context, u User, a Assertion, p LoginPoli
 		if name == "" {
 			name = strings.SplitN(u.Email, "@", 2)[0]
 		}
-		if _, err := s.CreateOrg(ctx, name+"'s workspace", Slugify(strings.SplitN(u.Email, "@", 2)[0]), u.ID, true, true); err != nil {
+		if r := []rune(name); len(r) > 60 {
+			name = string(r[:60])
+		}
+		_, err := s.CreateOrg(ctx, name+"'s workspace", Slugify(strings.SplitN(u.Email, "@", 2)[0]), u.ID, true, true)
+		if errors.Is(err, ErrConflict) {
+			// Every numbered variant is taken (squatted); fall back to random.
+			_, err = s.CreateOrg(ctx, name+"'s workspace", "ws-"+strings.ToLower(RandomToken(6)), u.ID, true, true)
+		}
+		if err != nil {
 			return err
 		}
 	}

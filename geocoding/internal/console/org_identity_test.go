@@ -262,15 +262,24 @@ func TestGroupMappings(t *testing.T) {
 	}
 	base := fmt.Sprintf("/console/orgs/acme/sso/%d/mappings", c.ID)
 
+	// Mappings decide roles, so they are owner-only.
 	ab := h.signIn(admin)
-	ab.post(base, url.Values{"group": {"geo-devs"}, "role": {"developer"}}, true)
-	ab.post(base, url.Values{"group": {"geo-owners"}, "role": {"owner"}}, true) // refused: admin cannot map to owner
-	ab.post("/console/orgs/acme/scim/mappings", url.Values{"group": {"SCIM Admins"}, "role": {"admin"}}, true)
+	if r := ab.post(base, url.Values{"group": {"geo-devs"}, "role": {"developer"}}, true); r.Status != http.StatusForbidden {
+		t.Fatalf("admin SSO mapping: %d", r.Status)
+	}
+	if r := ab.post("/console/orgs/acme/scim/mappings", url.Values{"group": {"SCIM Admins"}, "role": {"admin"}}, true); r.Status != http.StatusForbidden {
+		t.Fatalf("admin SCIM mapping: %d", r.Status)
+	}
+	if ms, _ := h.ids.GroupMappings(h.ctx, org.ID); len(ms) != 0 {
+		t.Fatalf("admin created mappings: %+v", ms)
+	}
+	ob := h.signIn(owner)
+	ob.post(base, url.Values{"group": {"geo-devs"}, "role": {"developer"}}, true)
+	ob.post("/console/orgs/acme/scim/mappings", url.Values{"group": {"SCIM Admins"}, "role": {"admin"}}, true)
 	ms, _ := h.ids.GroupMappings(h.ctx, org.ID)
 	if len(ms) != 2 {
 		t.Fatalf("mappings: %+v", ms)
 	}
-	ob := h.signIn(owner)
 	ob.post(base, url.Values{"group": {"geo-owners"}, "role": {"owner"}}, true)
 	ms, _ = h.ids.GroupMappings(h.ctx, org.ID)
 	var dev, own, scim identity.GroupMapping
@@ -287,17 +296,19 @@ func TestGroupMappings(t *testing.T) {
 	if dev.ConnectionID != c.ID || dev.Source != identity.SourceSSO || own.Role != identity.RoleOwner || scim.Source != identity.SourceSCIM {
 		t.Fatalf("mappings: %+v", ms)
 	}
-	if r := ab.get(fmt.Sprintf("/console/orgs/acme/sso/%d", c.ID)); !strings.Contains(r.Body, "geo-devs") {
+	if r := ob.get(fmt.Sprintf("/console/orgs/acme/sso/%d", c.ID)); !strings.Contains(r.Body, "geo-devs") {
 		t.Fatal("mapping not listed")
 	}
-	// Admin cannot delete the owner mapping; deleting a SCIM mapping through
-	// the SSO URL (wrong source) is not found.
-	ab.post(fmt.Sprintf("%s/%d/delete", base, own.ID), nil, true)
-	if r := ab.post(fmt.Sprintf("%s/%d/delete", base, scim.ID), nil, true); r.Status != http.StatusNotFound {
+	// Admins cannot delete mappings; deleting a SCIM mapping through the SSO
+	// URL (wrong source) is not found.
+	if r := ab.post(fmt.Sprintf("%s/%d/delete", base, dev.ID), nil, true); r.Status != http.StatusForbidden {
+		t.Fatalf("admin delete mapping: %d", r.Status)
+	}
+	if r := ob.post(fmt.Sprintf("%s/%d/delete", base, scim.ID), nil, true); r.Status != http.StatusNotFound {
 		t.Fatalf("scim mapping via sso url: %d", r.Status)
 	}
-	ab.post(fmt.Sprintf("%s/%d/delete", base, dev.ID), nil, true)
-	ab.post(fmt.Sprintf("/console/orgs/acme/scim/mappings/%d/delete", scim.ID), nil, true)
+	ob.post(fmt.Sprintf("%s/%d/delete", base, dev.ID), nil, true)
+	ob.post(fmt.Sprintf("/console/orgs/acme/scim/mappings/%d/delete", scim.ID), nil, true)
 	ms, _ = h.ids.GroupMappings(h.ctx, org.ID)
 	if len(ms) != 1 || ms[0].ID != own.ID {
 		t.Fatalf("after deletes: %+v", ms)

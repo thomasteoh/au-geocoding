@@ -21,6 +21,9 @@ var (
 	// ErrSCIMShared: the change would alter a user record shared with other
 	// orgs (or a platform admin), which one org's IdP may not do.
 	ErrSCIMShared = errors.New("user belongs to other orgs; userName cannot be changed by this org")
+	// ErrSCIMForeign: the address belongs to an account with access outside
+	// this org (other orgs or platform admin), which SCIM may not capture.
+	ErrSCIMForeign = errors.New("an account with this userName has access outside this organisation and cannot be provisioned by it")
 	// ErrSCIMMember: a group member is not a SCIM user of this org.
 	ErrSCIMMember = errors.New("group member is not a provisioned user of this org")
 )
@@ -257,6 +260,17 @@ func (s *Store) CreateSCIMUser(ctx context.Context, orgID int64, in SCIMUserInpu
 	case err != nil:
 		return SCIMUser{}, err
 	default:
+		// Linking an account that has access elsewhere would let this org's
+		// IdP (and anyone holding its SCIM token) act on it (A9).
+		u, err := s.UserByID(ctx, uid)
+		if err != nil {
+			return SCIMUser{}, err
+		}
+		if ok, err := s.orgLinkable(ctx, u, orgID); err != nil {
+			return SCIMUser{}, err
+		} else if !ok {
+			return SCIMUser{}, ErrSCIMForeign
+		}
 		shared, err := sharedUserTx(ctx, tx, orgID, uid)
 		if err != nil {
 			return SCIMUser{}, err
@@ -396,12 +410,14 @@ func scimActivateTx(ctx context.Context, tx *sql.Tx, orgID, userID int64) error 
 	return err
 }
 
-// scimDeactivateTx removes the org membership (any source; the last owner is
-// protected), deletes the user's sessions and deprovisions a user left with
-// no memberships who is not a platform admin.
+// scimDeactivateTx removes the org membership SCIM created (memberships added
+// in the console are the console's to remove; the last owner is protected).
+// A user left with no memberships who is not a platform admin is
+// deprovisioned and signed out everywhere; anyone else keeps their sessions,
+// which no longer reach this org.
 func scimDeactivateTx(ctx context.Context, tx *sql.Tx, orgID, userID int64) error {
 	var cur string
-	err := tx.QueryRowContext(ctx, `SELECT role FROM memberships WHERE org_id=? AND user_id=?`, orgID, userID).Scan(&cur)
+	err := tx.QueryRowContext(ctx, `SELECT role FROM memberships WHERE org_id=? AND user_id=? AND source=?`, orgID, userID, SourceSCIM).Scan(&cur)
 	switch {
 	case errors.Is(err, sql.ErrNoRows):
 	case err != nil:
@@ -412,15 +428,18 @@ func scimDeactivateTx(ctx context.Context, tx *sql.Tx, orgID, userID int64) erro
 				return err
 			}
 		}
-		if _, err := tx.ExecContext(ctx, `DELETE FROM memberships WHERE org_id=? AND user_id=?`, orgID, userID); err != nil {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM memberships WHERE org_id=? AND user_id=? AND source=?`, orgID, userID, SourceSCIM); err != nil {
 			return err
 		}
 	}
-	if _, err := tx.ExecContext(ctx, `DELETE FROM sessions WHERE user_id=?`, userID); err != nil {
+	res, err := tx.ExecContext(ctx, `UPDATE users SET status=? WHERE id=? AND platform_admin=0
+		AND NOT EXISTS (SELECT 1 FROM memberships WHERE user_id=?)`, StatusDeprovisioned, userID, userID)
+	if err != nil {
 		return err
 	}
-	_, err = tx.ExecContext(ctx, `UPDATE users SET status=? WHERE id=? AND platform_admin=0
-		AND NOT EXISTS (SELECT 1 FROM memberships WHERE user_id=?)`, StatusDeprovisioned, userID, userID)
+	if n, _ := res.RowsAffected(); n > 0 {
+		_, err = tx.ExecContext(ctx, `DELETE FROM sessions WHERE user_id=?`, userID)
+	}
 	return err
 }
 
