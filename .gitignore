@@ -1,0 +1,19 @@
+# Licensed datasets (D-018) and runtime state never enter the repo.
+**/data/
+*.db
+*.db-wal
+*.db-shm
+*.log
+
+# The places CI fixture is the one database that is committed (R9.2).
+!places/testdata/vic.db
+
+# Compiled binaries. CI and Docker build these from source.
+/places/gen
+/places/server
+/places/loadoscdiff
+/places/buildsuggest
+/places/bin/
+/geocoding/augeo
+/geocoding/keygen
+/geocoding/mockplaces

@@ -1,0 +1,26 @@
+# Build stage: static binaries, CGO-free (modernc.org/sqlite), no runtime deps.
+FROM golang:1.26-alpine AS build
+WORKDIR /src
+# Cache deps first for faster rebuilds.
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+# Build the serving server and the operator tool (keygen). The geocoder never
+# writes the geocoding DBs — it reads through the contract. CGO_ENABLED=0 keeps
+# them static and portable.
+RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/augeo ./cmd/augeo
+RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/keygen ./cmd/keygen
+
+# Runtime stage: minimal, runs as non-root. curl is needed for the compose
+# healthcheck (alpine base image ships no curl).
+FROM alpine:3.20
+RUN apk add --no-cache curl && adduser -D -u 10001 augeo && addgroup -g 10001 augeo
+COPY --from=build /out/augeo /usr/local/bin/augeo
+COPY --from=build /out/keygen /usr/local/bin/keygen
+USER augeo
+EXPOSE 8080
+# Split mode is the default deployment: the geocoder calls au-places over the
+# contract. Override via AUGEO_PLACES_URL. app.db holds keys/quota and is
+# operator-provided (issue keys with keygen before first boot).
+ENTRYPOINT ["/usr/local/bin/augeo"]
+CMD ["-addr", ":8080"]

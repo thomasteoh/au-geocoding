@@ -1,0 +1,362 @@
+/* anim.css — styles for the geocoding explainer animation.
+   Zero-dependency. The stage renders scenes as beat sequences. */
+
+/* ---- shell ---- */
+
+#app {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  max-width: 960px;
+  margin: 0 auto;
+  padding: 16px;
+  font-family: system-ui, sans-serif;
+  color: #1a1a2e;
+}
+
+/* ---- scene header / caption / progress ---- */
+
+.anim-header h2 {
+  margin: 0;
+  font-size: 1.2rem;
+  font-weight: 600;
+}
+
+.anim-caption {
+  margin: 8px 0 0;
+  font-size: 0.9rem;
+  color: #4a5568;
+  font-style: italic;
+}
+
+.anim-progress {
+  height: 4px;
+  background: #e2e8f0;
+  border-radius: 2px;
+  overflow: hidden;
+  margin-top: 8px;
+}
+
+.anim-progress-fill {
+  height: 100%;
+  background: #3987e5;
+  width: 0;
+  transition: width 0.2s ease;
+}
+
+/* ---- controls ---- */
+
+.anim-controls {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  flex-wrap: wrap;
+  margin-top: 8px;
+}
+
+.anim-controls button {
+  padding: 4px 10px;
+  border: 1px solid #cbd5e0;
+  background: #fff;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 0.85rem;
+}
+
+.anim-controls button:hover { background: #f0f4f8; }
+
+/* ---- stage ---- */
+
+.anim-stage {
+  position: relative;
+  min-height: 320px;
+  background: #f7fafc;
+  border: 1px solid #e2e8f0;
+  border-radius: 6px;
+  padding: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  overflow: hidden;
+}
+
+/* ---- beat nodes (diagram scenes) ---- */
+
+.anim-beat {
+  opacity: 0;
+  transition: opacity 0.2s ease-in-out, transform 0.2s ease-in-out;
+}
+
+.anim-beat.anim-in { opacity: 1; }
+.anim-beat.anim-active { opacity: 1; transform: none; }
+.anim-beat.anim-final { opacity: 1; }
+
+.anim-beat-type,
+.anim-beat-badge {
+  display: inline-block;
+  padding: 4px 10px;
+  background: #3987e5;
+  color: #fff;
+  border-radius: 4px;
+  font-family: ui-monospace, monospace;
+}
+
+.anim-beat-highlight {
+  color: #b7791f;
+  font-weight: 700;
+}
+
+.anim-beat-split { display: flex; gap: 6px; flex-wrap: wrap; }
+
+.anim-frag {
+  padding: 3px 8px;
+  background: #e6f0fb;
+  border: 1px solid #b7d4f0;
+  border-radius: 4px;
+  font-family: ui-monospace, monospace;
+}
+
+.anim-beat-probe {
+  font-family: ui-monospace, monospace;
+  color: #2d3748;
+}
+
+.anim-beat-probe[data-result="true"] { color: #199e70; }
+.anim-beat-probe[data-result="false"] { color: #718096; }
+
+.anim-beat-note {
+  padding: 8px 12px;
+  background: #fefcbf;
+  border-left: 3px solid #b7791f;
+  border-radius: 4px;
+  font-size: 0.9rem;
+  color: #744210;
+}
+
+/* ---- map scene (scatter / window / line / cross / ring) ---- */
+
+.anim-beat-scatter {
+  position: relative;
+  width: 100%;
+  height: 100%;
+  min-height: 260px;
+}
+
+.anim-point {
+  position: absolute;
+  width: 3px;
+  height: 3px;
+  border-radius: 50%;
+  background: #3987e5;
+  opacity: 0.4;
+}
+
+.anim-point[data-color="teal"] { background: #199e70; }
+.anim-point[data-color="amber"] { background: #d97706; }
+.anim-point[data-color="purple"] { background: #6b46c1; }
+.anim-point[data-color="orange"] { background: #dd6b20; }
+.anim-point[data-color="cyan"] { background: #00a0b0; }
+
+.anim-beat-window { position: absolute; inset: 0; }
+
+.anim-window {
+  position: absolute;
+  background: rgba(255, 255, 255, 0.6);
+  border: 1px solid #a0aec0;
+  border-radius: 4px;
+}
+
+.anim-beat-drawLine { position: absolute; inset: 0; }
+
+.anim-line {
+  width: 100%;
+  height: 100%;
+}
+
+.anim-cross {
+  position: absolute;
+  width: 8px;
+  height: 8px;
+  background: #d97706;
+  border-radius: 50%;
+  transform: scale(1);
+  animation: animPulse 0.6s ease-in-out 3;
+}
+
+.anim-ring {
+  position: absolute;
+  border: 2px dashed #00a0b0;
+  border-radius: 50%;
+  background: rgba(0, 160, 176, 0.08);
+}
+
+/* ---- chips ---- */
+
+.anim-chips {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+  margin-top: 8px;
+}
+
+.anim-chip {
+  padding: 4px 10px;
+  border: 1px solid #cbd5e0;
+  background: #fff;
+  border-radius: 12px;
+  cursor: pointer;
+  font-size: 0.8rem;
+}
+
+.anim-chip:hover { background: #f0f4f8; }
+.anim-chip-active { background: #3987e5; color: #fff; border-color: #3987e5; }
+
+/* ---- fallback ---- */
+
+.anim-fallback { padding: 24px; text-align: center; color: #718096; }
+
+/* ---- pulse keyframe ---- */
+
+@keyframes animPulse {
+  0% { transform: scale(1); }
+  50% { transform: scale(1.4); }
+  100% { transform: scale(1); }
+}
+
+/* ---- static panels ---- */
+
+.anim-panel { padding: 8px 0; }
+
+.anim-panel-cols {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+  justify-content: center;
+}
+
+.anim-panel-col {
+  flex: 1;
+  border: 1px solid #e2e8f0;
+  border-radius: 6px;
+  padding: 10px;
+  background: #fff;
+}
+
+.anim-panel-head {
+  font-weight: 700;
+  margin-bottom: 6px;
+  font-family: ui-monospace, monospace;
+  color: #2d3748;
+}
+
+.anim-panel-item {
+  padding: 3px 8px;
+  background: #f0f4f8;
+  border-radius: 4px;
+  margin: 4px 0;
+  font-size: 0.85rem;
+}
+
+.anim-panel-arrow { font-size: 1.4rem; color: #718096; }
+
+.anim-panel-rule {
+  margin-top: 10px;
+  padding: 8px 12px;
+  background: #fefcbf;
+  border-left: 3px solid #b7791f;
+  border-radius: 4px;
+  font-size: 0.9rem;
+  color: #744210;
+}
+
+.anim-panel-name {
+  font-family: ui-monospace, monospace;
+  font-weight: 700;
+  font-size: 1.1rem;
+  margin-bottom: 8px;
+}
+
+.anim-panel-stats {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+.anim-panel-stats span {
+  padding: 4px 10px;
+  background: #e6f0fb;
+  border: 1px solid #b7d4f0;
+  border-radius: 12px;
+  font-size: 0.85rem;
+}
+
+.anim-panel-note {
+  font-size: 0.9rem;
+  color: #4a5568;
+  font-style: italic;
+}
+
+/* ---- visible focus (keyboard accessibility) ---- */
+
+.anim-controls button:focus,
+.anim-chip:focus,
+#search-input:focus,
+#explainer-toggle:focus,
+.ambig-chip:focus,
+.result-card:focus {
+  outline: 2px solid #3987e5;
+  outline-offset: 2px;
+}
+
+/* ---- expanded result card (ux.md: match / authorities / precision) ---- */
+
+.result-card .result-detail {
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px solid #e2e8f0;
+  display: none;
+}
+
+.result-card.expanded .result-detail { display: block; }
+
+/* ---- status bar (error / empty / success states) ---- */
+
+.status-bar {
+  padding: 6px 10px;
+  border-radius: 4px;
+  font-size: 0.85rem;
+  margin: 4px 0;
+  background: #f0f4f8;
+  color: #4a5568;
+}
+.status-bar.status-ok { background: #e6f7f0; color: #199e70; }
+.status-bar.status-warn { background: #fefcbf; color: #744210; }
+.status-bar.status-error { background: #fde8e8; color: #c53030; }
+
+.result-card .result-meter {
+  display: inline-block;
+  padding: 2px 8px;
+  background: #e6f0fb;
+  border: 1px solid #b7d4f0;
+  border-radius: 10px;
+  font-size: 0.8rem;
+  margin: 2px 4px 2px 0;
+  font-family: ui-monospace, monospace;
+  color: #2d3748;
+}
+
+/* ---- reduced motion ---- */
+
+@media (prefers-reduced-motion: reduce) {
+  .anim-beat,
+  .anim-progress-fill,
+  .anim-cross,
+  .anim-window {
+    transition: none;
+    animation: none;
+  }
+  .anim-beat.anim-in,
+  .anim-beat.anim-active,
+  .anim-beat.anim-final { opacity: 1; }
+}

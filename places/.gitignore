@@ -1,0 +1,24 @@
+# Data — large, licensed downloads (D-018), never committed. The dataset is
+# built by the loader from sources; it is regenerable, not source.
+/data/
+
+# Test data — the DB is regenerable; the corpus TSVs are committed
+testdata/*.db
+testdata/*.db-wal
+testdata/*.db-shm
+
+# Databases anywhere (a stray build output outside data/ is still not source)
+*.db
+*.db-wal
+*.db-shm
+
+# Built binaries. The loader/server split (D-019) produces these; CI builds
+# them from source, so none of them belong in the tree.
+/gen
+/server
+/loadoscdiff
+/auplaces-server
+/auplaces-load
+/bin/
+
+*.log

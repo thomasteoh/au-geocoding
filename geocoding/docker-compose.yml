@@ -1,0 +1,78 @@
+# Compose example for the public geocoder (split mode). The geocoder calls
+# au-places over the /resolve contract; it never touches the geocoding DBs
+# directly — au-places owns those and mounts them read-only.
+#
+# Usage:
+#   1. Build/refresh the au-places dataset into its volume (see au-places
+#      docker-compose.yml — run --rm loader there).
+#   2. Start the places resolver, then the geocoder:
+#        docker compose up -d
+#   3. Issue a key into app.db before first boot (keygen is built into the
+#      image):
+#        docker compose run --rm augeo keygen -app-db /data/app.db -label my-key
+#   4. Verify:
+#        curl http://localhost:8090/readyz
+#        curl http://localhost:8099/readyz
+
+services:
+  augeo:
+    build: .
+    image: augeocoding:latest
+    container_name: augeo
+    ports:
+      - "8099:8080"
+    volumes:
+      - geocoder_data:/data
+    environment:
+      - AUGEO_ADDR=:8080
+      - AUGEO_APP_DB=/data/app.db
+      - AUGEO_PLACES_URL=http://places:8080
+      - AUGEO_CTRL_TOKEN=${AUGEO_CTRL_TOKEN:-}
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8080/readyz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
+
+  # The places resolver is a separate service in split mode. In a real
+  # deployment this points at a running au-places instance (see au-places'
+  # docker-compose.yml). Shown here as a stub for the contract endpoint. It
+  # builds from the au-places repo so `docker compose up -d` works standalone
+  # (the dataset must be provisioned first via au-places' loader).
+  places:
+    build: ../au-places
+    image: auplaces:latest
+    container_name: places
+    ports:
+      - "8090:8080"
+    volumes:
+      - places_data:/data:ro    # read-only mount (D-019, INV-4)
+    environment:
+      - AUGEO_DB=/data/vic.db
+      - AUGEO_ADDR=:8080
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8080/readyz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 120s   # dataset load can take minutes
+
+  # Monitoring: scrape /metrics from both services (augeo and places). Prometheus
+  # is the same instance that au-places' compose wires — targets use container
+  # names so it works on the compose network. Host port 9091 (not 9090) so both
+  # stacks can run side-by-side without a port clash.
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: augeo-prometheus
+    ports:
+      - "9091:9090"
+    volumes:
+      - ../au-places/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    restart: unless-stopped
+
+volumes:
+  geocoder_data:
+  places_data:

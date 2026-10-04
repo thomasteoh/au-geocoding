@@ -1,0 +1,81 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>au — geocoding explainer</title>
+  <link rel="stylesheet" href="/static/anim.css">
+  <style>
+    /* demo search SPA styles (small, local — no external CSS) */
+    .demo-shell { display: flex; gap: 16px; align-items: flex-start; }
+    .demo-search { flex: 1; min-width: 0; }
+    .demo-side { flex: 0 0 360px; }
+    #search-input {
+      width: 100%; padding: 10px 12px; font-size: 1rem;
+      border: 1px solid #cbd5e0; border-radius: 6px;
+    }
+    #strategy-chip { font-size: 0.9rem; font-weight: 600; margin-top: 8px; }
+    #result-meta { font-size: 0.85rem; color: #4a5568; margin-top: 4px; }
+    #result-list { margin-top: 12px; display: flex; flex-direction: column; gap: 8px; }
+    .result-card {
+      border: 1px solid #e2e8f0; border-radius: 6px; padding: 10px 12px;
+      cursor: pointer; background: #fff;
+    }
+    .result-card:hover { background: #f7fafc; }
+    .result-head { display: flex; justify-content: space-between; align-items: center; }
+    .result-name { font-weight: 600; }
+    .result-src { font-size: 0.8rem; color: #718096; }
+    .result-addr { font-size: 0.9rem; color: #4a5568; margin-top: 4px; }
+    .result-dist { font-size: 0.85rem; color: #199e70; margin-top: 2px; }
+    .result-coord { font-size: 0.8rem; color: #718096; margin-top: 2px; }
+    #map { margin-top: 12px; }
+    .local-map { width: 100%; height: auto; border: 1px solid #e2e8f0; border-radius: 6px; }
+    #playground {
+      margin-top: 12px; white-space: pre-wrap; font-family: ui-monospace, monospace;
+      font-size: 0.8rem; background: #f7fafc; border: 1px solid #e2e8f0;
+      border-radius: 6px; padding: 10px; max-height: 240px; overflow: auto;
+    }
+    #ambig { margin-top: 12px; display: flex; gap: 8px; flex-wrap: wrap; }
+    .ambig-note { font-size: 0.9rem; color: #b7791f; width: 100%; }
+    .ambig-chip {
+      padding: 4px 10px; border: 1px solid #cbd5e0; border-radius: 12px;
+      background: #fff; cursor: pointer; font-size: 0.8rem;
+    }
+    @media (max-width: 800px) { .demo-shell { flex-direction: column; } .demo-side { flex: none; } }
+  </style>
+</head>
+<body>
+  <main id="app"></main>
+
+  <noscript>
+    <div style="padding:16px;font-family:system-ui,sans-serif;color:#4a5568">
+      <p>The demo search and the explainer animation require JavaScript. Without it,
+      the page shows this note only. The search API (<code>/search</code>) still works
+      via <code>curl</code> or any HTTP client.</p>
+    </div>
+  </noscript>
+
+  <div class="demo-shell">
+    <div class="demo-search">
+      <input id="search-input" type="text" placeholder="Search places…" aria-label="Search places" />
+      <div id="strategy-chip" aria-live="polite"></div>
+      <div id="result-meta" aria-live="polite"></div>
+      <div id="status-bar" class="status-bar" role="status" aria-live="polite"></div>
+      <div id="result-list" aria-live="polite"></div>
+      <div id="map"></div>
+      <div id="playground" aria-live="polite"></div>
+      <div id="ambig" aria-live="polite"></div>
+    </div>
+    <div class="demo-side">
+      <button id="explainer-toggle" aria-expanded="true" aria-controls="explainer">How it works</button>
+      <div id="explainer" aria-live="polite"></div>
+      <div class="docs-entry">
+        <a href="/static/docs/">Read the form docs</a>
+      </div>
+    </div>
+  </div>
+
+  <script src="/static/anim.js"></script>
+  <script src="/static/app.js"></script>
+</body>
+</html>

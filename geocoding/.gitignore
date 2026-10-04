@@ -1,0 +1,11 @@
+# Data is never committed — G-NAF and OSM are licensed downloads (D-018).
+/data/
+*.db
+*.db-shm
+*.db-wal
+
+# Binaries
+/augeo
+/keygen
+/mockplaces
+/mock
