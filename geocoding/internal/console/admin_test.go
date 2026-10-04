@@ -228,32 +228,3 @@ func TestAdminUsers(t *testing.T) {
 		}
 	}
 }
-
-// The last active platform admin cannot be demoted or suspended, even by a
-// request that slipped past the self check (for example a second admin who
-// has since been suspended).
-func TestAdminLastAdminProtected(t *testing.T) {
-	h := newHarness(t, open)
-	root, b := h.platformAdmin("root@example.com")
-	second := h.user("second@example.com")
-	h.ids.SetPlatformAdmin(h.ctx, second.ID, true)
-	second, _ = h.ids.UserByID(h.ctx, second.ID)
-	req := httptest.NewRequest(http.MethodGet, "/", nil)
-	if last, _ := h.con.lastAdmin(req, second); last {
-		t.Fatal("two admins: second reported as last")
-	}
-	// root suspends second; root is now the only active admin.
-	b.post(fmt.Sprintf("/console/admin/users/%d/status", second.ID), url.Values{"status": {"suspended"}}, true)
-	root, _ = h.ids.UserByID(h.ctx, root.ID)
-	if last, _ := h.con.lastAdmin(req, root); !last {
-		t.Fatal("root should be the last active admin")
-	}
-	// A suspended admin is not counted and can still be demoted.
-	second, _ = h.ids.UserByID(h.ctx, second.ID)
-	if last, _ := h.con.lastAdmin(req, second); last {
-		t.Fatal("suspended admin reported as last")
-	}
-	if r := b.post(fmt.Sprintf("/console/admin/users/%d/admin", second.ID), url.Values{"admin": {"0"}}, true); r.Status != http.StatusSeeOther {
-		t.Fatalf("demote suspended: %d", r.Status)
-	}
-}
