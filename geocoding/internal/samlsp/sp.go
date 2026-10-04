@@ -36,8 +36,8 @@ func ACSURL(publicURL, slug string) string {
 	return publicURL + "/auth/saml/" + url.PathEscape(slug) + "/acs"
 }
 
-// New builds the service provider for a SAML connection: SP-initiated only,
-// signed AuthnRequests, signed assertions (or a signed response) required.
+// New builds the service provider for a SAML connection: SP-initiated sign-in
+// only, single logout in both directions, signed AuthnRequests, signed assertions (or a signed response) required.
 func New(publicURL string, c identity.Connection) (*saml.ServiceProvider, error) {
 	sp, err := base(publicURL, c)
 	if err != nil {
@@ -91,10 +91,18 @@ func base(publicURL string, c identity.Connection) (*saml.ServiceProvider, error
 	if err != nil {
 		return nil, err
 	}
+	slo, err := url.Parse(SLOURL(publicURL, c.Slug))
+	if err != nil {
+		return nil, err
+	}
 	sp := &saml.ServiceProvider{
 		EntityID:    md.String(),
 		MetadataURL: *md,
 		AcsURL:      *acs,
+		SloURL:      *slo,
+		// Advertised in metadata; inbound logout messages are handled by
+		// ParseLogout (slo.go).
+		LogoutBindings: []string{saml.HTTPRedirectBinding, saml.HTTPPostBinding},
 		// Ask for no particular format; the IdP's configured persistent or
 		// email NameID is used. crewjam's default (transient) is useless as
 		// a stable subject.
