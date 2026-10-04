@@ -1,0 +1,14 @@
+{{define "content"}}{{$d := .Data}}
+<h1>Platform admin</h1>
+<div class="stats">
+  <div class="stat"><span class="label">Organisations</span><span class="value">{{$d.Orgs}}</span></div>
+  <div class="stat"><span class="label">Platform connections</span><span class="value">{{$d.Connections}}</span></div>
+  <div class="stat"><span class="label">Active platform admins</span><span class="value">{{$d.Admins}}</span></div>
+</div>
+<ul>
+  <li><a href="/console/admin/orgs">Organisations</a>: tiers, members and SSO enforcement</li>
+  <li><a href="/console/admin/connections">Platform sign-in connections</a>: the providers on the sign-in page</li>
+  <li><a href="/console/admin/users">Users</a>: suspend, reactivate, platform admin</li>
+</ul>
+<p class="note">Platform admins can open any organisation's pages with owner rights. Every platform action is recorded in the audit log.</p>
+{{end}}

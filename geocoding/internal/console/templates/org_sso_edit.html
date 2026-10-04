@@ -1,0 +1,130 @@
+{{define "content"}}{{$d := .Data}}{{$sc := $d.Scope}}{{$c := $d.Conn}}
+<p class="note"><a href="{{$sc.Base}}">{{if $sc.Platform}}Platform connections{{else}}Single sign-on{{end}}</a></p>
+<h1>{{if $d.New}}New {{if eq $c.Kind "oidc"}}OpenID Connect{{else if eq $c.Kind "github"}}GitHub{{else}}SAML 2.0{{end}} connection{{else}}{{$c.Name}}{{end}}</h1>
+
+{{if $c.Managed}}
+<p class="note" role="note">This connection is declared in <code>AUGEO_AUTH_PROVIDERS_FILE</code> and is read-only here. Change it in that file and restart.</p>
+{{end}}
+
+<div class="card">
+  <h2>For your identity provider admin</h2>
+  {{if eq $c.Kind "saml"}}
+    {{if $c.Slug}}
+    <p>SP entity ID: <code>{{$c.EntityID}}</code></p>
+    <p>Assertion consumer service (ACS) URL, HTTP-POST: <code>{{$c.ACSURL}}</code></p>
+    <p>SP metadata URL: <a href="{{$c.MetadataURL}}"><code>{{$c.MetadataURL}}</code></a></p>
+    <p>Test sign-in: <a href="{{$c.TestURL}}">{{$c.TestURL}}</a></p>
+    {{else}}
+    <p class="muted">The entity ID, ACS URL and SP metadata URL appear here once the connection is created. Each SAML connection gets its own signing key.</p>
+    {{end}}
+  {{else}}
+    <p>Redirect URI: <code>{{$c.RedirectURI}}</code></p>
+    {{if $c.BackchannelURL}}<p>Back-channel logout URI: <code>{{$c.BackchannelURL}}</code></p>{{end}}
+    {{if $c.TestURL}}<p>Test sign-in: <a href="{{$c.TestURL}}">{{$c.TestURL}}</a></p>{{end}}
+  {{end}}
+  {{if $c.Slug}}<p class="note">Slug: <code>{{$c.Slug}}</code> (fixed once created)</p>{{end}}
+</div>
+
+<form method="post" action="{{if $d.New}}{{$sc.Base}}{{else}}{{$sc.Base}}/{{$c.ID}}{{end}}" class="card">
+  <input type="hidden" name="csrf" value="{{.CSRF}}">
+  {{if $d.New}}<input type="hidden" name="kind" value="{{$c.Kind}}">{{end}}
+  <fieldset {{if $c.Managed}}disabled{{end}}>
+  <label for="name">Name shown on the sign-in button</label>
+  <input id="name" name="name" required maxlength="100" value="{{$c.Name}}">
+
+  {{if eq $c.Kind "oidc"}}
+  <label for="preset">Provider</label>
+  <select id="preset" name="preset" aria-describedby="preset-help">
+    {{range presets}}{{$p := preset .}}<option value="{{.}}" {{if eq . $c.Preset}}selected{{end}}>{{$p.Name}} (issuer {{$p.IssuerHint}})</option>{{end}}
+  </select>
+  <p id="preset-help" class="note">The provider sets the default scopes and groups claim. Replace the {placeholders} in the issuer with your own values.</p>
+  <label for="issuer">Issuer URL</label>
+  <input id="issuer" name="issuer" type="url" required pattern="https://.*" value="{{$c.Issuer}}" placeholder="{{(preset $c.Preset).IssuerHint}}" aria-describedby="issuer-help">
+  <p id="issuer-help" class="note">Exactly as it appears in <code>iss</code>, for example {{(preset $c.Preset).IssuerHint}}.</p>
+  <label for="client_id">Client ID</label>
+  <input id="client_id" name="client_id" required maxlength="256" value="{{$c.ClientID}}" autocomplete="off">
+  <label for="client_secret">Client secret</label>
+  <input id="client_secret" name="client_secret" type="password" autocomplete="new-password" {{if $d.New}}required{{end}} aria-describedby="secret-help">
+  <p id="secret-help" class="note">{{if $d.New}}Stored encrypted and never shown again.{{else}}A secret is stored. Leave this blank to keep it.{{end}}</p>
+  <label for="scopes">Extra scopes</label>
+  <input id="scopes" name="scopes" value="{{$c.ExtraScopes}}" aria-describedby="scopes-help">
+  <p id="scopes-help" class="note">Space-separated, added to the provider defaults ({{join (preset $c.Preset).Scopes " "}}).</p>
+  <label for="groups_claim">Groups claim</label>
+  <input id="groups_claim" name="groups_claim" maxlength="100" value="{{$c.GroupsClaim}}" placeholder="{{(preset $c.Preset).GroupsClaim}}" aria-describedby="groups-help">
+  <p id="groups-help" class="note">The ID token claim that lists the user's groups. Leave blank for the provider default.</p>
+  {{end}}
+
+  {{if eq $c.Kind "github"}}
+  <label for="client_id">Client ID</label>
+  <input id="client_id" name="client_id" required maxlength="256" value="{{$c.ClientID}}" autocomplete="off">
+  <label for="client_secret">Client secret</label>
+  <input id="client_secret" name="client_secret" type="password" autocomplete="new-password" {{if $d.New}}required{{end}} aria-describedby="secret-help">
+  <p id="secret-help" class="note">{{if $d.New}}Stored encrypted and never shown again.{{else}}A secret is stored. Leave this blank to keep it.{{end}}</p>
+  <label for="allowed_orgs">Allowed GitHub organisations</label>
+  <input id="allowed_orgs" name="allowed_orgs" value="{{$c.AllowedOrgs}}" aria-describedby="orgs-help">
+  <p id="orgs-help" class="note">Space-separated GitHub organisation logins. Leave blank to allow any GitHub user (the domain rules still apply).</p>
+  <label for="issuer">GitHub Enterprise Server URL (optional)</label>
+  <input id="issuer" name="issuer" type="url" pattern="https://.*" value="{{$c.Issuer}}" placeholder="https://github.example.com">
+  {{end}}
+
+  {{if eq $c.Kind "saml"}}
+  <label for="metadata_url">IdP metadata URL</label>
+  <input id="metadata_url" name="metadata_url" type="url" pattern="https://.*" value="{{$d.MetadataURL}}" aria-describedby="md-help">
+  <label for="metadata">Or paste the IdP metadata XML</label>
+  <textarea id="metadata" name="metadata" aria-describedby="md-help">{{$c.SAMLIdPMetadata}}</textarea>
+  <p id="md-help" class="note">The metadata needs a single sign-on endpoint with the HTTP-Redirect binding and a signing certificate. A URL is fetched once when you save.</p>
+  <label for="email_attr">Email attribute</label>
+  <input id="email_attr" name="email_attr" maxlength="256" value="{{$c.SAMLEmailAttr}}" placeholder="NameID, email, or the emailaddress claim URI">
+  <label for="name_attr">Display name attribute</label>
+  <input id="name_attr" name="name_attr" maxlength="256" value="{{$c.SAMLNameAttr}}">
+  <label for="groups_attr">Groups attribute</label>
+  <input id="groups_attr" name="groups_attr" maxlength="256" value="{{$c.SAMLGroupsAttr}}">
+  {{end}}
+
+  <label class="check"><input type="checkbox" name="enabled" value="1" {{if $c.Enabled}}checked{{end}}> Enabled</label>
+  {{if not $d.New}}<p class="note">Disabling a connection also ends every session signed in through it.</p>{{end}}
+  {{if $sc.Platform}}{{if ne $c.Kind "saml"}}
+  <label class="check"><input type="checkbox" name="trust_email" value="1" {{if $c.TrustEmail}}checked{{end}} aria-describedby="trust-help"> Trust email for account linking</label>
+  <p id="trust-help" class="error">Only tick this if the provider guarantees that every email it asserts is verified and cannot be changed by the user. Otherwise anyone who can set their email at this provider can take over an existing account with that address.</p>
+  {{end}}{{end}}
+  </fieldset>
+  {{if not $c.Managed}}<button type="submit">{{if $d.New}}Create connection{{else}}Save{{end}}</button>{{end}}
+</form>
+
+{{if and (not $d.New) (not $sc.Platform)}}
+<div class="card">
+  <h2>Group to role mappings</h2>
+  <p class="muted">When someone signs in through this connection, their role becomes the highest role mapped from their groups. With no match they keep their current role (or get the default role).</p>
+  {{if $d.Mappings}}
+  <table>
+    <thead><tr><th>Group</th><th>Role</th><th></th></tr></thead>
+    <tbody>
+    {{range $d.Mappings}}<tr><td><code>{{.Group}}</code></td><td>{{.Role}}</td>
+      <td><form method="post" action="{{$sc.Base}}/{{$c.ID}}/mappings/{{.ID}}/delete" class="inline"><input type="hidden" name="csrf" value="{{$.CSRF}}"><button type="submit" class="danger" aria-label="Remove mapping for {{.Group}}">Remove</button></form></td></tr>{{end}}
+    </tbody>
+  </table>
+  {{else}}<p>No mappings.</p>{{end}}
+  <form method="post" action="{{$sc.Base}}/{{$c.ID}}/mappings">
+    <input type="hidden" name="csrf" value="{{.CSRF}}">
+    <label for="map-group">Group name or ID</label>
+    <input id="map-group" name="group" required maxlength="256">
+    <label for="map-role">Role</label>
+    <select id="map-role" name="role">
+      {{range roles}}{{if or (ne .String "owner") $d.CanOwner}}<option value="{{.}}">{{.}}</option>{{end}}{{end}}
+    </select>
+    <button type="submit">Add mapping</button>
+  </form>
+</div>
+{{end}}
+
+{{if and (not $d.New) (not $c.Managed)}}
+<div class="card">
+  <h2>Delete this connection</h2>
+  <p class="muted">People who sign in only through it lose access, and their sessions end now.</p>
+  <form method="post" action="{{$sc.Base}}/{{$c.ID}}/delete">
+    <input type="hidden" name="csrf" value="{{.CSRF}}">
+    <button type="submit" class="danger">Delete {{$c.Name}}</button>
+  </form>
+</div>
+{{end}}
+{{end}}
