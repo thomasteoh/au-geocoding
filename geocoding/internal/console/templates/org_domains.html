@@ -1,0 +1,40 @@
+{{define "content"}}
+<h1>Domains</h1>
+{{$slug := .Org.Org.Slug}}{{$csrf := .CSRF}}
+<p class="muted">A verified domain sends people with that email domain to this organisation's single sign-on, and is required to enforce it. A domain can be verified by one organisation only.</p>
+{{range .Data}}
+<div class="card">
+  <h2>{{.Domain}}</h2>
+  {{if .Verified}}
+  <p>Verified {{when .Verified}}.</p>
+  {{else}}
+  <p>Not verified. Add this DNS TXT record, then select Verify.</p>
+  <table>
+    <tbody>
+      <tr><th scope="row">Name</th><td><code>{{.TXTName}}</code></td></tr>
+      <tr><th scope="row">Value</th><td><code>{{.TXTValue}}</code></td></tr>
+    </tbody>
+  </table>
+  <form method="post" action="/console/orgs/{{$slug}}/domains/{{.ID}}/verify" class="inline">
+    <input type="hidden" name="csrf" value="{{$csrf}}">
+    <button type="submit">Verify {{.Domain}}</button>
+  </form>
+  {{end}}
+  <form method="post" action="/console/orgs/{{$slug}}/domains/{{.ID}}/delete" class="inline">
+    <input type="hidden" name="csrf" value="{{$csrf}}">
+    <button type="submit" class="danger" aria-label="Remove {{.Domain}}">Remove</button>
+  </form>
+</div>
+{{else}}
+<p>No domains yet.</p>
+{{end}}
+<div class="card">
+  <h2>Add a domain</h2>
+  <form method="post" action="/console/orgs/{{$slug}}/domains">
+    <input type="hidden" name="csrf" value="{{$csrf}}">
+    <label for="domain">Domain</label>
+    <input id="domain" name="domain" required maxlength="253" placeholder="example.com">
+    <button type="submit">Add</button>
+  </form>
+</div>
+{{end}}
