@@ -13,11 +13,12 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
-	_ "modernc.org/sqlite"
+	"augeocoding/internal/appdb"
 )
 
 // Errors for the public API. Uniform responses for unknown vs revoked vs
@@ -26,6 +27,7 @@ var (
 	ErrInvalidKey    = errors.New("invalid api key")
 	ErrQuotaExceeded = errors.New("daily quota exceeded")
 	ErrRateLimited   = errors.New("rate limited")
+	ErrNotFound      = errors.New("not found")
 )
 
 // Tier is a quota tier. Anonymous and keyed access get separate ceilings (T1).
@@ -104,7 +106,45 @@ type Key struct {
 	Scopes  []string
 	Created time.Time
 	Revoked *time.Time
+	// OrgID is set for keys issued in the console; 0 for operator keys from
+	// keygen. CreatedBy is the issuing user. Expires is optional.
+	OrgID     int64
+	CreatedBy int64
+	Expires   *time.Time
 }
+
+// Principal is whoever a public API request is accounted to: an operator
+// key, an org (console keys and JWT callers share the org's quota, so
+// minting more credentials never multiplies it, T1) or an anonymous IP.
+type Principal struct {
+	Kind   string // "anonymous", "key", "jwt"
+	KeyID  int64  // request_log key_id; 0 for jwt/anonymous
+	OrgID  int64
+	Tier   Tier
+	Scopes []string
+	// RateKey is the token-bucket key; UsageKey the daily quota row.
+	RateKey  string
+	UsageKey string
+	// Subject identifies a JWT caller ("jwt:<issuer id>:<sub>").
+	Subject string
+}
+
+// Anonymous reports whether the principal is the anonymous tier.
+func (p Principal) Anonymous() bool { return p.Kind == "anonymous" }
+
+// KeyPrincipal builds the principal for an authenticated key.
+func KeyPrincipal(k Key) Principal {
+	p := Principal{Kind: "key", KeyID: k.ID, OrgID: k.OrgID, Tier: k.Tier, Scopes: k.Scopes, RateKey: "key:" + strconv.FormatInt(k.ID, 10)}
+	if k.OrgID != 0 {
+		p.UsageKey = OrgUsageKey(k.OrgID)
+	} else {
+		p.UsageKey = "key:" + strconv.FormatInt(k.ID, 10)
+	}
+	return p
+}
+
+// OrgUsageKey is the daily quota row shared by an org's keys and JWT callers.
+func OrgUsageKey(orgID int64) string { return "org:" + strconv.FormatInt(orgID, 10) }
 
 // Store is the app.db service-state store. It owns api_keys, usage and
 // request_log, in a SQLite file separate from the geocoding DBs.
@@ -127,13 +167,20 @@ type Store struct {
 // pepper — a per-process random pepper would make keys issued by keygen
 // unverifiable by the server.
 func Open(path string) (*Store, error) {
-	db, err := sql.Open("sqlite", path)
+	db, err := appdb.Open(path)
 	if err != nil {
 		return nil, err
 	}
-	if err := db.Ping(); err != nil {
+	s, err := New(db)
+	if err != nil {
+		db.Close()
 		return nil, err
 	}
+	return s, nil
+}
+
+// New builds the store on an open app.db handle shared with other stores.
+func New(db *sql.DB) (*Store, error) {
 	s := &Store{
 		db:      db,
 		pepper:  GeneratePepper(),
@@ -216,47 +263,120 @@ func (s *Store) migrate() error {
 			strategy TEXT NOT NULL
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_request_log_ts ON request_log(ts)`,
+		// Quota rows keyed by principal ("key:<id>" or "org:<id>"). The old
+		// per-key usage table is copied in once and then left alone.
+		`CREATE TABLE IF NOT EXISTS usage_principal (
+			principal TEXT NOT NULL,
+			day TEXT NOT NULL,
+			rows INTEGER NOT NULL DEFAULT 0,
+			llm_calls INTEGER NOT NULL DEFAULT 0,
+			PRIMARY KEY (principal, day)
+		)`,
 	}
 	for _, stmt := range stmts {
 		if _, err := s.db.Exec(stmt); err != nil {
 			return fmt.Errorf("migrate: %w", err)
 		}
 	}
+	// Columns added for console-issued keys and JWT callers.
+	for _, c := range []struct{ table, col, def string }{
+		{"api_keys", "org_id", "INTEGER"},
+		{"api_keys", "created_by", "INTEGER"},
+		{"api_keys", "expires", "TEXT"},
+		{"request_log", "principal", "TEXT"},
+	} {
+		if err := addColumn(s.db, c.table, c.col, c.def); err != nil {
+			return err
+		}
+	}
+	if _, err := s.db.Exec(`CREATE INDEX IF NOT EXISTS idx_api_keys_org ON api_keys(org_id)`); err != nil {
+		return fmt.Errorf("migrate: %w", err)
+	}
+	var copied int
+	s.db.QueryRow(`SELECT COUNT(*) FROM usage_principal`).Scan(&copied)
+	if copied == 0 {
+		if _, err := s.db.Exec(`INSERT OR IGNORE INTO usage_principal(principal, day, rows, llm_calls)
+			SELECT 'key:' || key_id, day, rows, llm_calls FROM usage`); err != nil {
+			return fmt.Errorf("migrate usage: %w", err)
+		}
+	}
+	return nil
+}
+
+func addColumn(db *sql.DB, table, col, def string) error {
+	rows, err := db.Query(`SELECT name FROM pragma_table_info(?)`, table)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return err
+		}
+		if name == col {
+			return nil
+		}
+	}
+	rows.Close()
+	if _, err := db.Exec(fmt.Sprintf(`ALTER TABLE %s ADD COLUMN %s %s`, table, col, def)); err != nil {
+		return fmt.Errorf("migrate %s.%s: %w", table, col, err)
+	}
 	return nil
 }
 
 // loadKeys reads api_keys into the in-memory prefix index.
 func (s *Store) loadKeys() error {
-	rows, err := s.db.Query(`SELECT id, prefix, hash, label, quota_tier, enabled, scopes, created, revoked FROM api_keys`)
+	rows, err := s.db.Query(`SELECT ` + keyCols + ` FROM api_keys`)
 	if err != nil {
 		return err
 	}
 	defer rows.Close()
-	s.keys = make(map[string]Key)
+	keys := make(map[string]Key)
 	for rows.Next() {
-		var k Key
-		var hash []byte
-		var created, revoked sql.NullString
-		var enabled int
-		var scopes string
-		var tierStr string
-		if err := rows.Scan(&k.ID, &k.Prefix, &hash, &k.Label, &tierStr, &enabled, &scopes, &created, &revoked); err != nil {
+		k, err := scanKey(rows)
+		if err != nil {
 			return err
 		}
-		k.Tier = QuotaTier(tierStr)
-		copy(k.Hash[:], hash)
-		k.Enabled = enabled != 0
-		if created.Valid {
-			k.Created, _ = time.Parse(time.RFC3339, created.String)
-		}
-		if revoked.Valid {
-			t, _ := time.Parse(time.RFC3339, revoked.String)
-			k.Revoked = &t
-		}
-		k.Scopes = strings.Fields(scopes)
-		s.keys[k.Prefix] = k
+		keys[k.Prefix] = k
 	}
-	return rows.Err()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	s.keys = keys
+	s.mu.Unlock()
+	return nil
+}
+
+const keyCols = `id, prefix, hash, label, quota_tier, enabled, scopes, created, revoked, COALESCE(org_id,0), COALESCE(created_by,0), expires`
+
+func scanKey(sc interface{ Scan(...any) error }) (Key, error) {
+	var k Key
+	var hash []byte
+	var created, revoked, expires sql.NullString
+	var enabled int
+	var scopes string
+	var tierStr string
+	if err := sc.Scan(&k.ID, &k.Prefix, &hash, &k.Label, &tierStr, &enabled, &scopes, &created, &revoked, &k.OrgID, &k.CreatedBy, &expires); err != nil {
+		return k, err
+	}
+	k.Tier = QuotaTier(tierStr)
+	copy(k.Hash[:], hash)
+	k.Enabled = enabled != 0
+	if created.Valid {
+		k.Created, _ = time.Parse(time.RFC3339, created.String)
+	}
+	if revoked.Valid {
+		t, _ := time.Parse(time.RFC3339, revoked.String)
+		k.Revoked = &t
+	}
+	if expires.Valid && expires.String != "" {
+		t, _ := time.Parse(time.RFC3339, expires.String)
+		k.Expires = &t
+	}
+	k.Scopes = strings.Fields(scopes)
+	return k, nil
 }
 
 // Authenticate resolves a key string to a Key, using the non-secret prefix for
@@ -277,27 +397,138 @@ func (s *Store) Authenticate(keyStr string) (Key, error) {
 	if !k.Enabled || k.Revoked != nil {
 		return Key{}, ErrInvalidKey
 	}
+	if k.Expires != nil && !time.Now().Before(*k.Expires) {
+		return Key{}, ErrInvalidKey
+	}
 	return k, nil
 }
 
 // IssueKey creates a new key. The raw key is returned exactly once and never
 // stored or logged (T6).
 func (s *Store) IssueKey(label string, tier Tier, scopes []string) (id int64, raw string, err error) {
-	raw = newKeyString()
+	k, raw, err := s.IssueKeyWith(IssueOptions{Label: label, Tier: tier, Scopes: scopes})
+	return k.ID, raw, err
+}
+
+// IssueOptions describes a key to issue.
+type IssueOptions struct {
+	Label     string
+	Tier      Tier
+	Scopes    []string
+	OrgID     int64
+	CreatedBy int64
+	Expires   *time.Time
+}
+
+// IssueKeyWith creates a key with an optional org, creator and expiry. The
+// raw key is returned exactly once and never stored or logged (T6).
+func (s *Store) IssueKeyWith(o IssueOptions) (Key, string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	// The prefix is the in-memory index; regenerate on the (2^-32) chance it
+	// collides so an existing key is never shadowed.
+	var raw string
+	for {
+		raw = newKeyString()
+		if _, taken := s.keys[KeyPrefix(raw)]; !taken {
+			break
+		}
+	}
 	prefix := KeyPrefix(raw)
 	hash := HashKey(raw, s.pepper)
-	now := time.Now().UTC().Format(time.RFC3339)
-	res, err := s.db.Exec(`INSERT INTO api_keys(prefix, hash, label, quota_tier, enabled, scopes, created)
-		VALUES (?, ?, ?, ?, 1, ?, ?)`,
-		prefix, hash[:], label, tierName(tier), strings.Join(scopes, " "), now)
-	if err != nil {
-		return 0, "", err
+	created := time.Now().UTC()
+	var expires any
+	if o.Expires != nil {
+		expires = o.Expires.UTC().Format(time.RFC3339)
 	}
-	id, _ = res.LastInsertId()
+	res, err := s.db.Exec(`INSERT INTO api_keys(prefix, hash, label, quota_tier, enabled, scopes, created, org_id, created_by, expires)
+		VALUES (?, ?, ?, ?, 1, ?, ?, ?, ?, ?)`,
+		prefix, hash[:], o.Label, tierName(o.Tier), strings.Join(o.Scopes, " "), created.Format(time.RFC3339), nullInt(o.OrgID), nullInt(o.CreatedBy), expires)
+	if err != nil {
+		return Key{}, "", err
+	}
+	id, _ := res.LastInsertId()
+	k := Key{ID: id, Prefix: prefix, Hash: hash, Label: o.Label, Tier: o.Tier, Enabled: true, Scopes: o.Scopes, Created: created,
+		OrgID: o.OrgID, CreatedBy: o.CreatedBy, Expires: o.Expires}
+	s.keys[prefix] = k
+	return k, raw, nil
+}
+
+// OrgKeys lists an org's keys, newest first (hashes zeroed).
+func (s *Store) OrgKeys(orgID int64) ([]Key, error) {
+	rows, err := s.db.Query(`SELECT `+keyCols+` FROM api_keys WHERE org_id=? ORDER BY id DESC`, orgID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Key
+	for rows.Next() {
+		k, err := scanKey(rows)
+		if err != nil {
+			return nil, err
+		}
+		k.Hash = [32]byte{}
+		out = append(out, k)
+	}
+	return out, rows.Err()
+}
+
+// OrgKey returns one of an org's keys; another org's key is ErrNotFound.
+func (s *Store) OrgKey(orgID, id int64) (Key, error) {
+	k, err := scanKey(s.db.QueryRow(`SELECT `+keyCols+` FROM api_keys WHERE id=? AND org_id=?`, id, orgID))
+	if errors.Is(err, sql.ErrNoRows) {
+		return Key{}, ErrNotFound
+	}
+	k.Hash = [32]byte{}
+	return k, err
+}
+
+// RevokeOrgKey revokes one of an org's keys.
+func (s *Store) RevokeOrgKey(orgID, id int64) error {
+	if _, err := s.OrgKey(orgID, id); err != nil {
+		return err
+	}
+	return s.Revoke(id)
+}
+
+// RevokeOrgKeys revokes every key an org holds (org deletion).
+func (s *Store) RevokeOrgKeys(orgID int64) error {
+	keys, err := s.OrgKeys(orgID)
+	if err != nil {
+		return err
+	}
+	for _, k := range keys {
+		if k.Revoked == nil {
+			if err := s.Revoke(k.ID); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// SetOrgTier moves every live key of an org to a new tier, in the table and
+// the in-memory index, so a tier change takes effect at once.
+func (s *Store) SetOrgTier(orgID int64, tier Tier) error {
+	if _, err := s.db.Exec(`UPDATE api_keys SET quota_tier=? WHERE org_id=?`, tierName(tier), orgID); err != nil {
+		return err
+	}
 	s.mu.Lock()
-	s.keys[prefix] = Key{ID: id, Prefix: prefix, Hash: hash, Label: label, Tier: tier, Enabled: true, Scopes: scopes, Created: time.Now().UTC()}
-	s.mu.Unlock()
-	return id, raw, nil
+	defer s.mu.Unlock()
+	for p, k := range s.keys {
+		if k.OrgID == orgID {
+			k.Tier = tier
+			s.keys[p] = k
+		}
+	}
+	return nil
+}
+
+func nullInt(v int64) any {
+	if v == 0 {
+		return nil
+	}
+	return v
 }
 
 // Revoke disables a key. The in-memory index is updated immediately so a
@@ -324,9 +555,34 @@ func (s *Store) Revoke(id int64) error {
 // ChargeRows accounts for result rows consumed by a request (D-034). Returns
 // false when the tier's daily ceiling would be exceeded.
 func (s *Store) ChargeRows(keyID int64, tier Tier, rows int64) (bool, error) {
+	return s.charge("key:"+strconv.FormatInt(keyID, 10), tier, rows)
+}
+
+// ChargePrincipal charges result rows to a principal's daily quota row.
+func (s *Store) ChargePrincipal(p Principal, rows int64) (bool, error) {
+	if p.Anonymous() {
+		return true, nil
+	}
+	return s.charge(p.UsageKey, p.Tier, rows)
+}
+
+// UsageToday returns the rows charged to a usage key today.
+func (s *Store) UsageToday(usageKey string) (int64, error) {
+	var n int64
+	err := s.db.QueryRow(`SELECT rows FROM usage_principal WHERE principal=? AND day=?`, usageKey, time.Now().UTC().Format("2006-01-02")).Scan(&n)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, nil
+	}
+	return n, err
+}
+
+func (s *Store) charge(principal string, tier Tier, rows int64) (bool, error) {
 	if tier == TierAnonymous {
 		// Anonymous has no key — charged separately via the IP limiter.
 		return true, nil
+	}
+	if principal == "" {
+		return false, errors.New("charge: empty principal")
 	}
 	day := time.Now().UTC().Format("2006-01-02")
 	quota := TierQuota[tier]
@@ -339,7 +595,7 @@ func (s *Store) ChargeRows(keyID int64, tier Tier, rows int64) (bool, error) {
 	}
 	defer tx.Rollback()
 	var cur int64
-	if err := tx.QueryRow(`SELECT rows FROM usage WHERE key_id=? AND day=?`, keyID, day).Scan(&cur); err != nil {
+	if err := tx.QueryRow(`SELECT rows FROM usage_principal WHERE principal=? AND day=?`, principal, day).Scan(&cur); err != nil {
 		if err == sql.ErrNoRows {
 			cur = 0
 		} else {
@@ -349,8 +605,8 @@ func (s *Store) ChargeRows(keyID int64, tier Tier, rows int64) (bool, error) {
 	if cur+rows > quota {
 		return false, ErrQuotaExceeded
 	}
-	if _, err := tx.Exec(`INSERT INTO usage(key_id, day, rows) VALUES (?,?,?)
-		ON CONFLICT(key_id, day) DO UPDATE SET rows=rows+excluded.rows`, keyID, day, rows); err != nil {
+	if _, err := tx.Exec(`INSERT INTO usage_principal(principal, day, rows) VALUES (?,?,?)
+		ON CONFLICT(principal, day) DO UPDATE SET rows=rows+excluded.rows`, principal, day, rows); err != nil {
 		return false, err
 	}
 	return true, tx.Commit()
@@ -390,9 +646,20 @@ func (s *Store) ChargeAnonDaily(ip string, rows int64, perIP, global int64) (boo
 
 // LogRequest writes one request_log row (T9: no query text, no result contents).
 func (s *Store) LogRequest(keyID int64, endpoint string, status int, latencyMS int64, resultCount int, strategy string) error {
+	return s.LogPrincipalRequest(Principal{KeyID: keyID}, endpoint, status, latencyMS, resultCount, strategy)
+}
+
+// LogPrincipalRequest writes one request_log row for a principal. The
+// principal column holds the usage key ("org:<id>", "key:<id>") — never an IP
+// (T7) and never query text (T9).
+func (s *Store) LogPrincipalRequest(p Principal, endpoint string, status int, latencyMS int64, resultCount int, strategy string) error {
 	ts := time.Now().UTC().Format(time.RFC3339)
-	_, err := s.db.Exec(`INSERT INTO request_log(ts, key_id, endpoint, status, latency_ms, result_count, strategy)
-		VALUES (?, ?, ?, ?, ?, ?, ?)`, ts, keyID, endpoint, status, latencyMS, resultCount, strategy)
+	var principal any
+	if p.UsageKey != "" {
+		principal = p.UsageKey
+	}
+	_, err := s.db.Exec(`INSERT INTO request_log(ts, key_id, endpoint, status, latency_ms, result_count, strategy, principal)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)`, ts, p.KeyID, endpoint, status, latencyMS, resultCount, strategy, principal)
 	return err
 }
 
