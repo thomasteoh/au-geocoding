@@ -43,17 +43,10 @@ func (s *Server) registerOrgIdentityRoutes(mux *http.ServeMux) {
 	mux.Handle("POST /console/orgs/{org}/tokens/{id}/delete", s.orgPost(a, s.handleIssuerDelete))
 }
 
-// pathID parses a numeric path value; 0 means invalid.
-func pathID(r *http.Request, name string) int64 {
-	id, err := strconv.ParseInt(r.PathValue(name), 10, 64)
-	if err != nil || id <= 0 {
-		return 0
-	}
+// pathInt parses a numeric path value; 0 means invalid.
+func pathInt(r *http.Request, name string) int64 {
+	id, _ := pathID(r, name)
 	return id
-}
-
-func (s *Server) notFound(w http.ResponseWriter, r *http.Request) {
-	s.renderError(w, r, http.StatusNotFound, "Not found.")
 }
 
 // --- SSO connections (shared by org and platform pages) ---
@@ -384,7 +377,7 @@ func connDetail(c identity.Connection) string {
 
 // loadConn fetches a connection within the scope; anything else is 404.
 func (s *Server) loadConn(w http.ResponseWriter, r *http.Request, sc connScope) (identity.Connection, bool) {
-	id := pathID(r, "id")
+	id := pathInt(r, "id")
 	c, err := s.IDs.OrgConnection(r.Context(), sc.OrgID, id)
 	if id == 0 || errors.Is(err, identity.ErrNotFound) {
 		s.notFound(w, r)
@@ -547,6 +540,10 @@ func (s *Server) handleSSOMappingAdd(w http.ResponseWriter, r *http.Request) {
 	}
 	m.Source, m.ConnectionID = identity.SourceSSO, c.ID
 	m, err := s.IDs.AddGroupMapping(r.Context(), m)
+	if errors.Is(err, identity.ErrConflict) {
+		redirectFlash(w, r, back, "That group already has a mapping.")
+		return
+	}
 	if errors.Is(err, identity.ErrNotFound) {
 		s.notFound(w, r)
 		return
@@ -563,7 +560,7 @@ func (s *Server) handleSSOMappingAdd(w http.ResponseWriter, r *http.Request) {
 // the source (and connection) the URL names.
 func (s *Server) deleteMapping(w http.ResponseWriter, r *http.Request, source string, connID int64, back, target string) {
 	oc := orgFrom(r.Context())
-	mid := pathID(r, "mid")
+	mid := pathInt(r, "mid")
 	all, err := s.IDs.GroupMappings(r.Context(), oc.Org.ID)
 	if err != nil {
 		s.serverError(w, r, err)
@@ -657,7 +654,7 @@ func (s *Server) handleSCIMTokenCreate(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleSCIMTokenRevoke(w http.ResponseWriter, r *http.Request) {
 	oc := orgFrom(r.Context())
-	id := pathID(r, "id")
+	id := pathInt(r, "id")
 	if err := s.IDs.RevokeSCIMToken(r.Context(), oc.Org.ID, id); err != nil {
 		if errors.Is(err, identity.ErrNotFound) {
 			s.notFound(w, r)
@@ -680,6 +677,10 @@ func (s *Server) handleSCIMMappingAdd(w http.ResponseWriter, r *http.Request) {
 	}
 	m.Source = identity.SourceSCIM
 	m, err := s.IDs.AddGroupMapping(r.Context(), m)
+	if errors.Is(err, identity.ErrConflict) {
+		redirectFlash(w, r, back, "That group already has a mapping.")
+		return
+	}
 	if err != nil {
 		s.serverError(w, r, err)
 		return
@@ -785,7 +786,7 @@ func (s *Server) handleIssuerCreate(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) loadIssuer(w http.ResponseWriter, r *http.Request) (identity.JWTIssuer, bool) {
-	id := pathID(r, "id")
+	id := pathInt(r, "id")
 	j, err := s.IDs.OrgJWTIssuer(r.Context(), orgFrom(r.Context()).Org.ID, id)
 	if id == 0 || errors.Is(err, identity.ErrNotFound) {
 		s.notFound(w, r)

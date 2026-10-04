@@ -95,6 +95,7 @@ CREATE TABLE group_mappings (
 	created       TEXT NOT NULL
 );
 CREATE INDEX idx_group_mappings_org ON group_mappings(org_id);
+CREATE UNIQUE INDEX idx_group_mappings_unique ON group_mappings(org_id, source, COALESCE(connection_id, 0), grp);
 CREATE TABLE invites (
 	id         INTEGER PRIMARY KEY AUTOINCREMENT,
 	org_id     INTEGER NOT NULL REFERENCES orgs(id) ON DELETE CASCADE,

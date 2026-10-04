@@ -85,7 +85,7 @@ func (s *Server) handleAdminOrgs(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleAdminOrgTier(w http.ResponseWriter, r *http.Request) {
-	id := pathID(r, "id")
+	id := pathInt(r, "id")
 	org, err := s.IDs.OrgByID(r.Context(), id)
 	if id == 0 || errors.Is(err, identity.ErrNotFound) {
 		s.notFound(w, r)
@@ -140,7 +140,7 @@ func (s *Server) adminTargetUser(w http.ResponseWriter, r *http.Request) (identi
 	if q := r.PostFormValue("q"); q != "" {
 		back += "?q=" + url.QueryEscape(q)
 	}
-	id := pathID(r, "id")
+	id := pathInt(r, "id")
 	u, err := s.IDs.UserByID(r.Context(), id)
 	if id == 0 || errors.Is(err, identity.ErrNotFound) {
 		s.notFound(w, r)

@@ -25,8 +25,8 @@ func (h *harness) signIn(u identity.User) *browser {
 	return b
 }
 
-// member adds u to org with role.
-func (h *harness) member(org identity.Org, u identity.User, role identity.Role) {
+// addMember adds u to org with role.
+func (h *harness) addMember(org identity.Org, u identity.User, role identity.Role) {
 	h.t.Helper()
 	if err := h.ids.SetMembership(h.ctx, org.ID, u.ID, role, "manual"); err != nil {
 		h.t.Fatal(err)
@@ -254,7 +254,7 @@ func TestGroupMappings(t *testing.T) {
 	owner := h.user("owner@acme.example")
 	admin := h.user("admin@acme.example")
 	org := h.org("acme", owner)
-	h.member(org, admin, identity.RoleAdmin)
+	h.addMember(org, admin, identity.RoleAdmin)
 	c, err := h.ids.SaveConnection(h.ctx, identity.Connection{OrgID: org.ID, Slug: "acme-okta", Kind: identity.KindOIDC, Preset: "okta", Name: "Okta",
 		Enabled: true, Issuer: "https://acme.okta.example", ClientID: "x", ClientSecret: "y"})
 	if err != nil {
@@ -473,7 +473,7 @@ func TestIdentityPagesNeedAdmin(t *testing.T) {
 	h := newHarness(t, open)
 	owner, dev := h.user("owner@acme.example"), h.user("dev@acme.example")
 	org := h.org("acme", owner)
-	h.member(org, dev, identity.RoleDeveloper)
+	h.addMember(org, dev, identity.RoleDeveloper)
 	b := h.signIn(dev)
 	for _, p := range []string{"/console/orgs/acme/sso", "/console/orgs/acme/sso/new", "/console/orgs/acme/scim", "/console/orgs/acme/tokens"} {
 		if r := b.get(p); r.Status != http.StatusForbidden {

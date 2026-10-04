@@ -207,19 +207,31 @@ func (s *Store) SaveConnection(ctx context.Context, c Connection) (Connection, e
 	return s.ConnectionByID(ctx, c.ID)
 }
 
-// DeleteConnection deletes a connection within an org (0 = platform). Its
-// identities, mappings and flows cascade; sessions keep the user signed in
-// until they expire, so callers that want an immediate cut-off also call
-// DeleteConnectionSessions.
+// DeleteConnection deletes a connection within an org (0 = platform) and
+// ends every session created through it, in one transaction. Sessions go
+// first: sessions.connection_id is ON DELETE SET NULL, so once the
+// connection is gone they can no longer be found. Identities, mappings and
+// flows cascade.
 func (s *Store) DeleteConnection(ctx context.Context, orgID, id int64) error {
-	res, err := s.db.ExecContext(ctx, `DELETE FROM connections WHERE id=? AND COALESCE(org_id,0)=?`, id, orgID)
+	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
-	if n, _ := res.RowsAffected(); n == 0 {
+	defer tx.Rollback()
+	var n int
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM connections WHERE id=? AND COALESCE(org_id,0)=?`, id, orgID).Scan(&n); err != nil {
+		return err
+	}
+	if n == 0 {
 		return ErrNotFound
 	}
-	return nil
+	if _, err := tx.ExecContext(ctx, `DELETE FROM sessions WHERE connection_id=?`, id); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM connections WHERE id=?`, id); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 // --- domains ---
@@ -402,6 +414,9 @@ func (s *Store) AddGroupMapping(ctx context.Context, m GroupMapping) (GroupMappi
 	res, err := s.db.ExecContext(ctx, `INSERT INTO group_mappings(org_id, source, connection_id, grp, role, created) VALUES (?,?,?,?,?,?)`,
 		m.OrgID, m.Source, nullID(m.ConnectionID), m.Group, m.Role.String(), now())
 	if err != nil {
+		if isUnique(err) {
+			return m, ErrConflict
+		}
 		return m, err
 	}
 	m.ID, _ = res.LastInsertId()
