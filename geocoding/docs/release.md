@@ -9,9 +9,12 @@ the default deployment).
 
 - `augeo` — serving binary (public API, read-only against the contract).
 - `keygen` — operator key issuance into app.db (no HTTP issuance endpoint).
-- `Dockerfile` — multi-stage build producing both binaries.
-- `docker-compose.yml` — geocoder + places resolver (split mode).
-- `.github/workflows/release.yml` — tag-triggered CI (P9).
+- `Dockerfile` — multi-stage build producing both binaries; build context is
+  the repository root.
+- `../docker-compose.yml` — the whole stack (geocoder, places resolver,
+  loader, Prometheus).
+- `../.github/workflows/release-geocoding.yml` — CI triggered by
+  `geocoding/v*` tags (P9).
 - `LICENSE` (Apache-2.0), `ATTRIBUTION.md` (data licences, D-018).
 
 ## Build
@@ -54,16 +57,17 @@ uniform 401 (T6).
 ## Run (Docker)
 
 ```
-docker build -t augeocoding:latest .
+# from the repository root
+docker build -f geocoding/Dockerfile -t augeocoding:latest .
 docker run --rm -v "$(pwd)/data:/data" -p 8099:8080 \
   -e AUGEO_PLACES_URL=http://host.docker.internal:8090 augeocoding:latest
 ```
 
-Or compose (split mode — geocoder + places resolver):
+Or compose from the repository root (split mode — geocoder + places resolver):
 
 ```
-docker compose up -d
-docker compose run --rm augeo keygen -app-db /data/app.db -label my-key
+docker compose run --rm --entrypoint keygen augeo -app-db /data/app.db -label my-key
+docker compose up -d places augeo prometheus
 ```
 
 ## Config (D-020)

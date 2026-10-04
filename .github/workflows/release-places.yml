@@ -1,0 +1,75 @@
+name: release-places
+
+# P9 release for the places service. Triggered by tags of the form
+# `places/vX.Y.Z`; the image is published as ghcr.io/<repo>/auplaces:vX.Y.Z.
+# Multi-arch (R9.1), SBOM per image, actions pinned by commit SHA (R9.5).
+
+on:
+  push:
+    tags:
+      - "places/v*"
+
+permissions:
+  contents: read
+  packages: write   # GHCR push (R9.7)
+
+jobs:
+  ci:
+    uses: ./.github/workflows/ci.yml
+
+  docker:
+    runs-on: ubuntu-latest
+    needs: ci
+    strategy:
+      matrix:
+        arch: [amd64, arm64]
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8
+      - uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435
+      - uses: docker/login-action@783ae9cac559640a24c9212dfa6cd9e998252f9a
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build and push image for ${{ matrix.arch }}
+        run: |
+          # Image tags cannot contain '/', so strip the service prefix; GHCR
+          # names must be lower case.
+          version="${GITHUB_REF_NAME#places/}"
+          image="ghcr.io/${GITHUB_REPOSITORY,,}/auplaces"
+          docker buildx build \
+            -f places/Dockerfile \
+            --platform linux/${{ matrix.arch }} \
+            -t "$image:$version-${{ matrix.arch }}" \
+            --sbom=true \
+            --push .
+
+  manifest:
+    runs-on: ubuntu-latest
+    needs: docker
+    steps:
+      - uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435
+      - uses: docker/login-action@783ae9cac559640a24c9212dfa6cd9e998252f9a
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Merge multi-arch manifest (R9.7)
+        run: |
+          version="${GITHUB_REF_NAME#places/}"
+          image="ghcr.io/${GITHUB_REPOSITORY,,}/auplaces"
+          docker buildx imagetools create -t "$image:$version" \
+            "$image:$version-amd64" "$image:$version-arm64"
+
+  release-notes:
+    runs-on: ubuntu-latest
+    needs: manifest
+    steps:
+      - name: Emit release notes (R9.6)
+        run: |
+          {
+            echo "## Contract version"
+            echo "v1 (internal seam; data version is separate)"
+            echo "## Dataset versions tested"
+            echo "synthetic fixture seeded by cmd/gen; corpus subset (testdata/corpus.tsv)"
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -1,7 +1,0 @@
-# Build context hygiene. The geocoder never ships the geocoding DBs — it reads
-# through the contract. data/ here is app.db (service state), small, but keep
-# it out of the build context anyway.
-data/
-*.log
-.git/
-.gitignore

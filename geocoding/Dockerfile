@@ -1,10 +1,15 @@
+# Build from the repository root so the shared module is in the context:
+#   docker build -f geocoding/Dockerfile .
 # Build stage: static binaries, CGO-free (modernc.org/sqlite), no runtime deps.
 FROM golang:1.26-alpine AS build
-WORKDIR /src
+# Build the module standalone; its replace directive resolves ../shared.
+ENV GOWORK=off
+WORKDIR /src/geocoding
 # Cache deps first for faster rebuilds.
-COPY go.mod go.sum ./
+COPY shared/ /src/shared/
+COPY geocoding/go.mod geocoding/go.sum ./
 RUN go mod download
-COPY . .
+COPY geocoding/ ./
 # Build the serving server and the operator tool (keygen). The geocoder never
 # writes the geocoding DBs — it reads through the contract. CGO_ENABLED=0 keeps
 # them static and portable.
@@ -14,7 +19,7 @@ RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/keygen 
 # Runtime stage: minimal, runs as non-root. curl is needed for the compose
 # healthcheck (alpine base image ships no curl).
 FROM alpine:3.20
-RUN apk add --no-cache curl && adduser -D -u 10001 augeo && addgroup -g 10001 augeo
+RUN apk add --no-cache curl && addgroup -g 10001 augeo && adduser -D -u 10001 -G augeo augeo
 COPY --from=build /out/augeo /usr/local/bin/augeo
 COPY --from=build /out/keygen /usr/local/bin/keygen
 USER augeo

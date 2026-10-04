@@ -3,11 +3,12 @@
 The public geocoding service. It owns **auth, rate limits, quotas, abuse
 guards, `ErrOutOfScope` handling** and the public API surface — everything
 Step 5 of au-system. It does **not** own the geocoding data: it calls
-**au-places** through the split-service contract (`internal/contract`).
+**au-places** through the split-service contract (`shared/contract`).
 
-The repo is deliberately separate from au-places so the public surface (keys,
-quotas, rate limits) lives where it belongs and the geocoding DBs stay
-read-only and unauthenticated behind the contract.
+It lives in the au-system monorepo beside `places/` and `shared/`, but it is
+its own Go module and its own deployable, so the public surface (keys, quotas,
+rate limits) lives where it belongs and the geocoding DBs stay read-only and
+unauthenticated behind the contract.
 
 ## Layout
 
@@ -16,14 +17,14 @@ read-only and unauthenticated behind the contract.
 | `cmd/augeo` | HTTP server: /search, /geocode, /reverse, /poi, /parse, /batch, /suggest, /healthz, /readyz, /metrics |
 | `cmd/keygen` | Operator key issuance (no HTTP endpoint — T6) |
 | `cmd/mockplaces` | Test resolver implementing the contract /resolve |
-| `internal/contract` | The geocoder↔places contract (single-binary + split mode) |
-| `internal/normalise` | Free text → tokens; FTS5-injection guard (T3) |
 | `internal/ladder` | Parse ladder rungs 1–5; LLM admission/breaker/singleflight |
 | `internal/ranking` | Two-phase ranking: FTS5 cap, then Go composite |
 | `internal/publicapi` | app.db: api_keys, usage, request_log; pepper, quota, token bucket |
 | `internal/placesclient` | Split-mode resolver over HTTP |
-| `internal/slog` | Structured logging (INV-1: event + k/v only) |
 | `internal/config` | D-020: flag > env > file > default, AUGEO_ prefix, fail fast |
+| `../shared/contract` | The geocoder↔places contract (single-binary + split mode) |
+| `../shared/normalise` | Free text → tokens; FTS5-injection guard (T3) |
+| `../shared/slog` | Structured logging (INV-1: event + k/v only) |
 
 ## Build
 
@@ -105,12 +106,14 @@ Secrets support the `_FILE` convention (e.g. `AUGEO_LLM_API_KEY_FILE`).
 
 `Dockerfile` builds the serving binary (`augeo`) and the operator tool
 (`keygen`). The geocoder never mounts geocoding data — it reads au-places
-through the contract. See [docs/release.md](docs/release.md) and the compose
-example.
+through the contract. Build from the repository root
+(`docker build -f geocoding/Dockerfile .`) so `shared/` is in the context. See
+[docs/release.md](docs/release.md) and the root `docker-compose.yml`.
 
 ## CI
 
-Tag-triggered, fixture-only (never downloads real data), smoke test against the
+Root `.github/workflows/ci.yml` runs on every push and PR. Releases are
+triggered by `geocoding/v*` tags, fixture-only (never downloads real data), smoke test against the
 mock resolver (`cmd/mockplaces`) — the geocoder never touches real geocoding
 data, so CI exercises the contract end to end with canned candidates. Actions
 pinned by commit SHA (P9). See [docs/release.md](docs/release.md).

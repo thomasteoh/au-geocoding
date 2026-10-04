@@ -77,10 +77,13 @@ OSM-touching responses carry an `attribution` field (D-018).
 ## Docker
 
 `Dockerfile` builds the server binary; the data volume is mounted read-only
-(`:ro`). See [release.md](docs/release.md) and the compose example.
+(`:ro`). Build from the repository root (`docker build -f places/Dockerfile .`)
+so `shared/` is in the context. See [release.md](docs/release.md) and the root
+`docker-compose.yml`.
 
 ## CI
 
-Tag-triggered, multi-arch (amd64/arm64), fixture-only (never downloads real data),
+Root `.github/workflows/ci.yml` runs on every push and PR. Releases are
+triggered by `places/v*` tags, multi-arch (amd64/arm64), fixture-only (never downloads real data),
 corpus-subset smoke test, SBOM + signature per image, actions pinned by commit SHA
 (P9). See [release.md](docs/release.md).
