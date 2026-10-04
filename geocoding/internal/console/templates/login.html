@@ -1,0 +1,37 @@
+{{define "head"}}<meta name="robots" content="noindex">{{end}}
+{{define "content"}}
+<section class="login">
+  <h1>Sign in to au-geocoder</h1>
+  {{with .Data}}
+  {{if .OrgChoices}}
+  <div class="card">
+    <h2>Continue with your organisation</h2>
+    <ul class="buttons">
+      {{range .OrgChoices}}<li><a class="button" href="/auth/{{if eq .Kind "saml"}}saml{{else}}oidc{{end}}/{{.Slug}}/start{{if $.Data.ReturnTo}}?return_to={{$.Data.ReturnTo}}{{end}}">{{.Name}}</a></li>{{end}}
+    </ul>
+  </div>
+  {{end}}
+  {{if .Connections}}
+  <ul class="buttons">
+    {{range .Connections}}<li><a class="button" href="/auth/{{if eq .Kind "saml"}}saml{{else}}oidc{{end}}/{{.Slug}}/start{{if $.Data.ReturnTo}}?return_to={{$.Data.ReturnTo}}{{end}}">Continue with {{.Name}}</a></li>{{end}}
+  </ul>
+  {{end}}
+  <div class="card">
+    <h2>Work account</h2>
+    <form method="post" action="/auth/discover">
+      <input type="hidden" name="return_to" value="{{.ReturnTo}}">
+      <label for="email">Work email</label>
+      <input id="email" name="email" type="email" autocomplete="username webauthn" required value="{{.Email}}">
+      <button type="submit">Continue</button>
+    </form>
+  </div>
+  <div class="card">
+    <h2>Passkey</h2>
+    <p class="muted">For accounts that registered a passkey after signing in.</p>
+    <button type="button" id="passkey-login" data-return-to="{{.ReturnTo}}">Sign in with a passkey</button>
+    <p id="passkey-error" class="error" role="alert" hidden></p>
+  </div>
+  {{end}}
+</section>
+{{end}}
+{{define "scripts"}}<script src="/console/static/passkey.js" defer></script>{{end}}

@@ -1,0 +1,49 @@
+{{define "content"}}
+<h1>Your account</h1>
+<div class="card">
+  <h2>Profile</h2>
+  <p>Email: <strong>{{.Viewer.User.Email}}</strong> <span class="muted">(managed by your identity provider)</span></p>
+  <form method="post" action="/console/account/profile">
+    <input type="hidden" name="csrf" value="{{.CSRF}}">
+    <label for="name">Display name</label>
+    <input id="name" name="name" maxlength="100" value="{{.Viewer.User.Name}}">
+    <button type="submit">Save</button>
+  </form>
+</div>
+
+<div class="card">
+  <h2>Passkeys</h2>
+  <p class="muted">A passkey lets you sign in when your identity provider is unavailable. You can add one within 10 minutes of signing in with single sign-on.</p>
+  {{with .Data.Passkeys}}
+  <table>
+    <thead><tr><th>Name</th><th>Added</th><th>Last used</th><th></th></tr></thead>
+    <tbody>
+    {{range .}}<tr><td>{{.Name}}</td><td>{{when .Created}}</td><td>{{when .LastUsed}}</td>
+      <td><form method="post" action="/console/account/passkeys/{{.ID}}/delete" class="inline"><input type="hidden" name="csrf" value="{{$.CSRF}}"><button type="submit" class="danger">Remove</button></form></td></tr>{{end}}
+    </tbody>
+  </table>
+  {{else}}<p>No passkeys yet.</p>{{end}}
+  <label for="passkey-name">Name for a new passkey</label>
+  <input id="passkey-name" maxlength="100" placeholder="e.g. Work laptop">
+  <button type="button" id="passkey-register" data-csrf="{{.CSRF}}">Add a passkey</button>
+  <p id="passkey-error" class="error" role="alert" hidden></p>
+</div>
+
+<div class="card">
+  <h2>Sessions</h2>
+  <table>
+    <thead><tr><th>Signed in</th><th>Method</th><th>Last active</th><th>Browser</th><th></th></tr></thead>
+    <tbody>
+    {{range .Data.Sessions}}<tr>
+      <td>{{when .Created}}</td><td>{{.Method}}</td><td>{{when .LastSeen}}</td><td class="ua">{{.UserAgent}}</td>
+      <td>{{if .Current}}<span class="muted">this browser</span>{{else}}<form method="post" action="/console/account/sessions/revoke" class="inline"><input type="hidden" name="csrf" value="{{$.CSRF}}"><input type="hidden" name="session" value="{{.HashHex}}"><button type="submit" class="danger">End</button></form>{{end}}</td>
+    </tr>{{end}}
+    </tbody>
+  </table>
+  <form method="post" action="/console/account/sessions/revoke-others">
+    <input type="hidden" name="csrf" value="{{.CSRF}}">
+    <button type="submit">Sign out everywhere else</button>
+  </form>
+</div>
+{{end}}
+{{define "scripts"}}<script src="/console/static/passkey.js" defer></script>{{end}}

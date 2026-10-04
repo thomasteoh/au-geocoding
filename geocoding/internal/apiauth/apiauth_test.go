@@ -221,7 +221,7 @@ func TestMapScopes(t *testing.T) {
 		{"search batch", "", nil, "", []string{"search", "batch"}},
 		{"", `["api.search"]`, nil, "api.", []string{"search"}},
 		{"", `"geo.search geo.batch"`, nil, "geo.", []string{"search", "batch"}}, // Entra delegated scp string
-		{"", "", []string{"Geo.Batch"}, "Geo.", []string{"batch"}},              // Entra app roles
+		{"", "", []string{"Geo.Batch"}, "Geo.", []string{"batch"}},               // Entra app roles
 		{"openid profile", "", nil, "", nil},
 		{"search", "", nil, "geo:", nil},
 	} {

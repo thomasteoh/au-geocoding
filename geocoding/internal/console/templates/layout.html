@@ -1,0 +1,59 @@
+{{define "layout"}}<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{.Title}} · au-geocoder</title>
+<link rel="stylesheet" href="/console/static/console.css">
+{{block "head" .}}{{end}}
+</head>
+<body>
+<header class="top">
+  <a class="brand" href="/console">au-geocoder</a>
+  {{if .Viewer}}
+  <nav class="top-nav">
+    {{if .Orgs}}
+    <details class="switcher">
+      <summary>{{if .Org}}{{.Org.Org.Name}}{{else}}Organisations{{end}}</summary>
+      <ul>
+        {{range .Orgs}}<li><a href="/console/orgs/{{.Org.Slug}}">{{.Org.Name}}</a> <span class="muted">{{.Role}}</span></li>{{end}}
+        <li><a href="/console?all=1">All organisations…</a></li>
+      </ul>
+    </details>
+    {{end}}
+    {{if .Viewer.User.PlatformAdmin}}<a href="/console/admin" {{if eq .Active "admin"}}aria-current="page"{{end}}>Admin</a>{{end}}
+    <a href="/console/account" {{if eq .Active "account"}}aria-current="page"{{end}}>{{.Viewer.User.Email}}</a>
+    <form method="post" action="/auth/logout" class="inline">
+      <input type="hidden" name="csrf" value="{{.CSRF}}">
+      <button type="submit" class="link">Sign out</button>
+    </form>
+  </nav>
+  {{end}}
+</header>
+<div class="wrap">
+  {{if .Org}}
+  <nav class="side" aria-label="Organisation">
+    {{$slug := .Org.Org.Slug}}{{$a := .Active}}{{$r := .Org.Role}}
+    <a href="/console/orgs/{{$slug}}" {{if eq $a "overview"}}aria-current="page"{{end}}>Overview</a>
+    <a href="/console/orgs/{{$slug}}/keys" {{if eq $a "keys"}}aria-current="page"{{end}}>API keys</a>
+    <a href="/console/orgs/{{$slug}}/members" {{if eq $a "members"}}aria-current="page"{{end}}>Members</a>
+    {{if atLeast $r "admin"}}
+    <a href="/console/orgs/{{$slug}}/sso" {{if eq $a "sso"}}aria-current="page"{{end}}>Single sign-on</a>
+    <a href="/console/orgs/{{$slug}}/domains" {{if eq $a "domains"}}aria-current="page"{{end}}>Domains</a>
+    <a href="/console/orgs/{{$slug}}/scim" {{if eq $a "scim"}}aria-current="page"{{end}}>SCIM provisioning</a>
+    <a href="/console/orgs/{{$slug}}/tokens" {{if eq $a "tokens"}}aria-current="page"{{end}}>OAuth tokens</a>
+    <a href="/console/orgs/{{$slug}}/audit" {{if eq $a "audit"}}aria-current="page"{{end}}>Audit log</a>
+    {{end}}
+    {{if atLeast $r "owner"}}<a href="/console/orgs/{{$slug}}/settings" {{if eq $a "settings"}}aria-current="page"{{end}}>Settings</a>{{end}}
+    {{if .Org.ViaPlatformAdmin}}<p class="note">You are viewing this organisation as a platform admin.</p>{{end}}
+  </nav>
+  {{end}}
+  <main>
+    {{if .Flash}}<p class="flash" role="status">{{.Flash}}</p>{{end}}
+    {{if .Error}}<p class="error" role="alert">{{.Error}}</p>{{end}}
+    {{block "content" .}}{{end}}
+  </main>
+</div>
+{{block "scripts" .}}{{end}}
+</body>
+</html>{{end}}

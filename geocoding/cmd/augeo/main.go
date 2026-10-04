@@ -20,11 +20,19 @@ import (
 	"syscall"
 	"time"
 
+	"augeocoding/internal/apiauth"
+	"augeocoding/internal/appdb"
 	"augeocoding/internal/config"
+	"augeocoding/internal/console"
+	"augeocoding/internal/identity"
 	"augeocoding/internal/ladder"
 	"augeocoding/internal/llm"
+	"augeocoding/internal/oidcrp"
 	"augeocoding/internal/placesclient"
 	"augeocoding/internal/publicapi"
+	"augeocoding/internal/safehttp"
+	"augeocoding/internal/scim"
+	"augeocoding/internal/secretbox"
 	"ausystem/shared/contract"
 	"ausystem/shared/metrics"
 	"ausystem/shared/normalise"
@@ -56,18 +64,74 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Public API store (app.db — service state, separate from geocoding DBs).
-	store, err := publicapi.Open(cfg.Data.AppDB)
+	// app.db — service state, separate from the geocoding DBs. One handle is
+	// shared by the key/quota store and the identity store.
+	db, err := appdb.Open(cfg.Data.AppDB)
 	if err != nil {
 		log.Error("boot_failed", "reason", "app_db", "error", err.Error())
 		os.Exit(1)
 	}
-	defer store.Close()
+	defer db.Close()
+	store, err := publicapi.New(db)
+	if err != nil {
+		log.Error("boot_failed", "reason", "app_db", "error", err.Error())
+		os.Exit(1)
+	}
+	var box *secretbox.Box
+	if cfg.Auth.ConsoleEnabled() {
+		key, err := secretbox.ParseKey(cfg.Auth.SecretKey)
+		if err == nil {
+			box, err = secretbox.New(key)
+		}
+		if err != nil {
+			log.Error("boot_failed", "reason", "secret_key", "error", err.Error())
+			os.Exit(1)
+		}
+	}
+	ids, err := identity.New(db, box)
+	if err != nil {
+		log.Error("boot_failed", "reason", "identity_db", "error", err.Error())
+		os.Exit(1)
+	}
+	// Admin-controlled URLs (discovery, JWKS, SAML metadata) are fetched
+	// through a client that refuses private addresses (SSRF).
+	fetch := safehttp.Client(10*time.Second, cfg.Auth.AllowPrivateFetch)
 
 	// Rate limiters: per-key (D-006) and per-IP anonymous (D-034). Anonymous
 	// has its own budget — AnonRPS/AnonBurst — NOT the keyed one.
 	limiter := publicapi.NewRateLimiter(cfg.Rate.KeyDefaultRPS, cfg.Rate.KeyDefaultBurst)
 	anonLimiter := publicapi.NewRateLimiter(cfg.Rate.AnonRPS, cfg.Rate.AnonBurst)
+	authn := &apiauth.Authenticator{
+		Keys: store, KeyLimiter: limiter, AnonLimiter: anonLimiter, HTTPClient: fetch,
+		ClientIP: func(r *http.Request) string { return clientIP(r, cfg.Server.TrustedProxy) },
+		Reject:   func(reason string) { log.Warn("auth_rejected", "reason", reason) },
+	}
+	if cfg.Auth.JWTBearer {
+		authn.Issuers = ids
+	}
+
+	// Console, SSO and SCIM (docs/auth.md). Off unless AUGEO_PUBLIC_URL and
+	// AUGEO_SECRET_KEY are set.
+	var con *console.Server
+	if cfg.Auth.ConsoleEnabled() {
+		if cfg.Auth.ProvidersFile != "" {
+			if err := console.LoadProviders(context.Background(), ids, cfg.Auth.ProvidersFile); err != nil {
+				log.Error("boot_failed", "reason", "providers_file", "error", err.Error())
+				os.Exit(1)
+			}
+		}
+		rp := &oidcrp.RP{CallbackURL: cfg.Auth.PublicURL + "/auth/oidc/callback", HTTP: fetch}
+		con, err = console.New(console.Config{
+			PublicURL: cfg.Auth.PublicURL,
+			Session:   identity.SessionPolicy{Idle: time.Duration(cfg.Auth.SessionIdle) * time.Second, Max: time.Duration(cfg.Auth.SessionMax) * time.Second},
+			Login:     identity.LoginPolicy{SignupOpen: cfg.Auth.Signup == "open", BootstrapAdmins: cfg.Auth.BootstrapAdmins},
+		}, ids, store, rp, log, fetch)
+		if err != nil {
+			log.Error("boot_failed", "reason", "console", "error", err.Error())
+			os.Exit(1)
+		}
+		log.Info("console_enabled", "public_url", cfg.Auth.PublicURL, "signup", cfg.Auth.Signup)
+	}
 
 	// LLM: runtime-configurable provider client (rung 5). The holder is seeded
 	// from boot config and is updated at runtime by /ctrl/llm — no restart. The
@@ -105,7 +169,7 @@ func main() {
 
 	srv := &http.Server{
 		Addr:              cfg.Server.Addr,
-		Handler:           newMux(l, store, limiter, anonLimiter, resolver, cfg, log, met, llmHolder, ctrlToken),
+		Handler:           newMux(l, store, authn, resolver, cfg, log, met, llmHolder, ctrlToken, con, ids),
 		ReadHeaderTimeout: time.Duration(cfg.Server.ReadTimeout) * time.Second,
 		ReadTimeout:       time.Duration(cfg.Server.ReadTimeout) * time.Second,
 		WriteTimeout:      writeTimeout,
@@ -174,16 +238,20 @@ func buildLadder(res contract.Resolver, cfg config.Config, provider *llm.Client,
 }
 
 // newMux builds the HTTP routes.
-func newMux(l *ladder.Ladder, store *publicapi.Store, limiter *publicapi.RateLimiter, anonLimiter *publicapi.RateLimiter, resolver contract.Resolver, cfg config.Config, log *slog.Logger, met *metrics.Collector, llmHolder *llm.Holder, ctrlToken string) http.Handler {
+func newMux(l *ladder.Ladder, store *publicapi.Store, authn *apiauth.Authenticator, resolver contract.Resolver, cfg config.Config, log *slog.Logger, met *metrics.Collector, llmHolder *llm.Holder, ctrlToken string, con *console.Server, ids *identity.Store) http.Handler {
 	mux := http.NewServeMux()
+	if con != nil {
+		con.Register(mux)
+		mux.Handle("/scim/v2/", &scim.Server{IDs: ids, Log: log, BaseURL: cfg.Auth.PublicURL + "/scim/v2"})
+	}
 
-	mux.HandleFunc("/search", handleSearch(l, store, limiter, anonLimiter, cfg, log, met))
-	mux.HandleFunc("/geocode", handleGeocode(l, store, limiter, anonLimiter, cfg, log, met))
-	mux.HandleFunc("/reverse", handleReverse(l, store, limiter, anonLimiter, cfg, log, met))
-	mux.HandleFunc("/poi", handlePOI(l, store, limiter, anonLimiter, cfg, log, met))
-	mux.HandleFunc("/parse", handleParse(l, store, limiter, anonLimiter, cfg, log, met))
-	mux.HandleFunc("/batch", handleBatch(l, store, limiter, cfg, log))
-	mux.HandleFunc("/suggest", handleSuggest(resolver, store, limiter, anonLimiter, cfg, log, met))
+	mux.HandleFunc("/search", handleSearch(l, store, authn, cfg, log, met))
+	mux.HandleFunc("/geocode", handleGeocode(l, store, authn, cfg, log, met))
+	mux.HandleFunc("/reverse", handleReverse(l, store, authn, cfg, log, met))
+	mux.HandleFunc("/poi", handlePOI(l, store, authn, cfg, log, met))
+	mux.HandleFunc("/parse", handleParse(l, store, authn, cfg, log, met))
+	mux.HandleFunc("/batch", handleBatch(l, store, authn, cfg, log))
+	mux.HandleFunc("/suggest", handleSuggest(resolver, store, authn, cfg, log, met))
 	mux.HandleFunc("/healthz", handleHealthz())
 	mux.HandleFunc("/readyz", handleReadyz(resolver, cfg))
 	mux.HandleFunc("/metrics", handleMetrics(met))
@@ -196,30 +264,30 @@ func newMux(l *ladder.Ladder, store *publicapi.Store, limiter *publicapi.RateLim
 
 // handleSearch is the front door: it classifies free text and dispatches to the
 // right rung (all rungs). This is /search.
-func handleSearch(l *ladder.Ladder, store *publicapi.Store, limiter *publicapi.RateLimiter, anonLimiter *publicapi.RateLimiter, cfg config.Config, log *slog.Logger, met *metrics.Collector) http.HandlerFunc {
-	return handleQuery(l, store, limiter, anonLimiter, cfg, log, met, "search", "/search")
+func handleSearch(l *ladder.Ladder, store *publicapi.Store, authn *apiauth.Authenticator, cfg config.Config, log *slog.Logger, met *metrics.Collector) http.HandlerFunc {
+	return handleQuery(l, store, authn, cfg, log, met, "search", "/search")
 }
 
 // handleGeocode is /geocode: address text → G-NAF. Only the address rung (and
 // coord) serve it — never POI.
-func handleGeocode(l *ladder.Ladder, store *publicapi.Store, limiter *publicapi.RateLimiter, anonLimiter *publicapi.RateLimiter, cfg config.Config, log *slog.Logger, met *metrics.Collector) http.HandlerFunc {
-	return handleQuery(l, store, limiter, anonLimiter, cfg, log, met, "geocode", "/geocode")
+func handleGeocode(l *ladder.Ladder, store *publicapi.Store, authn *apiauth.Authenticator, cfg config.Config, log *slog.Logger, met *metrics.Collector) http.HandlerFunc {
+	return handleQuery(l, store, authn, cfg, log, met, "geocode", "/geocode")
 }
 
 // handleReverse is /reverse: lat/lon → RTree nearest. Only the coord rung serves
 // it; an address string is rejected.
-func handleReverse(l *ladder.Ladder, store *publicapi.Store, limiter *publicapi.RateLimiter, anonLimiter *publicapi.RateLimiter, cfg config.Config, log *slog.Logger, met *metrics.Collector) http.HandlerFunc {
-	return handleQuery(l, store, limiter, anonLimiter, cfg, log, met, "reverse", "/reverse")
+func handleReverse(l *ladder.Ladder, store *publicapi.Store, authn *apiauth.Authenticator, cfg config.Config, log *slog.Logger, met *metrics.Collector) http.HandlerFunc {
+	return handleQuery(l, store, authn, cfg, log, met, "reverse", "/reverse")
 }
 
 // handlePOI is /poi: name (+ optional area) → OSM. Only POI rungs serve it.
-func handlePOI(l *ladder.Ladder, store *publicapi.Store, limiter *publicapi.RateLimiter, anonLimiter *publicapi.RateLimiter, cfg config.Config, log *slog.Logger, met *metrics.Collector) http.HandlerFunc {
-	return handleQuery(l, store, limiter, anonLimiter, cfg, log, met, "poi", "/poi")
+func handlePOI(l *ladder.Ladder, store *publicapi.Store, authn *apiauth.Authenticator, cfg config.Config, log *slog.Logger, met *metrics.Collector) http.HandlerFunc {
+	return handleQuery(l, store, authn, cfg, log, met, "poi", "/poi")
 }
 
 // handleParse is /parse: conversational → LLM structured intent. Deterministic
 // rungs never serve it; only the LLM rung participates.
-func handleParse(l *ladder.Ladder, store *publicapi.Store, limiter *publicapi.RateLimiter, anonLimiter *publicapi.RateLimiter, cfg config.Config, log *slog.Logger, met *metrics.Collector) http.HandlerFunc {
+func handleParse(l *ladder.Ladder, store *publicapi.Store, authn *apiauth.Authenticator, cfg config.Config, log *slog.Logger, met *metrics.Collector) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		// LLM layer must be enabled; /parse is LLM-only (rung 5). Without it the
 		// endpoint is unavailable, not "input unparseable" — distinct signal.
@@ -228,14 +296,14 @@ func handleParse(l *ladder.Ladder, store *publicapi.Store, limiter *publicapi.Ra
 			met.Record("/parse", 503, 0, 0)
 			return
 		}
-		h := handleQuery(l, store, limiter, anonLimiter, cfg, log, met, "parse", "/parse")
+		h := handleQuery(l, store, authn, cfg, log, met, "parse", "/parse")
 		h.ServeHTTP(w, r)
 	}
 }
 
 // handleQuery is the shared request path. kind constrains which rungs run;
 // endpoint is the canonical name for logging.
-func handleQuery(l *ladder.Ladder, store *publicapi.Store, limiter *publicapi.RateLimiter, anonLimiter *publicapi.RateLimiter, cfg config.Config, log *slog.Logger, met *metrics.Collector, kind, endpoint string) http.HandlerFunc {
+func handleQuery(l *ladder.Ladder, store *publicapi.Store, authn *apiauth.Authenticator, cfg config.Config, log *slog.Logger, met *metrics.Collector, kind, endpoint string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		// Metrics: record endpoint/status/latency/result-count per request.
 		start := time.Now()
@@ -263,20 +331,15 @@ func handleQuery(l *ladder.Ladder, store *publicapi.Store, limiter *publicapi.Ra
 			writeJSONError(w, http.StatusBadRequest, "query too long")
 			return
 		}
-		auth, anon, keyID, authErr := authenticate(r, store, limiter, anonLimiter, cfg, log)
+		p, authErr := authn.Authenticate(r)
 		if authErr != nil {
-			if errors.Is(authErr, publicapi.ErrInvalidKey) {
-				status = 401
-				writeJSONError(w, http.StatusUnauthorized, "invalid api key")
-			} else {
-				status = 429
-				writeJSONError(w, http.StatusTooManyRequests, "rate limited")
-			}
+			status = int64(writeAuthError(w, authErr))
 			return
 		}
+		anon := p.Anonymous()
 		// Scope enforcement: a key's scopes gate which endpoints it may use
 		// (security.md: /batch requires the batch scope, never anonymous).
-		if !anon && !hasScope(auth.Scopes, endpointScope(kind)) {
+		if !anon && !hasScope(p.Scopes, endpointScope(kind)) {
 			status = 403
 			writeJSONError(w, http.StatusForbidden, "key not permitted for this endpoint")
 			return
@@ -313,7 +376,7 @@ func handleQuery(l *ladder.Ladder, store *publicapi.Store, limiter *publicapi.Ra
 				}
 				rows := int64(len(res.Response.Candidates))
 				if !anon {
-					ok, _ := store.ChargeRows(keyID, auth.Tier, rows)
+					ok, _ := store.ChargePrincipal(p, rows)
 					if !ok {
 						status = 429
 						writeJSONError(w, http.StatusTooManyRequests, "quota exceeded")
@@ -333,7 +396,7 @@ func handleQuery(l *ladder.Ladder, store *publicapi.Store, limiter *publicapi.Ra
 				}
 				status = 200
 				resultRows = rows
-				store.LogRequest(keyID, endpoint, http.StatusOK, 0, len(res.Response.Candidates), res.Strategy)
+				store.LogPrincipalRequest(p, endpoint, http.StatusOK, 0, len(res.Response.Candidates), res.Strategy)
 				// Echo the contract version so the caller can verify which wire
 				// format it got (UX review finding #3).
 				w.Header().Set(contract.ContractVersionHeader, contract.Version)
@@ -372,7 +435,7 @@ func handleQuery(l *ladder.Ladder, store *publicapi.Store, limiter *publicapi.Ra
 		// anonymous rows go to the in-memory per-IP daily counter (D-026).
 		rows := int64(len(res.Response.Candidates))
 		if !anon {
-			ok, _ := store.ChargeRows(keyID, auth.Tier, rows)
+			ok, _ := store.ChargePrincipal(p, rows)
 			if !ok {
 				status = 429
 				writeJSONError(w, http.StatusTooManyRequests, "quota exceeded")
@@ -394,7 +457,7 @@ func handleQuery(l *ladder.Ladder, store *publicapi.Store, limiter *publicapi.Ra
 		// Success.
 		status = 200
 		resultRows = rows
-		store.LogRequest(keyID, endpoint, http.StatusOK, 0, len(res.Response.Candidates), res.Strategy)
+		store.LogPrincipalRequest(p, endpoint, http.StatusOK, 0, len(res.Response.Candidates), res.Strategy)
 		// Echo the contract version so the caller can verify which wire
 		// format it got (UX review finding #3).
 		w.Header().Set(contract.ContractVersionHeader, contract.Version)
@@ -417,28 +480,21 @@ type batchResp struct {
 	Items []batchItem `json:"items"`
 }
 
-func handleBatch(l *ladder.Ladder, store *publicapi.Store, limiter *publicapi.RateLimiter, cfg config.Config, log *slog.Logger) http.HandlerFunc {
+func handleBatch(l *ladder.Ladder, store *publicapi.Store, authn *apiauth.Authenticator, cfg config.Config, log *slog.Logger) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		// /batch requires a key with the batch scope; never anonymous
-		// (security.md: batch is scoped and keyed).
-		keyStr := r.Header.Get("X-Api-Key")
-		if keyStr == "" {
+		// /batch requires a key or bearer token with the batch scope; never
+		// anonymous (security.md: batch is scoped and keyed).
+		if r.Header.Get("X-Api-Key") == "" && r.Header.Get("Authorization") == "" {
 			writeJSONError(w, http.StatusForbidden, "batch requires a key")
 			return
 		}
-		k, err := store.Authenticate(keyStr)
+		p, err := authn.Authenticate(r)
 		if err != nil {
-			log.Warn("auth_rejected", "reason", "invalid_key")
-			writeJSONError(w, http.StatusUnauthorized, "invalid api key")
+			writeAuthError(w, err)
 			return
 		}
-		if !hasScope(k.Scopes, "batch") {
+		if !hasScope(p.Scopes, "batch") {
 			writeJSONError(w, http.StatusForbidden, "key not permitted for this endpoint")
-			return
-		}
-		// Rate limit the keyed batch path.
-		if !limiter.Allow("key:" + keyStr) {
-			writeJSONError(w, http.StatusTooManyRequests, "rate limited")
 			return
 		}
 
@@ -552,15 +608,11 @@ func handleBatch(l *ladder.Ladder, store *publicapi.Store, limiter *publicapi.Ra
 
 		// Charge quota for the total result rows across all items (D-034). If the
 		// keyed quota is exhausted, refuse the whole batch — the caller retries.
-		if !k.Enabled {
-			writeJSONError(w, http.StatusForbidden, "key disabled")
-			return
-		}
-		if ok, _ := store.ChargeRows(k.ID, k.Tier, totalRows); !ok {
+		if ok, _ := store.ChargePrincipal(p, totalRows); !ok {
 			writeJSONError(w, http.StatusTooManyRequests, "quota exceeded")
 			return
 		}
-		store.LogRequest(k.ID, "/batch", http.StatusOK, 0, int(totalRows), "batch")
+		store.LogPrincipalRequest(p, "/batch", http.StatusOK, 0, int(totalRows), "batch")
 
 		// Attribution (D-018): OSM-touching responses carry the ODbL notice.
 		if touchesOSMItems(resp) {
@@ -586,7 +638,7 @@ func touchesOSMItems(resp batchResp) bool {
 // It is NOT a rung walk — autocomplete is a genuinely different problem (PR-7).
 // It calls the resolver's Suggest directly. The prefix is never logged and
 // never a metric label (PR-7.5 / INV-1): only the suggestion count is recorded.
-func handleSuggest(resolver contract.Resolver, store *publicapi.Store, limiter *publicapi.RateLimiter, anonLimiter *publicapi.RateLimiter, cfg config.Config, log *slog.Logger, met *metrics.Collector) http.HandlerFunc {
+func handleSuggest(resolver contract.Resolver, store *publicapi.Store, authn *apiauth.Authenticator, cfg config.Config, log *slog.Logger, met *metrics.Collector) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
 		status := int64(200)
@@ -610,18 +662,13 @@ func handleSuggest(resolver contract.Resolver, store *publicapi.Store, limiter *
 			writeJSONError(w, http.StatusBadRequest, "query too long")
 			return
 		}
-		auth, anon, keyID, authErr := authenticate(r, store, limiter, anonLimiter, cfg, log)
+		p, authErr := authn.Authenticate(r)
 		if authErr != nil {
-			if errors.Is(authErr, publicapi.ErrInvalidKey) {
-				status = 401
-				writeJSONError(w, http.StatusUnauthorized, "invalid api key")
-			} else {
-				status = 429
-				writeJSONError(w, http.StatusTooManyRequests, "rate limited")
-			}
+			status = int64(writeAuthError(w, authErr))
 			return
 		}
-		if !anon && !hasScope(auth.Scopes, "search") {
+		anon := p.Anonymous()
+		if !anon && !hasScope(p.Scopes, "search") {
 			status = 403
 			writeJSONError(w, http.StatusForbidden, "key not permitted for this endpoint")
 			return
@@ -657,7 +704,7 @@ func handleSuggest(resolver contract.Resolver, store *publicapi.Store, limiter *
 		// are a caller concern — the meter still counts rows; a session-aware
 		// billing shim (S-14) sits in front of this endpoint.
 		if !anon {
-			ok, _ := store.ChargeRows(keyID, auth.Tier, rows)
+			ok, _ := store.ChargePrincipal(p, rows)
 			if !ok {
 				status = 429
 				writeJSONError(w, http.StatusTooManyRequests, "quota exceeded")
@@ -674,7 +721,7 @@ func handleSuggest(resolver contract.Resolver, store *publicapi.Store, limiter *
 		}
 		status = 200
 		resultRows = rows
-		store.LogRequest(keyID, "/suggest", http.StatusOK, 0, int(rows), "suggest")
+		store.LogPrincipalRequest(p, "/suggest", http.StatusOK, 0, int(rows), "suggest")
 		// Echo the contract version so the caller can verify which wire
 		// format it got (UX review finding #3).
 		w.Header().Set(contract.ContractVersionHeader, contract.Version)
@@ -843,29 +890,20 @@ func readBody(w http.ResponseWriter, r *http.Request, cfg config.Config, log *sl
 	return strings.TrimSpace(sb.String())
 }
 
-func authenticate(r *http.Request, store *publicapi.Store, limiter *publicapi.RateLimiter, anonLimiter *publicapi.RateLimiter, cfg config.Config, log *slog.Logger) (publicapi.Key, bool, int64, error) {
-	keyStr := r.Header.Get("X-Api-Key")
-	if keyStr == "" {
-		// Anonymous is limited per-IP, not per-connection. RemoteAddr carries
-		// host:port; keying on the port gives a fresh bucket per connection,
-		// which a client can exploit by simply reconnecting. Strip to the IP.
-		ip := clientIP(r, cfg.Server.TrustedProxy)
-		if !anonLimiter.Allow("anon:" + ip) {
-			return publicapi.Key{}, true, 0, publicapi.ErrRateLimited
-		}
-		return publicapi.Key{}, true, 0, nil
+// writeAuthError maps an authentication failure to its response and returns
+// the status. Every credential failure is the same 401 (T6).
+func writeAuthError(w http.ResponseWriter, err error) int {
+	switch {
+	case errors.Is(err, apiauth.ErrBothCredentials):
+		writeJSONError(w, http.StatusBadRequest, err.Error())
+		return http.StatusBadRequest
+	case errors.Is(err, publicapi.ErrRateLimited):
+		writeJSONError(w, http.StatusTooManyRequests, "rate limited")
+		return http.StatusTooManyRequests
+	default:
+		writeJSONError(w, http.StatusUnauthorized, "invalid api key")
+		return http.StatusUnauthorized
 	}
-	k, err := store.Authenticate(keyStr)
-	if err != nil {
-		// Uniform 401 for unknown/revoked/disabled (T6) — never fall through to
-		// anonymous. An invalid key must be rejected, not silently served.
-		log.Warn("auth_rejected", "reason", "invalid_key")
-		return publicapi.Key{}, false, 0, publicapi.ErrInvalidKey
-	}
-	if !limiter.Allow("key:" + keyStr) {
-		return k, false, k.ID, publicapi.ErrRateLimited
-	}
-	return k, false, k.ID, nil
 }
 
 // writeJSONError writes a JSON error body with the application/json content
