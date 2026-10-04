@@ -113,17 +113,25 @@ connection's `allowed_orgs` (checked against `/user/orgs`, which needs the
 
 ### SAML 2.0
 
-SP-initiated, HTTP-Redirect binding for the request and HTTP-POST for the
-response. Each SAML connection has its own SP entity ID and ACS URL
-(`/auth/saml/{id}/acs`), its own signing key pair (generated on creation,
+SP-initiated, HTTP-Redirect binding for the request (signed, RSA-SHA256)
+and HTTP-POST for the response. Each SAML connection has its own SP entity ID
+(`/auth/saml/{slug}/metadata`, which also serves the SP metadata) and ACS URL
+(`/auth/saml/{slug}/acs`), its own signing key pair (generated on creation,
 private key sealed) and stores the IdP metadata XML. Assertions must be
-signed, `InResponseTo` must match the flow's request ID, and audience,
-`NotBefore`/`NotOnOrAfter` and the destination are checked by crewjam/saml.
-IdP-initiated SSO is refused, because it cannot be bound to a flow.
+signed (a signed response covering them is also accepted), `InResponseTo`
+must match the flow's request ID, and audience, `NotBefore`/`NotOnOrAfter`
+(180 s skew), issue time (90 s), recipient and destination are checked by
+crewjam/saml. Encrypted assertions are accepted; the artifact binding is not.
+IdP-initiated SSO is refused, because it cannot be bound to a flow. The NameID
+is the subject, so a transient NameID is refused.
 
-Attribute mapping per connection: email (default NameID if it is an email,
-else `email` / `http://schemas.xmlsoap.org/ws/2005/05/identity/claims/emailaddress`),
-name, and groups.
+Attribute mapping per connection: email (default NameID if its format is
+emailAddress or it contains `@`, else `email`, `mail`,
+`http://schemas.xmlsoap.org/ws/2005/05/identity/claims/emailaddress` or
+`urn:oid:0.9.2342.19200300.100.1.3`), name (default `displayName`, `name`,
+`cn` and their URI forms, else given name plus surname), and groups (default
+`groups`, `http://schemas.microsoft.com/ws/2008/06/identity/claims/groups`,
+`memberOf`). Attributes match on Name or FriendlyName, ignoring case.
 
 SAML single logout is not implemented; ending the console session does not
 end the IdP session. Use SCIM deprovisioning or short session lifetimes for
