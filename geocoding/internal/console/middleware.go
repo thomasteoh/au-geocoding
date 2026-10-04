@@ -34,6 +34,10 @@ type OrgContext struct {
 	ViaPlatformAdmin bool
 }
 
+func withViewer(ctx context.Context, v *Viewer) context.Context {
+	return context.WithValue(ctx, viewerKey, v)
+}
+
 func viewerFrom(ctx context.Context) *Viewer {
 	v, _ := ctx.Value(viewerKey).(*Viewer)
 	return v
@@ -100,6 +104,10 @@ func (s *Server) requireOrg(min identity.Role, h http.Handler) http.Handler {
 		}
 		if oc.Role < min {
 			s.renderError(w, r, http.StatusForbidden, "You need the "+min.String()+" role for this.")
+			return
+		}
+		if !s.ssoSatisfied(r, v, oc) {
+			s.requireOrgSSO(w, r, oc)
 			return
 		}
 		h.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), orgKey, oc)))
@@ -200,4 +208,33 @@ func safeReturn(p string) string {
 		return "/console"
 	}
 	return p
+}
+
+// ssoSatisfied applies per-org SSO enforcement (docs/auth.md "SSO
+// enforcement"): when the org enforces SSO, the session must come from one
+// of the org's own connections. An owner on a passkey session (break-glass)
+// and platform admins are exempt.
+func (s *Server) ssoSatisfied(r *http.Request, v *Viewer, oc *OrgContext) bool {
+	if !oc.Org.SSOEnforced || v.User.PlatformAdmin {
+		return true
+	}
+	if v.Session.Method == "passkey" && oc.Role == identity.RoleOwner {
+		return true
+	}
+	return s.IDs.SessionConnectionOrg(r.Context(), v.Session.ConnectionID) == oc.Org.ID
+}
+
+// requireOrgSSO tells the person to sign in through the org's SSO. GETs
+// get a page with the org's sign-in options; other methods are refused.
+func (s *Server) requireOrgSSO(w http.ResponseWriter, r *http.Request, oc *OrgContext) {
+	if r.Method != http.MethodGet {
+		s.renderError(w, r, http.StatusForbidden, oc.Org.Name+" requires you to sign in with its single sign-on.")
+		return
+	}
+	conns, _ := s.IDs.OrgLoginConnections(r.Context(), oc.Org.ID)
+	s.render(w, r, http.StatusForbidden, "sso_required", Page{Title: "Single sign-on required", Data: struct {
+		OrgName     string
+		Connections []identity.Connection
+		ReturnTo    string
+	}{oc.Org.Name, conns, safeReturn(r.URL.RequestURI())}})
 }

@@ -17,8 +17,12 @@ type Assertion struct {
 	EmailTrusted bool // the IdP vouches for the address (per preset + email_verified)
 	Name         string
 	Groups       []string
-	IdPSID       string
-	IDToken      string
+	// GroupsUnknown is set when the IdP could not say which groups the
+	// person is in (Entra group overage with no Graph lookup). Roles are
+	// then left as they are rather than recomputed from an empty list.
+	GroupsUnknown bool
+	IdPSID        string
+	IDToken       string
 }
 
 // Denial is a login refusal with a reason code for the audit log and a
@@ -136,7 +140,7 @@ func (s *Store) ResolveLogin(ctx context.Context, a Assertion, p LoginPolicy) (L
 				return LoginResult{}, err
 			}
 			if !ok {
-				return LoginResult{}, deny("link_not_allowed", "An account with this email already exists outside this organisation. Sign in the way you did before.")
+				return LoginResult{}, deny("link_not_allowed", "An account with this email already exists outside this organisation. Sign in the way you did before, then link this sign-in method from your account page.")
 			}
 		}
 	} else {
@@ -277,6 +281,13 @@ func (s *Store) afterLogin(ctx context.Context, u User, a Assertion, p LoginPoli
 			return err
 		}
 		switch {
+		case a.GroupsUnknown:
+			// Keep the current role; JIT still applies to newcomers.
+			if cur == RoleNone && org.JITEnabled {
+				if err := s.SetMembership(ctx, org.ID, u.ID, org.DefaultRole, "jit"); err != nil {
+					return err
+				}
+			}
 		case hasMappings && mapped != RoleNone:
 			if mapped != cur {
 				if err := s.SetMembership(ctx, org.ID, u.ID, mapped, "group"); err != nil && !errors.Is(err, ErrLastOwner) {

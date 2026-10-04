@@ -364,3 +364,54 @@ An invite is always a pending row, even for an email that already has an
 account: the person joins when they next sign in with a trusted address, so
 nobody is added to an org without acting, and the response never reveals
 whether an account exists. Invites expire after 14 days.
+
+## Linking sign-in methods
+
+A signed-in person can link another identity to their account from the
+account page: they complete that provider's sign-in and the identity is
+attached. Because they hold both, no email match is needed, which is what
+lets someone who belongs to several orgs add each org's SSO (automatic
+linking at login refuses accounts with access outside the org; see rule 2
+above). Rules:
+
+- Linking needs a recent SSO sign-in (within 10 minutes, not a passkey
+  session), like adding a passkey.
+- Only platform connections and connections of orgs the person belongs to
+  are offered.
+- An org connection link still needs the asserted email in a domain that
+  org verified, and the org's invite, JIT and group-mapping rules apply.
+- An identity already linked to another account cannot be linked again.
+- Unlinking never removes the last way to sign in (identities plus
+  passkeys), and ends sessions created through that connection.
+
+## SSO enforcement
+
+An org with SSO enforcement on checks every console request to its pages:
+the session must have been created through one of that org's own
+connections. Otherwise GETs show a page with the org's sign-in buttons and
+other requests get 403. Exempt: platform admins, and owners on a passkey
+session (break-glass). Because the check runs per request, sessions that
+predate enforcement do not survive it, and guests at other domains need an
+identity in the org's IdP (linked as above).
+
+Separately, platform IdP logins for an address in an enforced org's
+verified domain are refused at sign-in. An owner can only turn enforcement
+on from a session that already satisfies it, so they cannot lock
+themselves out.
+
+## Microsoft Entra ID
+
+- Single-tenant issuer (`https://login.microsoftonline.com/{tenant}/v2.0`):
+  go-oidc checks the token's issuer, so only that tenant signs in.
+- Shared issuers (`common`, `organizations`): each token's issuer must be
+  its own tenant's, and the connection's **allowed tenants** list pins
+  which tenant IDs may sign in. The list is required on org connections and
+  optional on platform connections; back-channel logout tokens are checked
+  against it too.
+- Email is trusted for linking only with the `xms_edov` claim (see the
+  preset table).
+- Group overage: when Entra omits groups (`_claim_names.groups` or
+  `hasgroups`), the console asks Microsoft Graph (`/me/getMemberGroups`,
+  needs GroupMember.Read.All consented). If that fails, the sign-in still
+  works and the person's role is left unchanged rather than recomputed from
+  an empty list.

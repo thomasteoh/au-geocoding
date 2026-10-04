@@ -218,6 +218,8 @@ CREATE TABLE audit_events (
 );
 CREATE INDEX idx_audit_org_ts ON audit_events(org_id, ts);
 `,
+	// 2: Entra tenant allowlist on connections.
+	`ALTER TABLE connections ADD COLUMN allowed_tenants TEXT NOT NULL DEFAULT '';`,
 }
 
 func migrate(db *sql.DB) error {

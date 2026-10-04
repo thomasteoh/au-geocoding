@@ -79,7 +79,7 @@ func (s *Server) handleSAMLACS(w http.ResponseWriter, r *http.Request) {
 		s.loginPage(w, r, http.StatusBadRequest, loginData{}, "Start sign-in from this site, not from your identity provider's portal.")
 		return
 	}
-	f, ok := s.takeFlow(w, r, relay, "saml")
+	f, ok := s.takeFlow(w, r, relay, "saml", flowLink)
 	if !ok {
 		return
 	}
@@ -100,6 +100,10 @@ func (s *Server) handleSAMLACS(w http.ResponseWriter, r *http.Request) {
 		s.Log.Warn("saml_response_rejected", "connection", c.Slug, "error", err.Error())
 		s.audit(r, c.OrgID, "login.failed", c.Slug, "saml_invalid")
 		s.loginPage(w, r, http.StatusBadRequest, loginData{}, "Sign-in with "+c.Name+" did not complete. Try again.")
+		return
+	}
+	if f.Kind == flowLink {
+		s.finishLink(w, r, f, samlsp.ToAssertion(c, sa))
 		return
 	}
 	s.completeLogin(w, r, samlsp.ToAssertion(c, sa), f.ReturnTo, identity.KindSAML)

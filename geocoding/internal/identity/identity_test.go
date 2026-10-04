@@ -502,3 +502,93 @@ func TestSlugify(t *testing.T) {
 		}
 	}
 }
+
+func TestGroupsUnknownKeepsRole(t *testing.T) {
+	s := newStore(t)
+	org, c, _ := setupOrgWithDomain(t, s, "acme", "acme.example", false)
+	s.AddGroupMapping(ctx, GroupMapping{OrgID: org.ID, Source: SourceSSO, ConnectionID: c.ID, Group: "admins", Role: RoleAdmin})
+	s.CreateInvite(ctx, org.ID, "g@acme.example", RoleViewer, 0, time.Hour)
+	a := Assertion{Connection: c, Subject: "g", Email: "g@acme.example", Groups: []string{"admins"}}
+	res, err := s.ResolveLogin(ctx, a, LoginPolicy{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	a.Groups, a.GroupsUnknown = nil, true
+	if _, err := s.ResolveLogin(ctx, a, LoginPolicy{}); err != nil {
+		t.Fatalf("unknown groups: %v", err)
+	}
+	if r, _ := s.Role(ctx, org.ID, res.User.ID); r != RoleAdmin {
+		t.Fatalf("role changed on unknown groups: %v", r)
+	}
+}
+
+func TestMultiTenantOrgConnectionNeedsTenants(t *testing.T) {
+	s := newStore(t)
+	org, _, _ := setupOrgWithDomain(t, s, "acme", "acme.example", false)
+	c := Connection{OrgID: org.ID, Slug: "acme-entra", Kind: KindOIDC, Preset: "entra", Name: "E", Enabled: true,
+		Issuer: "https://login.microsoftonline.com/organizations/v2.0", ClientID: "x"}
+	if _, err := s.SaveConnection(ctx, c); err != ErrInvalid {
+		t.Fatalf("unpinned: %v", err)
+	}
+	c.AllowedTenants = []string{"not-a-guid"}
+	if _, err := s.SaveConnection(ctx, c); err != ErrInvalid {
+		t.Fatalf("bad tenant: %v", err)
+	}
+	c.AllowedTenants = []string{"11111111-1111-1111-1111-111111111111"}
+	got, err := s.SaveConnection(ctx, c)
+	if err != nil || len(got.AllowedTenants) != 1 {
+		t.Fatalf("pinned: %+v %v", got, err)
+	}
+}
+
+func TestLinkIdentity(t *testing.T) {
+	s := newStore(t)
+	org, oc, _ := setupOrgWithDomain(t, s, "acme", "acme.example", true)
+	google := platformConn(t, s, "google", true)
+	github := platformConn(t, s, "github", false)
+	// A user who belongs to another org cannot be auto-linked by acme's IdP...
+	u, _ := s.CreateUser(ctx, "dev@acme.example", "")
+	other, _ := s.CreateOrg(ctx, "Other", "other", u.ID, false, false)
+	_ = other
+	if _, err := s.ResolveLogin(ctx, Assertion{Connection: oc, Subject: "okta-dev", Email: u.Email}, LoginPolicy{}); denialCode(err) != "link_not_allowed" {
+		t.Fatalf("auto link: %v", err)
+	}
+	// ...but can link it explicitly, which applies acme's JIT.
+	if err := s.LinkIdentity(ctx, u.ID, Assertion{Connection: oc, Subject: "okta-dev", Email: u.Email}, LoginPolicy{}); err != nil {
+		t.Fatal(err)
+	}
+	if r, _ := s.Role(ctx, org.ID, u.ID); r != RoleDeveloper {
+		t.Fatalf("JIT on link: %v", r)
+	}
+	res, err := s.ResolveLogin(ctx, Assertion{Connection: oc, Subject: "okta-dev", Email: u.Email}, LoginPolicy{})
+	if err != nil || res.User.ID != u.ID {
+		t.Fatalf("login after link: %+v %v", res, err)
+	}
+	// Org connection link needs the org's verified domain.
+	if err := s.LinkIdentity(ctx, u.ID, Assertion{Connection: oc, Subject: "x", Email: "dev@elsewhere.example"}, LoginPolicy{}); denialCode(err) != "domain_not_verified" {
+		t.Fatalf("foreign domain link: %v", err)
+	}
+	// A platform identity with any email links; one held by another user does not.
+	if err := s.LinkIdentity(ctx, u.ID, Assertion{Connection: github, Subject: "gh-1", Email: "personal@x.example"}, LoginPolicy{}); err != nil {
+		t.Fatal(err)
+	}
+	v, _ := s.CreateUser(ctx, "v@example.com", "")
+	if err := s.LinkIdentity(ctx, v.ID, Assertion{Connection: github, Subject: "gh-1"}, LoginPolicy{}); err != ErrLinkedElsewhere {
+		t.Fatalf("steal identity: %v", err)
+	}
+	ids, _ := s.LinkedIdentities(ctx, u.ID)
+	if len(ids) != 2 {
+		t.Fatalf("linked: %+v", ids)
+	}
+	// Unlink keeps at least one method.
+	if _, err := s.UnlinkIdentity(ctx, u.ID, ids[0].ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.UnlinkIdentity(ctx, u.ID, ids[1].ID); err != ErrLastMethod {
+		t.Fatalf("last method: %v", err)
+	}
+	if _, err := s.UnlinkIdentity(ctx, v.ID, ids[1].ID); err != ErrNotFound {
+		t.Fatalf("unlink other's identity: %v", err)
+	}
+	_ = google
+}

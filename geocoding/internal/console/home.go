@@ -42,8 +42,11 @@ func (s *Server) handleCreateOrg(w http.ResponseWriter, r *http.Request) {
 }
 
 type accountData struct {
-	Sessions []sessionRow
-	Passkeys []identity.Passkey
+	Sessions   []sessionRow
+	Passkeys   []identity.Passkey
+	Identities []identity.LinkedIdentity
+	Linkable   []identity.Connection // not yet linked
+	CanLink    bool                  // session fresh enough to link
 }
 
 type sessionRow struct {
@@ -68,7 +71,28 @@ func (s *Server) handleAccount(w http.ResponseWriter, r *http.Request) {
 		s.serverError(w, r, err)
 		return
 	}
-	s.render(w, r, http.StatusOK, "account", Page{Title: "Your account", Active: "account", Data: accountData{Sessions: rows, Passkeys: pks}})
+	ids, err := s.IDs.LinkedIdentities(r.Context(), v.User.ID)
+	if err != nil {
+		s.serverError(w, r, err)
+		return
+	}
+	conns, err := s.IDs.LinkableConnections(r.Context(), v.User.ID)
+	if err != nil {
+		s.serverError(w, r, err)
+		return
+	}
+	linked := map[int64]bool{}
+	for _, i := range ids {
+		linked[i.Connection.ID] = true
+	}
+	var linkable []identity.Connection
+	for _, c := range conns {
+		if !linked[c.ID] {
+			linkable = append(linkable, c)
+		}
+	}
+	s.render(w, r, http.StatusOK, "account", Page{Title: "Your account", Active: "account", Data: accountData{Sessions: rows, Passkeys: pks,
+		Identities: ids, Linkable: linkable, CanLink: linkFresh(v.Session)}})
 }
 
 func (s *Server) handleAccountProfile(w http.ResponseWriter, r *http.Request) {

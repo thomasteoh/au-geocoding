@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"strings"
@@ -40,6 +41,9 @@ type RP struct {
 	HTTP *http.Client
 	// GitHub endpoints; zero value means github.com.
 	GitHub GitHubEndpoints
+	// GraphURL is Microsoft Graph, for Entra group overage; "" means
+	// https://graph.microsoft.com/v1.0.
+	GraphURL string
 
 	mu        sync.Mutex
 	providers map[string]cachedProvider
@@ -184,6 +188,10 @@ func (rp *RP) Callback(ctx context.Context, c identity.Connection, f identity.Fl
 	if err := idt.Claims(&cl.Raw); err != nil {
 		return identity.Assertion{}, fmt.Errorf("%w: claims: %v", ErrToken, err)
 	}
+	if len(c.AllowedTenants) > 0 && !contains(c.AllowedTenants, strings.ToLower(cl.TenantID)) {
+		// The connection is pinned to specific Entra tenants.
+		return identity.Assertion{}, &identity.Denial{Code: "tenant_not_allowed", Message: "Your Microsoft organisation is not allowed to use this sign-in."}
+	}
 	if multi {
 		// Per-tenant issuer: iss must be the tenant's own v2.0 issuer.
 		if cl.TenantID == "" || idt.Issuer != "https://login.microsoftonline.com/"+cl.TenantID+"/v2.0" {
@@ -206,6 +214,18 @@ func (rp *RP) Callback(ctx context.Context, c identity.Connection, f identity.Fl
 	if groupsClaim == "" {
 		groupsClaim = pr.GroupsClaim
 	}
+	groups := stringList(cl.Raw[groupsClaim])
+	groupsUnknown := false
+	if c.Preset == "entra" && entraOverage(cl.Raw) {
+		// Entra leaves groups out of the token when there are too many (or
+		// for implicit flows) and says so. Ask Graph; if that fails, the
+		// role is left alone rather than recomputed from nothing.
+		if g, err := rp.entraGroups(ctx, tok.AccessToken); err == nil {
+			groups = g
+		} else {
+			groupsUnknown = true
+		}
+	}
 	subject := cl.Subject
 	if multi {
 		// Entra subjects are pairwise per app but not globally unique across
@@ -218,11 +238,12 @@ func (rp *RP) Callback(ctx context.Context, c identity.Connection, f identity.Fl
 		Email:      email,
 		// Only a real email claim is ever trusted, never the user-chosen
 		// preferred_username fallback.
-		EmailTrusted: cl.Email != "" && ((pr.TrustEmail != nil && pr.TrustEmail(cl)) || c.TrustEmail),
-		Name:         truncate(name, 100),
-		Groups:       stringList(cl.Raw[groupsClaim]),
-		IdPSID:       cl.SID,
-		IDToken:      rawID,
+		EmailTrusted:  cl.Email != "" && ((pr.TrustEmail != nil && pr.TrustEmail(cl)) || c.TrustEmail),
+		Name:          truncate(name, 100),
+		Groups:        groups,
+		GroupsUnknown: groupsUnknown,
+		IdPSID:        cl.SID,
+		IDToken:       rawID,
 	}, nil
 }
 
@@ -308,6 +329,9 @@ func (rp *RP) VerifyLogoutToken(ctx context.Context, c identity.Connection, raw 
 	case cl.Exp != nil && now.After(time.Unix(*cl.Exp, 0).Add(time.Minute)):
 		return LogoutToken{}, fmt.Errorf("%w: expired", ErrToken)
 	}
+	if len(c.AllowedTenants) > 0 && !contains(c.AllowedTenants, strings.ToLower(cl.TID)) {
+		return LogoutToken{}, fmt.Errorf("%w: tenant not allowed", ErrToken)
+	}
 	if multi && (cl.TID == "" || t.Issuer != "https://login.microsoftonline.com/"+cl.TID+"/v2.0") {
 		return LogoutToken{}, fmt.Errorf("%w: tenant issuer", ErrToken)
 	}
@@ -365,4 +389,59 @@ func truncate(s string, n int) string {
 		return s[:n]
 	}
 	return s
+}
+
+// entraOverage reports whether an Entra ID token signals that its groups
+// claim was omitted (_claim_names.groups or hasgroups).
+func entraOverage(raw map[string]any) bool {
+	if names, ok := raw["_claim_names"].(map[string]any); ok {
+		if _, ok := names["groups"]; ok {
+			return true
+		}
+	}
+	if b, ok := raw["hasgroups"].(bool); ok && b {
+		return true
+	}
+	return false
+}
+
+// entraGroups fetches the signed-in user's group IDs from Microsoft Graph
+// (getMemberGroups, which needs GroupMember.Read.All or Directory.Read.All
+// consented for the app).
+func (rp *RP) entraGroups(ctx context.Context, accessToken string) ([]string, error) {
+	if accessToken == "" {
+		return nil, errors.New("no access token")
+	}
+	base := rp.GraphURL
+	if base == "" {
+		base = "https://graph.microsoft.com/v1.0"
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, base+"/me/getMemberGroups", strings.NewReader(`{"securityEnabledOnly":false}`))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+accessToken)
+	req.Header.Set("Content-Type", "application/json")
+	client := rp.HTTP
+	if client == nil {
+		client = http.DefaultClient
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("graph getMemberGroups: status %d", resp.StatusCode)
+	}
+	var out struct {
+		Value []string `json:"value"`
+	}
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 4<<20)).Decode(&out); err != nil {
+		return nil, err
+	}
+	if len(out.Value) > 5000 {
+		out.Value = out.Value[:5000]
+	}
+	return out.Value, nil
 }

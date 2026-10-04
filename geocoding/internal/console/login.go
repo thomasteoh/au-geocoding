@@ -91,10 +91,14 @@ func (s *Server) beginFlow(w http.ResponseWriter, r *http.Request, f identity.Fl
 }
 
 // takeFlow consumes the flow named by state, bound to this browser.
-func (s *Server) takeFlow(w http.ResponseWriter, r *http.Request, state, kind string) (identity.Flow, bool) {
+func (s *Server) takeFlow(w http.ResponseWriter, r *http.Request, state string, kinds ...string) (identity.Flow, bool) {
 	f, err := s.IDs.TakeFlow(r.Context(), state, cookieValue(r, flowCookie))
 	clearCookie(w, flowCookie, http.SameSiteNoneMode)
-	if err != nil || f.Kind != kind {
+	kindOK := false
+	for _, k := range kinds {
+		kindOK = kindOK || f.Kind == k
+	}
+	if err != nil || !kindOK {
 		s.audit(r, 0, "login.failed", "", "flow_invalid")
 		s.loginPage(w, r, http.StatusBadRequest, loginData{}, "That sign-in attempt expired or was started in another browser. Try again.")
 		return identity.Flow{}, false
@@ -162,7 +166,7 @@ func (s *Server) handleOIDCStart(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleOIDCCallback(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
-	f, ok := s.takeFlow(w, r, q.Get("state"), "oidc")
+	f, ok := s.takeFlow(w, r, q.Get("state"), "oidc", flowLink)
 	if !ok {
 		return
 	}
@@ -181,6 +185,10 @@ func (s *Server) handleOIDCCallback(w http.ResponseWriter, r *http.Request) {
 		s.Log.Warn("oidc_callback_failed", "connection", c.Slug, "error", err.Error())
 		s.audit(r, c.OrgID, "login.failed", c.Slug, "oidc_callback")
 		s.loginPage(w, r, http.StatusBadRequest, loginData{}, "Sign-in with "+c.Name+" did not complete. Try again.")
+		return
+	}
+	if f.Kind == flowLink {
+		s.finishLink(w, r, f, a)
 		return
 	}
 	s.completeLogin(w, r, a, f.ReturnTo, c.Kind)

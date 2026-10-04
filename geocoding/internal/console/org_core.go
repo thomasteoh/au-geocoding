@@ -606,6 +606,14 @@ func (s *Server) handleSettingsSave(w http.ResponseWriter, r *http.Request) {
 			redirectFlash(w, r, back, "To enforce single sign-on, first verify a domain and enable an SSO connection.")
 			return
 		}
+		// The owner turning it on must already be signed in the enforced way,
+		// or the next page would lock them out.
+		enforced := *oc
+		enforced.Org.SSOEnforced = true
+		if !s.ssoSatisfied(r, viewerFrom(r.Context()), &enforced) {
+			redirectFlash(w, r, back, "Sign in with one of this organisation's SSO connections first (link it from your account page), then turn on enforcement.")
+			return
+		}
 	}
 	err := s.IDs.UpdateOrgSettings(r.Context(), oc.Org.ID, set)
 	if errors.Is(err, identity.ErrInvalid) {
