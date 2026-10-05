@@ -38,7 +38,6 @@ const contractVersion = "v1"
 // Must equal the geocoder's contract.ContractVersionHeader.
 const contractVersionHeader = "X-Augeo-Contract-Version"
 
-
 // Wire error strings mirror the geocoder's contract error taxonomy. The wire
 // protocol carries them as HTTP status + error string; the geocoder's
 // placesclient maps them back to its own errors (it checks for "out_of_scope").
@@ -50,9 +49,9 @@ const (
 	// Request bound caps (security): Limit, MaxRadiusM and token slices are
 	// caller-controlled — clamp them so an expensive query can't be driven
 	// unbounded. Match the geocoder's limits.
-	maxResults  = 20
-	maxRadiusM  = 5000
-	maxTokens   = 32
+	maxResults = 20
+	maxRadiusM = 5000
+	maxTokens  = 32
 )
 
 // ResolveHandler is the /resolve HTTP handler. p provides the active serving DB.
@@ -238,15 +237,15 @@ func resolvePOI(ctx context.Context, db *sql.DB, req contract.ResolveRequest) (c
 			dist = &d
 		}
 		resp.Candidates = append(resp.Candidates, contract.Candidate{
-			ID:        contract.CandidateID{Source: "osm", PID: c.OsmID},
-			Kind:      contract.KindPOI,
-			Point:     contract.Point{Lat: c.Lat, Lon: c.Lon},
-			Source:    "osm",
-			Text:      c.Name,
-			Name:      c.Name,
-			Brand:     c.Brand,
-			Operator:  c.Operator,
-			DistanceM: dist,
+			ID:         contract.CandidateID{Source: "osm", PID: c.OsmID},
+			Kind:       contract.KindPOI,
+			Point:      contract.Point{Lat: c.Lat, Lon: c.Lon},
+			Source:     "osm",
+			Text:       c.Name,
+			Name:       c.Name,
+			Brand:      c.Brand,
+			Operator:   c.Operator,
+			DistanceM:  dist,
 			MatchScore: c.Score,
 		})
 	}
@@ -308,8 +307,8 @@ func resolveLocality(ctx context.Context, db *sql.DB, req contract.ResolveReques
 	resp := contract.ResolveResponse{GeneratedCount: len(hits), TotalMatched: len(hits)}
 	for _, h := range hits {
 		resp.Candidates = append(resp.Candidates, contract.Candidate{
-			Kind:   contract.KindLocality,
-			Text:   h.Name,
+			Kind:    contract.KindLocality,
+			Text:    h.Name,
 			GnafPID: h.LocPID,
 		})
 	}

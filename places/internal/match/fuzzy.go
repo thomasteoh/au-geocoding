@@ -21,8 +21,8 @@ import (
 // It also tracks which localities each street exists in, so resolution can
 // prefer a street that exists in the query's locality.
 type FuzzySet struct {
-	localities map[string]bool       // canonical locality names (upper)
-	streets    map[string]bool       // canonical street names (upper)
+	localities map[string]bool            // canonical locality names (upper)
+	streets    map[string]bool            // canonical street names (upper)
 	streetLocs map[string]map[string]bool // street -> set of localities it appears in
 }
 

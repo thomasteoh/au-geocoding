@@ -8,12 +8,12 @@
 package main
 
 import (
+	"compress/gzip"
 	"database/sql"
 	"flag"
 	"fmt"
 	"io"
 	"log"
-	"compress/gzip"
 	"net/http"
 	"net/url"
 	"os"

@@ -14,9 +14,9 @@ import (
 
 type Row struct {
 	PID, StreetNumber, StreetName, StreetType, Locality, State, Postcode string
-	Lat, Lon                                                            float64
-	Confidence, GeocodeRel                                              int
-	PrimarySec, Alias                                                   string
+	Lat, Lon                                                             float64
+	Confidence, GeocodeRel                                               int
+	PrimarySec, Alias                                                    string
 }
 
 // LocalitySeed is the anchor set. Real names so normalise aliases work.
@@ -51,19 +51,19 @@ func gen(r *rand.Rand, n int) []Row {
 			alias = "alias:" + st
 		}
 		rows = append(rows, Row{
-			PID:       fmt.Sprintf("GAVIC%09d", i),
+			PID:          fmt.Sprintf("GAVIC%09d", i),
 			StreetNumber: num,
-			StreetName: st,
-			StreetType: streetType(r),
-			Locality:   loc,
-			State:      "VIC",
-			Postcode:   postcodeFor(loc),
-			Lat:        -37.8 + float64(r.Intn(1000))/100000,
-			Lon:        144.9 + float64(r.Intn(1000))/100000,
-			Confidence: r.Intn(3), // 0..2
-			GeocodeRel: r.Intn(6) + 1,
-			PrimarySec: "P",
-			Alias:      alias,
+			StreetName:   st,
+			StreetType:   streetType(r),
+			Locality:     loc,
+			State:        "VIC",
+			Postcode:     postcodeFor(loc),
+			Lat:          -37.8 + float64(r.Intn(1000))/100000,
+			Lon:          144.9 + float64(r.Intn(1000))/100000,
+			Confidence:   r.Intn(3), // 0..2
+			GeocodeRel:   r.Intn(6) + 1,
+			PrimarySec:   "P",
+			Alias:        alias,
 		})
 	}
 	return rows

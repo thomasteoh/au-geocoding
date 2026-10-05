@@ -156,6 +156,7 @@ DROP TABLE IF EXISTS STATE;
 //  1. DROP VIEW IF EXISTS ADDRESS_VIEW (SQLite has no CREATE OR REPLACE VIEW).
 //  2. The view is materialised as a table (ADDRESS_VIEW) so the trigram index
 //     can be built over it. The design's flattened view is the matching table.
+//
 // The join is unchanged — it's the official flattened view.
 var RealViewSQL = `
 DROP VIEW IF EXISTS ADDRESS_VIEW;

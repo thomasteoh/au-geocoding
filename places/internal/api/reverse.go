@@ -98,8 +98,8 @@ type LocalityRequest struct {
 
 // LocalityResponse is the /locality response.
 type LocalityResponse struct {
-	Version   string             `json:"dataset_version"`
-	Localities []LocalityResult   `json:"localities"`
+	Version    string           `json:"dataset_version"`
+	Localities []LocalityResult `json:"localities"`
 }
 
 // LocalityResult is one containing locality.

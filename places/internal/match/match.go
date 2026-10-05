@@ -149,12 +149,12 @@ func Score(q Query, row Candidate) float64 {
 	// matching a locality substring), which drops match rate.
 	// When a token has no tag (Fields empty), fall back to best-across-fields.
 	fieldMap := map[string]string{
-		"locality_name":  row.Locality,
-		"state":          row.State,
-		"postcode":       row.Postcode,
-		"street_name":    row.StreetName,
-		"street_number":  row.StreetNumber,
-		"street_type":    row.StreetType,
+		"locality_name": row.Locality,
+		"state":         row.State,
+		"postcode":      row.Postcode,
+		"street_name":   row.StreetName,
+		"street_number": row.StreetNumber,
+		"street_type":   row.StreetType,
 	}
 	// Weight per field: locality and state are anchors — an exact match there
 	// strongly signals the right address, so they outweigh street similarity.

@@ -1,0 +1,89 @@
+# Compose stack for the whole system: au-places (resolver + one-shot loader),
+# au-geocoder (public API) and Prometheus. Build context is the repository
+# root so both images can include the shared module.
+#
+# Usage:
+#   1. Build the dataset into the places volume (one-shot; the server must be
+#      stopped during a refresh — only the loader writes, D-019):
+#        docker compose run --rm loader
+#   2. Issue a key into app.db before first boot:
+#        docker compose run --rm --entrypoint keygen augeo -app-db /data/app.db -label my-key
+#   3. Start the stack:
+#        docker compose up -d places augeo prometheus
+#   4. Verify:
+#        curl http://localhost:8090/readyz   # places
+#        curl http://localhost:8099/readyz   # geocoder
+
+services:
+  places:
+    build:
+      context: .
+      dockerfile: places/Dockerfile
+    image: auplaces:latest
+    ports:
+      - "8090:8080"
+    volumes:
+      - places_data:/data:ro    # read-only mount (D-019, INV-4)
+    environment:
+      - AUGEO_DB=/data/vic.db
+      - AUGEO_ADDR=:8080
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8080/readyz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 120s   # dataset load can take minutes
+
+  # One-shot loader: builds/refreshes the dataset, then the Step 7 suggestion
+  # index, into the same volume. Run with `docker compose run --rm loader`.
+  loader:
+    build:
+      context: .
+      dockerfile: places/Dockerfile
+    image: auplaces:latest
+    entrypoint: ["/bin/sh", "-c", "/usr/local/bin/auplaces-load -db /data/vic.db && /usr/local/bin/auplaces-suggest -db /data/vic.db"]
+    command: []
+    volumes:
+      - places_data:/data
+    environment:
+      - AUGEO_DB=/data/vic.db
+    profiles: ["load"]
+    restart: "no"
+
+  augeo:
+    build:
+      context: .
+      dockerfile: geocoding/Dockerfile
+    image: augeocoding:latest
+    ports:
+      - "8099:8080"
+    volumes:
+      - geocoder_data:/data
+    environment:
+      - AUGEO_ADDR=:8080
+      - AUGEO_APP_DB=/data/app.db
+      - AUGEO_PLACES_URL=http://places:8080
+      - AUGEO_CTRL_TOKEN=${AUGEO_CTRL_TOKEN:-}
+    depends_on:
+      places:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8080/readyz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
+
+  prometheus:
+    image: prom/prometheus:latest
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./deploy/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    restart: unless-stopped
+
+volumes:
+  geocoder_data:
+  places_data:

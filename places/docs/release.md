@@ -8,9 +8,11 @@ deps — copy it and run. The loader binary is the only writer (INV-4, D-019).
 
 - `auplaces-server` — serving binary (read-only, single static binary).
 - `auplaces-load` — loader binary (only writer; builds/refreshes the dataset).
-- `Dockerfile` — multi-stage build producing both binaries (D-019).
-- `docker-compose.yml` — server mounts data `:ro`; loader is a one-shot.
-- `.github/workflows/release.yml` — tag-triggered CI (P9).
+- `Dockerfile` — multi-stage build producing both binaries (D-019); build
+  context is the repository root.
+- `../docker-compose.yml` — `places` mounts data `:ro`; `loader` is a one-shot.
+- `../.github/workflows/release-places.yml` — CI triggered by `places/v*`
+  tags (P9).
 - `LICENSE` (Apache-2.0), `ATTRIBUTION.md` (data licences, D-018).
 
 ## Build
@@ -38,15 +40,16 @@ is missing (D-020 fail-fast).
 ## Run (Docker)
 
 ```
-docker build -t auplaces:latest .
+# from the repository root
+docker build -f places/Dockerfile -t auplaces:latest .
 docker run --rm -v "$(pwd)/data:/data:ro" -p 8080:8080 auplaces:latest
 ```
 
-Or compose:
+Or compose, from the repository root:
 
 ```
 docker compose run --rm loader   # build/refresh dataset into the volume
-docker compose up -d server      # serve it (read-only mount)
+docker compose up -d places      # serve it (read-only mount)
 ```
 
 The server mounts the data volume `:ro` (D-019, INV-4). Only the loader writes.

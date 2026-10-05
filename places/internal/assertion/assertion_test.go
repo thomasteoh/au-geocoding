@@ -32,13 +32,13 @@ func newTestStore(t *testing.T) *Store {
 func TestValidateRejectsBadAssertion(t *testing.T) {
 	s := newTestStore(t)
 	cases := []Assertion{
-		{Subject: "x", Predicate: "name", Object: "a", ObservedAt: "2026-01-01T00:00:00Z", Confidence: 1}, // no source
-		{Source: "gnaf", Predicate: "name", Object: "a", ObservedAt: "2026-01-01T00:00:00Z", Confidence: 1}, // no subject
-		{Source: "gnaf", Subject: "x", Object: "a", ObservedAt: "2026-01-01T00:00:00Z", Confidence: 1}, // no predicate
-		{Source: "gnaf", Subject: "x", Predicate: "name", ObservedAt: "2026-01-01T00:00:00Z", Confidence: 1}, // no object
-		{Source: "gnaf", Subject: "x", Predicate: "name", Object: "a", Confidence: 1},                        // no observed_at
-		{Source: "gnaf", Subject: "x", Predicate: "name", Object: "a", ObservedAt: "not-a-date", Confidence: 1}, // bad RFC3339
-		{Source: "gnaf", Subject: "x", Predicate: "name", Object: "a", ObservedAt: "2026-01-01T00:00:00Z", Confidence: 1.5}, // confidence > 1
+		{Subject: "x", Predicate: "name", Object: "a", ObservedAt: "2026-01-01T00:00:00Z", Confidence: 1},                    // no source
+		{Source: "gnaf", Predicate: "name", Object: "a", ObservedAt: "2026-01-01T00:00:00Z", Confidence: 1},                  // no subject
+		{Source: "gnaf", Subject: "x", Object: "a", ObservedAt: "2026-01-01T00:00:00Z", Confidence: 1},                       // no predicate
+		{Source: "gnaf", Subject: "x", Predicate: "name", ObservedAt: "2026-01-01T00:00:00Z", Confidence: 1},                 // no object
+		{Source: "gnaf", Subject: "x", Predicate: "name", Object: "a", Confidence: 1},                                        // no observed_at
+		{Source: "gnaf", Subject: "x", Predicate: "name", Object: "a", ObservedAt: "not-a-date", Confidence: 1},              // bad RFC3339
+		{Source: "gnaf", Subject: "x", Predicate: "name", Object: "a", ObservedAt: "2026-01-01T00:00:00Z", Confidence: 1.5},  // confidence > 1
 		{Source: "gnaf", Subject: "x", Predicate: "name", Object: "a", ObservedAt: "2026-01-01T00:00:00Z", Confidence: -0.1}, // confidence < 0
 		{Source: "missing", Subject: "x", Predicate: "name", Object: "a", ObservedAt: "2026-01-01T00:00:00Z", Confidence: 1}, // unregistered source
 	}

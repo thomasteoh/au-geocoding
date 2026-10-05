@@ -16,18 +16,18 @@ import (
 	"sync"
 	"time"
 
+	"augeocoding/internal/ranking"
 	"ausystem/shared/contract"
 	"ausystem/shared/normalise"
-	"augeocoding/internal/ranking"
 )
 
 // Strategy names, exposed as `strategy` on every response.
 const (
-	StrategyCoord      = "coord"
-	StrategyAddress    = "address"
-	StrategyPOIAnchor  = "poi_anchor"
-	StrategyPOI        = "poi"
-	StrategyLLM        = "llm"
+	StrategyCoord     = "coord"
+	StrategyAddress   = "address"
+	StrategyPOIAnchor = "poi_anchor"
+	StrategyPOI       = "poi"
+	StrategyLLM       = "llm"
 )
 
 // Rung is one step of the ladder. Each rung returns the strategy it fired and
@@ -41,21 +41,21 @@ type Rung interface {
 
 // Query is the parsed intent for a single free-text request.
 type Query struct {
-	Raw     string
-	Normal  normalise.Result
+	Raw    string
+	Normal normalise.Result
 	// Parsed fields, filled by whichever rung fires.
-	Point    contract.Point
-	Address  string
-	POIName  string
-	Anchor   *contract.Point
-	Within   contract.LocalityID
+	Point   contract.Point
+	Address string
+	POIName string
+	Anchor  *contract.Point
+	Within  contract.LocalityID
 }
 
 // Result is the outcome of walking the ladder.
 type Result struct {
-	Strategy   string
-	Response   contract.ResolveResponse
-	Degraded   bool
+	Strategy      string
+	Response      contract.ResolveResponse
+	Degraded      bool
 	DegradeReason string
 }
 
@@ -456,10 +456,10 @@ type LLMRung struct {
 
 // Breaker is a simple circuit breaker.
 type Breaker struct {
-	mu      sync.Mutex
-	failed  int
-	open    bool
-	opened  time.Time
+	mu     sync.Mutex
+	failed int
+	open   bool
+	opened time.Time
 	// Threshold opens after this many consecutive failures.
 	Threshold int
 	// Cooldown is how long the breaker stays open.

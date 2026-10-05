@@ -43,11 +43,11 @@ type CandidateID struct {
 
 // Candidate is a single resolution candidate.
 type Candidate struct {
-	ID       CandidateID `json:"id"`
-	Kind     Kind        `json:"kind"`
-	Point    Point       `json:"point"`
-	Source   string      `json:"source"` // "gnaf" | "osm"
-	Text     string      `json:"text"`   // full address or POI name — what the caller scores against
+	ID     CandidateID `json:"id"`
+	Kind   Kind        `json:"kind"`
+	Point  Point       `json:"point"`
+	Source string      `json:"source"` // "gnaf" | "osm"
+	Text   string      `json:"text"`   // full address or POI name — what the caller scores against
 
 	// G-NAF only — distinct quality axes, never collapsed
 	GnafPID            string `json:"gnaf_pid,omitempty"`
@@ -106,9 +106,9 @@ func (c AddressComponents) HasStreet() bool { return c.StreetName != "" }
 // ResolveRequest is a structured resolution request. Places never parses free
 // text; geocoder never reads a G-NAF column.
 type ResolveRequest struct {
-	Kind       Kind        `json:"kind"`
-	Generate   []string    `json:"generate,omitempty"`  // reliable tokens — candidate generation
-	Score      []string    `json:"score,omitempty"`     // full normalised token set — returned for caller scoring
+	Kind     Kind     `json:"kind"`
+	Generate []string `json:"generate,omitempty"` // reliable tokens — candidate generation
+	Score    []string `json:"score,omitempty"`    // full normalised token set — returned for caller scoring
 
 	// Components is set when the caller supplied a structured address instead
 	// of free text. Places uses it for field-aware matching rather than
@@ -116,21 +116,21 @@ type ResolveRequest struct {
 	// Generate and Score are still populated alongside it so a resolver that
 	// ignores Components degrades to token matching rather than failing.
 	Components *AddressComponents `json:"components,omitempty"`
-	State      string      `json:"state,omitempty"`     // hint, "" if absent
-	Postcode   string      `json:"postcode,omitempty"`  // hint, "" if absent
-	Anchor     *Point      `json:"anchor,omitempty"`    // distance ranking
-	Within     LocalityID  `json:"within,omitempty"`
-	Limit      int         `json:"limit,omitempty"`      // caller's cap; places applies it AFTER ordering
-	MaxRadiusM int         `json:"max_radius_m,omitempty"` // Reverse only
+	State      string             `json:"state,omitempty"`    // hint, "" if absent
+	Postcode   string             `json:"postcode,omitempty"` // hint, "" if absent
+	Anchor     *Point             `json:"anchor,omitempty"`   // distance ranking
+	Within     LocalityID         `json:"within,omitempty"`
+	Limit      int                `json:"limit,omitempty"`        // caller's cap; places applies it AFTER ordering
+	MaxRadiusM int                `json:"max_radius_m,omitempty"` // Reverse only
 }
 
 // ResolveResponse is the resolution result.
 type ResolveResponse struct {
 	Candidates     []Candidate `json:"candidates,omitempty"`
-	Truncated      bool        `json:"truncated"`        // INV-6 — was the set capped?
-	TotalMatched   int         `json:"total_matched"`    // what the caller did not see
-	GeneratedCount int         `json:"generated_count"`  // candidates before filtering — cost visibility
-	DatasetVersion string      `json:"dataset_version"`  // INV-5
+	Truncated      bool        `json:"truncated"`           // INV-6 — was the set capped?
+	TotalMatched   int         `json:"total_matched"`       // what the caller did not see
+	GeneratedCount int         `json:"generated_count"`     // candidates before filtering — cost visibility
+	DatasetVersion string      `json:"dataset_version"`     // INV-5
 	Ambiguous      []Locality  `json:"ambiguous,omitempty"` // populated when a locality name resolved to many
 	Degraded       []string    `json:"degraded,omitempty"`  // e.g. "boundaries-unavailable"
 }
@@ -162,9 +162,9 @@ type Suggestion struct {
 // indexed street+locality entries; the caller selects one and resolves via the
 // handle it carries.
 type SuggestResponse struct {
-	Suggestions []Suggestion `json:"suggestions,omitempty"`
-	Truncated   bool         `json:"truncated"`
-	DatasetVersion string    `json:"dataset_version,omitempty"`
+	Suggestions    []Suggestion `json:"suggestions,omitempty"`
+	Truncated      bool         `json:"truncated"`
+	DatasetVersion string       `json:"dataset_version,omitempty"`
 }
 
 // Resolver is the single-binary-mode interface. Split mode is an HTTP client

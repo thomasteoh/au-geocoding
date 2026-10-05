@@ -12,8 +12,8 @@ import (
 
 // LocalityHit is one locality polygon containing a point.
 type LocalityHit struct {
-	LocPID       string
-	Name         string
+	LocPID        string
+	Name          string
 	LocalityClass string
 }
 

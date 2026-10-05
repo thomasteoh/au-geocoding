@@ -66,32 +66,32 @@ CREATE TABLE IF NOT EXISTS batch_log (
 // Assertion is one immutable fact. The object is JSON-encoded when structured;
 // observed_at is RFC3339 (the temporal anchor, P-D02).
 type Assertion struct {
-	Source      string  `json:"source"`
-	Subject     string  `json:"subject"`
-	Predicate   string  `json:"predicate"`
-	Object      string  `json:"object"`
-	ObservedAt  string  `json:"observed_at"` // RFC3339
-	Confidence  float64 `json:"confidence"`  // 0..1
-	BatchID     string  `json:"batch_id,omitempty"`
-	Provenance  string  `json:"provenance,omitempty"`
+	Source     string  `json:"source"`
+	Subject    string  `json:"subject"`
+	Predicate  string  `json:"predicate"`
+	Object     string  `json:"object"`
+	ObservedAt string  `json:"observed_at"` // RFC3339
+	Confidence float64 `json:"confidence"`  // 0..1
+	BatchID    string  `json:"batch_id,omitempty"`
+	Provenance string  `json:"provenance,omitempty"`
 }
 
 // Batch is the input envelope. NDJSON in/out (P6): one assertion per line;
 // results stream as they complete and may be out of order; correlate by id.
 type Batch struct {
-	ID     string     `json:"id"`
-	Source string     `json:"source"` // must be a registered source
-	Version string    `json:"version"` // dataset version the facts came from
-	Rule   string     `json:"rule"`   // ingestion rule version
-	Items  []Assertion `json:"items"`
+	ID      string      `json:"id"`
+	Source  string      `json:"source"`  // must be a registered source
+	Version string      `json:"version"` // dataset version the facts came from
+	Rule    string      `json:"rule"`    // ingestion rule version
+	Items   []Assertion `json:"items"`
 }
 
 // Result is one per-assertion outcome, streamed inline.
 type Result struct {
-	Index   int    `json:"index"`
-	ID      string `json:"id,omitempty"`
-	Status  string `json:"status"` // applied | superseded | retracted | rejected
-	Error   string `json:"error,omitempty"`
+	Index  int    `json:"index"`
+	ID     string `json:"id,omitempty"`
+	Status string `json:"status"` // applied | superseded | retracted | rejected
+	Error  string `json:"error,omitempty"`
 }
 
 // Open opens the assertion store at path. Creates schema if absent.
@@ -349,7 +349,7 @@ func (s *Store) deriveSubject(tx *sql.Tx, subject string) error {
 	// Group per predicate and pick the highest score.
 	best := map[string]struct {
 		object, source, observed string
-		score                   float64
+		score                    float64
 	}{}
 	for rows.Next() {
 		var predicate, object, source, observed string
@@ -363,7 +363,7 @@ func (s *Store) deriveSubject(tx *sql.Tx, subject string) error {
 		if !ok || score > cur.score || (score == cur.score && observed > cur.observed) {
 			best[predicate] = struct {
 				object, source, observed string
-				score                   float64
+				score                    float64
 			}{object, source, observed, score}
 		}
 	}

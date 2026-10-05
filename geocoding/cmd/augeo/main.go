@@ -21,13 +21,13 @@ import (
 	"time"
 
 	"augeocoding/internal/config"
-	"ausystem/shared/contract"
-	"ausystem/shared/metrics"
 	"augeocoding/internal/ladder"
 	"augeocoding/internal/llm"
-	"ausystem/shared/normalise"
 	"augeocoding/internal/placesclient"
 	"augeocoding/internal/publicapi"
+	"ausystem/shared/contract"
+	"ausystem/shared/metrics"
+	"ausystem/shared/normalise"
 	"ausystem/shared/slog"
 )
 
@@ -162,7 +162,7 @@ func buildLadder(res contract.Resolver, cfg config.Config, provider *llm.Client,
 					return false
 				}
 			},
-			Release: func() { <-admit },
+			Release:      func() { <-admit },
 			Singleflight: &sync.Map{},
 			Breaker:      ladder.NewBreaker(cfg.Queue.BreakerThreshold, time.Duration(cfg.Queue.BreakerCooldown)*time.Second),
 		}
@@ -452,7 +452,7 @@ func handleBatch(l *ladder.Ladder, store *publicapi.Store, limiter *publicapi.Ra
 		var req struct {
 			Items []struct {
 				Query string  `json:"query"`
-				Kind  string  `json:"kind"`   // geocode|reverse|poi|search (default search)
+				Kind  string  `json:"kind"` // geocode|reverse|poi|search (default search)
 				Lat   float64 `json:"lat"`
 				Lon   float64 `json:"lon"`
 			} `json:"items"`
@@ -758,8 +758,8 @@ func peerIP(r *http.Request) string {
 // than silently resolved one way.
 func structuredRequest(body string) (comps *contract.AddressComponents, hasQuery bool, err error) {
 	var obj struct {
-		Query      string                     `json:"query"`
-		Q          string                     `json:"q"`
+		Query      string                      `json:"query"`
+		Q          string                      `json:"q"`
 		Components *contract.AddressComponents `json:"components"`
 		// Components may also be supplied flat at the top level, which is what
 		// a caller mapping their own record shape will reach for first.

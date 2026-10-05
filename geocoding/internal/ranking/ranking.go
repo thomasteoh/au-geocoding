@@ -28,7 +28,7 @@ const (
 	WMatch        = 1.0
 	WGnafConf     = 0.5
 	WGeocodeRel   = 0.25
-	WDistance     = 0.3 // applied only when an anchor is present
+	WDistance     = 0.3    // applied only when an anchor is present
 	DistanceScale = 5000.0 // metres at which distance penalty saturates
 
 	// Full-scale values of the refining inputs, used to normalise them.

@@ -1,0 +1,21 @@
+# Build context is the repository root (both Dockerfiles need shared/).
+# Datasets (~3 GB under places/data), service state and stray binaries must
+# never reach the Docker daemon.
+**/data/
+**/*.db
+**/*.db-wal
+**/*.db-shm
+**/*.log
+places/testdata/
+places/bin/
+places/gen
+places/server
+places/loadoscdiff
+places/buildsuggest
+geocoding/augeo
+geocoding/keygen
+geocoding/mockplaces
+.git/
+.github/
+go.work
+go.work.sum

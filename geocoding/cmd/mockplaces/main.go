@@ -6,6 +6,7 @@ package main
 
 import (
 	"encoding/json"
+	"flag"
 	"log"
 	"net/http"
 	"strings"
@@ -14,6 +15,8 @@ import (
 )
 
 func main() {
+	addr := flag.String("addr", ":8092", "listen address")
+	flag.Parse()
 	http.HandleFunc("/readyz", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]string{"status": "ready", "dataset": "mock-v1"})
@@ -46,5 +49,5 @@ func main() {
 			DatasetVersion: "mock-v1",
 		})
 	})
-	log.Fatal(http.ListenAndServe(":8092", nil))
+	log.Fatal(http.ListenAndServe(*addr, nil))
 }

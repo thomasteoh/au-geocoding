@@ -40,14 +40,14 @@ const MaxQueryLen = 256
 
 // SearchResponse is the /search response.
 type SearchResponse struct {
-	Strategy   string       `json:"strategy"`
-	Candidates []Candidate  `json:"candidates"`
-	Ambiguous  []Ambiguous  `json:"ambiguous,omitempty"`
-	Truncated  bool         `json:"truncated"`
-	Total      int          `json:"total"`
-	Generated  int          `json:"generated"`
-	Version    string       `json:"dataset_version"`
-	Anchor     *Anchor      `json:"anchor,omitempty"`
+	Strategy   string      `json:"strategy"`
+	Candidates []Candidate `json:"candidates"`
+	Ambiguous  []Ambiguous `json:"ambiguous,omitempty"`
+	Truncated  bool        `json:"truncated"`
+	Total      int         `json:"total"`
+	Generated  int         `json:"generated"`
+	Version    string      `json:"dataset_version"`
+	Anchor     *Anchor     `json:"anchor,omitempty"`
 	// Attribution (D-018): present when the response carries an OSM-derived
 	// POI, per the ODbL requirement. Empty otherwise.
 	Attribution string `json:"attribution,omitempty"`
@@ -55,18 +55,18 @@ type SearchResponse struct {
 
 // Candidate is the API-facing candidate (address or POI).
 type Candidate struct {
-	ID       string   `json:"id"`
-	Kind     string   `json:"kind"`
-	Name     string   `json:"name,omitempty"`
-	Address  string   `json:"address,omitempty"`
-	Brand    string   `json:"brand,omitempty"`
-	Lat      float64  `json:"latitude"`
-	Lon      float64  `json:"longitude"`
-	Distance float64  `json:"distance_m,omitempty"`
-	Source   string   `json:"source"`
-	Match    float64  `json:"match_score,omitempty"`
-	Conf     int      `json:"gnaf_confidence,omitempty"`
-	Rel      int      `json:"geocode_reliability,omitempty"`
+	ID       string  `json:"id"`
+	Kind     string  `json:"kind"`
+	Name     string  `json:"name,omitempty"`
+	Address  string  `json:"address,omitempty"`
+	Brand    string  `json:"brand,omitempty"`
+	Lat      float64 `json:"latitude"`
+	Lon      float64 `json:"longitude"`
+	Distance float64 `json:"distance_m,omitempty"`
+	Source   string  `json:"source"`
+	Match    float64 `json:"match_score,omitempty"`
+	Conf     int     `json:"gnaf_confidence,omitempty"`
+	Rel      int     `json:"geocode_reliability,omitempty"`
 }
 
 // Ambiguous is a locality ambiguity result.
@@ -161,8 +161,8 @@ func Search(ctx context.Context, db *sql.DB, req SearchRequest) SearchResponse {
 func searchCoord(ctx context.Context, db *sql.DB, coord string) SearchResponse {
 	lat, lon := parseCoord(coord)
 	return SearchResponse{
-		Strategy:  "coord",
-		Version:   datasetVersion(ctx, db),
+		Strategy:   "coord",
+		Version:    datasetVersion(ctx, db),
 		Candidates: []Candidate{{ID: "coord", Kind: "coord", Lat: lat, Lon: lon, Source: "coord"}},
 	}
 }
@@ -338,4 +338,3 @@ func parseCoord(s string) (float64, float64) {
 	}
 	return 0, 0
 }
-
