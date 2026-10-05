@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -91,7 +92,30 @@ type Config struct {
 		Format string `json:"format"`
 	} `json:"log"`
 	PlacesURL string `json:"places_url"` // split-mode au-places base URL; "" = single-binary
+	Auth      Auth   `json:"auth"`
 }
+
+// Auth configures the console, SSO, SCIM and API bearer tokens
+// (docs/auth.md). The console is enabled when PublicURL and SecretKey are
+// both set.
+type Auth struct {
+	PublicURL       string   `json:"public_url"`
+	SecretKey       string   `json:"secret_key"`
+	Signup          string   `json:"signup"` // open | closed
+	BootstrapAdmins []string `json:"bootstrap_admins"`
+	SessionIdle     int      `json:"session_idle"` // seconds
+	SessionMax      int      `json:"session_max"`  // seconds
+	ProvidersFile   string   `json:"providers_file"`
+	// JWTBearer enables Authorization: Bearer on the public API (on by
+	// default; it only accepts issuers an org registered).
+	JWTBearer bool `json:"jwt_bearer"`
+	// AllowPrivateFetch lets OIDC discovery, JWKS and SAML metadata fetches
+	// reach private and loopback addresses. Development only.
+	AllowPrivateFetch bool `json:"allow_private_fetch"`
+}
+
+// ConsoleEnabled reports whether the console and SSO are configured.
+func (a Auth) ConsoleEnabled() bool { return a.PublicURL != "" && a.SecretKey != "" }
 
 // Load parses flags, env and an optional file, with precedence flag > env > file
 // > default (D-020). Returns the effective config and any validation error.
@@ -130,6 +154,7 @@ func Load(args []string, filePath string) (Config, error) {
 	fs.StringVar(&cfg.PlacesURL, "places-url", cfg.PlacesURL, "au-places base URL (split mode)")
 	fs.StringVar(&cfg.Log.Level, "log-level", cfg.Log.Level, "log level")
 	fs.StringVar(&cfg.Log.Format, "log-format", cfg.Log.Format, "log format")
+	fs.StringVar(&cfg.Auth.PublicURL, "public-url", cfg.Auth.PublicURL, "external base URL; enables the console with AUGEO_SECRET_KEY")
 	if err := fs.Parse(args); err != nil {
 		return cfg, err
 	}
@@ -158,10 +183,39 @@ func Load(args []string, filePath string) (Config, error) {
 	if cfg.Limits.MaxBodyBytes <= 0 {
 		cfg.Limits.MaxBodyBytes = 1 << 20
 	}
+	errs = append(errs, validateAuth(&cfg.Auth)...)
 	if len(errs) > 0 {
 		return cfg, fmt.Errorf("invalid config: %s", strings.Join(errs, "; "))
 	}
 	return cfg, nil
+}
+
+func validateAuth(a *Auth) []string {
+	var errs []string
+	a.PublicURL = strings.TrimSuffix(strings.TrimSpace(a.PublicURL), "/")
+	if (a.PublicURL == "") != (a.SecretKey == "") {
+		errs = append(errs, "AUGEO_PUBLIC_URL and AUGEO_SECRET_KEY must be set together")
+	}
+	if a.PublicURL != "" {
+		u, err := url.Parse(a.PublicURL)
+		switch {
+		case err != nil || u.Host == "" || u.Path != "" || u.RawQuery != "":
+			errs = append(errs, "public-url must be an origin like https://geo.example.com")
+		case u.Scheme != "https" && !(u.Scheme == "http" && (u.Hostname() == "localhost" || u.Hostname() == "127.0.0.1")):
+			// Session cookies are Secure and __Host- prefixed; plain http
+			// only works on localhost, where browsers allow it.
+			errs = append(errs, "public-url must be https (http only for localhost)")
+		}
+	}
+	switch a.Signup {
+	case "open", "closed":
+	default:
+		errs = append(errs, "auth signup must be open or closed")
+	}
+	if a.SessionIdle <= 0 || a.SessionMax <= 0 || a.SessionIdle > a.SessionMax {
+		errs = append(errs, "auth session idle and max must be positive, idle <= max")
+	}
+	return errs
 }
 
 // configPathFromArgs extracts -config/--config (and -config=value) from args,
@@ -220,6 +274,10 @@ func setDefaults(c *Config) {
 	c.Web.DemoEnabled = true
 	c.Log.Level = "info"
 	c.Log.Format = "json"
+	c.Auth.Signup = "closed"
+	c.Auth.SessionIdle = 8 * 3600
+	c.Auth.SessionMax = 7 * 24 * 3600
+	c.Auth.JWTBearer = true
 }
 
 func loadFile(path string, c *Config) error {
@@ -250,6 +308,13 @@ func applyEnv(c *Config) {
 		if v, ok := os.LookupEnv("AUGEO_" + key); ok {
 			if n, err := strconv.ParseInt(v, 10, 64); err == nil {
 				*dst = n
+			}
+		}
+	}
+	boolean := func(key string, dst *bool) {
+		if v, ok := os.LookupEnv("AUGEO_" + key); ok {
+			if b, err := strconv.ParseBool(v); err == nil {
+				*dst = b
 			}
 		}
 	}
@@ -314,8 +379,37 @@ func applyEnv(c *Config) {
 	if v, ok := os.LookupEnv("AUGEO_LLM_API_KEY"); ok {
 		c.LLM.APIKey = v
 	}
+	str("PUBLIC_URL", &c.Auth.PublicURL)
+	str("AUTH_SIGNUP", &c.Auth.Signup)
+	num("AUTH_SESSION_IDLE", &c.Auth.SessionIdle)
+	num("AUTH_SESSION_MAX", &c.Auth.SessionMax)
+	str("AUTH_PROVIDERS_FILE", &c.Auth.ProvidersFile)
+	boolean("AUTH_JWT_BEARER", &c.Auth.JWTBearer)
+	boolean("AUTH_ALLOW_PRIVATE_FETCH", &c.Auth.AllowPrivateFetch)
+	if v, ok := os.LookupEnv("AUGEO_AUTH_BOOTSTRAP_ADMINS"); ok {
+		c.Auth.BootstrapAdmins = nil
+		for _, e := range strings.Split(v, ",") {
+			if e = strings.TrimSpace(e); e != "" {
+				c.Auth.BootstrapAdmins = append(c.Auth.BootstrapAdmins, e)
+			}
+		}
+	}
+	secretFromEnv("SECRET_KEY", &c.Auth.SecretKey)
+
 	// LLM enabled only when BaseURL is set.
 	c.LLM.Enabled = c.LLM.BaseURL != ""
+}
+
+// secretFromEnv reads AUGEO_<key>_FILE, then AUGEO_<key> (which wins).
+func secretFromEnv(key string, dst *string) {
+	if v, ok := os.LookupEnv("AUGEO_" + key + "_FILE"); ok {
+		if b, err := os.ReadFile(v); err == nil {
+			*dst = strings.TrimSpace(string(b))
+		}
+	}
+	if v, ok := os.LookupEnv("AUGEO_" + key); ok {
+		*dst = v
+	}
 }
 
 // Redacted returns a copy of the config safe to log — secrets blanked (runtime.md:
@@ -324,6 +418,9 @@ func (c Config) Redacted() Config {
 	cp := c
 	if cp.LLM.APIKey != "" {
 		cp.LLM.APIKey = "REDACTED"
+	}
+	if cp.Auth.SecretKey != "" {
+		cp.Auth.SecretKey = "REDACTED"
 	}
 	return cp
 }

@@ -1,0 +1,16 @@
+{{define "content"}}
+<h1>Audit log</h1>
+{{with .Data}}
+{{if .Events}}
+<table>
+  <thead><tr><th>Time</th><th>Actor</th><th>Action</th><th>Target</th><th>Detail</th></tr></thead>
+  <tbody>
+  {{range .Events}}<tr><td>{{when .TS}}</td><td>{{.Actor}}</td><td><code>{{.Action}}</code></td><td>{{.Target}}</td><td>{{.Detail}}</td></tr>{{end}}
+  </tbody>
+</table>
+{{if .Older}}<p><a href="/console/orgs/{{$.Org.Org.Slug}}/audit?before={{.Older}}">Older events</a></p>{{end}}
+{{else}}
+<p>No events.</p>
+{{end}}
+{{end}}
+{{end}}

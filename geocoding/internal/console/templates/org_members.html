@@ -1,0 +1,61 @@
+{{define "content"}}
+<h1>Members</h1>
+{{$slug := .Org.Org.Slug}}{{$csrf := .CSRF}}{{$admin := atLeast .Org.Role "admin"}}
+{{with .Data}}{{$grant := .Grantable}}
+<table>
+  <thead><tr><th>Email</th><th>Name</th><th>Role</th><th>Source</th><th>Last sign-in</th>{{if $admin}}<th></th>{{end}}</tr></thead>
+  <tbody>
+  {{range .Members}}<tr>
+    <td>{{.User.Email}}{{if .Self}} <span class="muted">(you)</span>{{end}}</td>
+    <td>{{.User.Name}}</td>
+    <td>{{if .CanManage}}<form method="post" action="/console/orgs/{{$slug}}/members/{{.User.ID}}/role" class="inline">
+      <input type="hidden" name="csrf" value="{{$csrf}}">
+      {{$cur := .Role}}
+      <select name="role" aria-label="Role for {{.User.Email}}">{{range $grant}}<option value="{{.}}" {{if eq . $cur}}selected{{end}}>{{.}}</option>{{end}}</select>
+      <button type="submit">Change</button></form>{{else}}{{.Role}}{{end}}</td>
+    <td>{{.Source}}</td>
+    <td>{{when .User.LastLogin}}</td>
+    {{if $admin}}<td>{{if .CanManage}}<form method="post" action="/console/orgs/{{$slug}}/members/{{.User.ID}}/remove" class="inline">
+      <input type="hidden" name="csrf" value="{{$csrf}}">
+      <button type="submit" class="danger" aria-label="Remove {{.User.Email}}">Remove</button></form>{{end}}</td>{{end}}
+  </tr>{{end}}
+  </tbody>
+</table>
+
+{{if $admin}}
+<div class="card">
+  <h2>Pending invites</h2>
+  {{with .Invites}}
+  <table>
+    <thead><tr><th>Email</th><th>Role</th><th>Invited</th><th>Expires</th><th></th></tr></thead>
+    <tbody>
+    {{range .}}<tr><td>{{.Email}}</td><td>{{.Role}}</td><td>{{when .Created}}</td><td>{{when .Expires}}</td>
+      <td><form method="post" action="/console/orgs/{{$slug}}/invites/{{.ID}}/delete" class="inline">
+        <input type="hidden" name="csrf" value="{{$csrf}}">
+        <button type="submit" class="danger" aria-label="Delete invite for {{.Email}}">Delete</button></form></td></tr>{{end}}
+    </tbody>
+  </table>
+  {{else}}<p>No pending invites.</p>{{end}}
+  <h2>Invite someone</h2>
+  <p class="muted">Invites last 14 days. The person joins with the chosen role the first time they sign in. Someone who already has an account is added straight away.</p>
+  <form method="post" action="/console/orgs/{{$slug}}/invites">
+    <input type="hidden" name="csrf" value="{{$csrf}}">
+    <label for="invite-email">Email</label>
+    <input id="invite-email" name="email" type="email" required maxlength="254">
+    <label for="invite-role">Role</label>
+    <select id="invite-role" name="role">{{range $grant}}<option value="{{.}}">{{.}}</option>{{end}}</select>
+    <button type="submit">Invite</button>
+  </form>
+</div>
+{{end}}
+{{end}}
+
+<div class="card">
+  <h2>Leave organisation</h2>
+  <p class="muted">You lose access to this organisation. The last owner cannot leave.</p>
+  <form method="post" action="/console/orgs/{{$slug}}/members/leave">
+    <input type="hidden" name="csrf" value="{{$csrf}}">
+    <button type="submit" class="danger">Leave {{.Org.Org.Name}}</button>
+  </form>
+</div>
+{{end}}

@@ -1,0 +1,13 @@
+{{define "content"}}
+<h1>{{.Org.Org.Name}}</h1>
+{{with .Data}}
+<div class="stats">
+  <div class="stat"><span class="label">Rows today</span><span class="value">{{.UsageToday}} / {{.Quota}}</span>
+    <meter min="0" max="100" value="{{pct .UsageToday .Quota}}">{{pct .UsageToday .Quota}}%</meter></div>
+  <div class="stat"><span class="label">Tier</span><span class="value">{{$.Org.Org.Tier}}</span></div>
+  <div class="stat"><span class="label">Live API keys</span><span class="value">{{.Keys}}</span></div>
+  <div class="stat"><span class="label">Members</span><span class="value">{{.Members}}</span></div>
+</div>
+<p class="muted">The daily row quota is shared by every API key and OAuth client in this organisation. It resets at 00:00 UTC.</p>
+{{end}}
+{{end}}

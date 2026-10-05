@@ -1,0 +1,40 @@
+{{define "content"}}{{$d := .Data}}{{$sc := $d.Scope}}
+{{if $sc.Platform}}<p class="note"><a href="/console/admin">Platform admin</a></p>{{end}}
+<h1>{{.Title}}</h1>
+{{if $sc.Platform}}
+<p class="muted">Platform connections appear on the sign-in page for everyone. An organisation's own identity provider belongs on that organisation's Single sign-on page.</p>
+{{else}}
+<p class="muted">Connect your organisation's identity provider. People sign in with it when their email domain is one of this organisation's verified domains.</p>
+{{end}}
+
+{{if $d.Conns}}
+<table>
+  <thead><tr><th>Name</th><th>Type</th><th>Provider</th><th>Status</th><th>Slug</th><th>Test</th></tr></thead>
+  <tbody>
+  {{range $d.Conns}}<tr>
+    <td><a href="{{$sc.Base}}/{{.ID}}">{{.Name}}</a>{{if .Managed}} <span class="muted">(providers file)</span>{{end}}</td>
+    <td>{{if eq .Kind "oidc"}}OpenID Connect{{else if eq .Kind "github"}}GitHub{{else}}SAML 2.0{{end}}</td>
+    <td>{{if eq .Kind "oidc"}}{{(preset .Preset).Name}}{{else}}<span class="muted">—</span>{{end}}</td>
+    <td>{{if .Enabled}}Enabled{{else}}<span class="muted">Disabled</span>{{end}}{{if .TrustEmail}} <span class="muted">· trusts email</span>{{end}}</td>
+    <td><code>{{.Slug}}</code></td>
+    <td><a href="{{.TestURL}}">Try sign-in</a></td>
+  </tr>{{end}}
+  </tbody>
+</table>
+{{else}}
+<p>No connections yet.</p>
+{{end}}
+
+<div class="card">
+  <h2>Add a connection</h2>
+  <ul>
+    <li><a href="{{$sc.Base}}/new?kind=oidc">OpenID Connect</a> <span class="muted">(Microsoft Entra ID, Okta, Google, Auth0, Keycloak, GitLab and others)</span></li>
+    <li><a href="{{$sc.Base}}/new?kind=github">GitHub</a></li>
+    <li><a href="{{$sc.Base}}/new?kind=saml">SAML 2.0</a></li>
+  </ul>
+  <p class="note">Redirect URI for every OpenID Connect and GitHub app: <code>{{$d.RedirectURI}}</code></p>
+</div>
+{{if not $sc.Platform}}
+<p class="note">Group to role mappings are set on each connection's page. Mappings for SCIM groups are on the <a href="/console/orgs/{{$.Org.Org.Slug}}/scim">SCIM provisioning</a> page.</p>
+{{end}}
+{{end}}

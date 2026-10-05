@@ -1,0 +1,50 @@
+{{define "content"}}
+<h1>API keys</h1>
+{{$slug := .Org.Org.Slug}}{{$csrf := .CSRF}}
+{{with .Data}}
+{{if .NewKey}}
+<div class="card" role="status">
+  <h2>Your new key{{with .NewKeyRow}}: {{.Label}}{{end}}</h2>
+  <p>Copy this key now. It is shown once and cannot be retrieved later; if you lose it, revoke it and create another.</p>
+  <p class="secret" id="new-key">{{.NewKey}}</p>
+  <p class="note">Send it in the <code>X-Api-Key</code> header with each API request.</p>
+</div>
+{{end}}
+{{if .Keys}}
+<table>
+  <thead><tr><th>Label</th><th>Prefix</th><th>Scopes</th><th>Created by</th><th>Created</th><th>Expires</th><th>Status</th><th></th></tr></thead>
+  <tbody>
+  {{range .Keys}}<tr>
+    <td>{{.Label}}</td><td><code>{{.Prefix}}</code></td><td>{{join .Scopes ", "}}</td>
+    <td>{{if .CreatedByEmail}}{{.CreatedByEmail}}{{else}}<span class="muted">—</span>{{end}}</td>
+    <td>{{when .Created}}</td><td>{{if .Expires}}{{when .Expires}}{{else}}Never{{end}}</td>
+    <td>{{if .Revoked}}Revoked {{when .Revoked}}{{else if .Expired}}Expired{{else}}Active{{end}}</td>
+    <td>{{if .CanRevoke}}<form method="post" action="/console/orgs/{{$slug}}/keys/{{.ID}}/revoke" class="inline">
+      <input type="hidden" name="csrf" value="{{$csrf}}">
+      <button type="submit" class="danger" aria-label="Revoke {{.Label}}">Revoke</button></form>{{end}}</td>
+  </tr>{{end}}
+  </tbody>
+</table>
+{{else}}
+<p>This organisation has no API keys yet.</p>
+{{end}}
+{{if atLeast $.Org.Role "developer"}}
+<div class="card">
+  <h2>Create a key</h2>
+  <p class="muted">Keys use this organisation's {{$.Org.Org.Tier}} tier and share its daily quota.</p>
+  <form method="post" action="/console/orgs/{{$slug}}/keys">
+    <input type="hidden" name="csrf" value="{{$csrf}}">
+    <label for="label">Label</label>
+    <input id="label" name="label" required maxlength="100" placeholder="e.g. Production backend">
+    <fieldset>
+      <legend>Scopes</legend>
+      {{range .Scopes}}<label class="check"><input type="checkbox" name="scope" value="{{.}}" {{if eq . "search"}}checked{{end}}> {{.}}</label>{{end}}
+    </fieldset>
+    <label for="expires_days">Expires after (days, optional)</label>
+    <input id="expires_days" name="expires_days" type="number" min="1" max="730" inputmode="numeric">
+    <button type="submit">Create key</button>
+  </form>
+</div>
+{{end}}
+{{end}}
+{{end}}

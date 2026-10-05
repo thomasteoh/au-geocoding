@@ -1,0 +1,64 @@
+{{define "content"}}{{$d := .Data}}{{$base := printf "/console/orgs/%s/scim" .Org.Org.Slug}}
+<h1>SCIM provisioning</h1>
+<p class="muted">Your identity provider can create, update and remove members of this organisation over SCIM 2.0. Removing someone in the IdP removes their membership here and ends their sessions.</p>
+
+<div class="card">
+  <h2>Connection details</h2>
+  <p>SCIM base URL (tenant URL): <code>{{$d.BaseURL}}</code></p>
+  <p>Authentication: bearer token (create one below).</p>
+</div>
+
+{{if $d.Secret}}
+<div class="card" role="status">
+  <h2>New token</h2>
+  <p>Copy this token into your identity provider now. It is not shown again.</p>
+  <p class="secret">{{$d.Secret}}</p>
+</div>
+{{end}}
+
+<div class="card">
+  <h2>Tokens</h2>
+  {{if $d.Tokens}}
+  <table>
+    <thead><tr><th>Label</th><th>Starts with</th><th>Created</th><th>Last used</th><th>Status</th><th></th></tr></thead>
+    <tbody>
+    {{range $d.Tokens}}<tr>
+      <td>{{.Label}}</td><td><code>{{.Prefix}}…</code></td><td>{{when .Created}}</td><td>{{when .LastUsed}}</td>
+      <td>{{if .Revoked}}Revoked {{when .Revoked}}{{else}}Active{{end}}</td>
+      <td>{{if not .Revoked}}<form method="post" action="{{$base}}/tokens/{{.ID}}/revoke" class="inline"><input type="hidden" name="csrf" value="{{$.CSRF}}"><button type="submit" class="danger" aria-label="Revoke token {{.Label}}">Revoke</button></form>{{end}}</td>
+    </tr>{{end}}
+    </tbody>
+  </table>
+  {{else}}<p>No tokens yet.</p>{{end}}
+  <form method="post" action="{{$base}}/tokens">
+    <input type="hidden" name="csrf" value="{{.CSRF}}">
+    <label for="label">Label</label>
+    <input id="label" name="label" required maxlength="100" placeholder="e.g. Entra ID provisioning">
+    <button type="submit">Create token</button>
+  </form>
+</div>
+
+<div class="card">
+  <h2>SCIM group to role mappings</h2>
+  <p class="muted">Members of a mapped SCIM group get the highest role their groups map to. Use the group's display name as your IdP sends it.</p>
+  {{if $d.Mappings}}
+  <table>
+    <thead><tr><th>Group</th><th>Role</th><th></th></tr></thead>
+    <tbody>
+    {{range $d.Mappings}}<tr><td><code>{{.Group}}</code></td><td>{{.Role}}</td>
+      <td><form method="post" action="{{$base}}/mappings/{{.ID}}/delete" class="inline"><input type="hidden" name="csrf" value="{{$.CSRF}}"><button type="submit" class="danger" aria-label="Remove mapping for {{.Group}}">Remove</button></form></td></tr>{{end}}
+    </tbody>
+  </table>
+  {{else}}<p>No mappings.</p>{{end}}
+  <form method="post" action="{{$base}}/mappings">
+    <input type="hidden" name="csrf" value="{{.CSRF}}">
+    <label for="map-group">Group</label>
+    <input id="map-group" name="group" required maxlength="256">
+    <label for="map-role">Role</label>
+    <select id="map-role" name="role">
+      {{range roles}}{{if or (ne .String "owner") $d.CanOwner}}<option value="{{.}}">{{.}}</option>{{end}}{{end}}
+    </select>
+    <button type="submit">Add mapping</button>
+  </form>
+</div>
+{{end}}

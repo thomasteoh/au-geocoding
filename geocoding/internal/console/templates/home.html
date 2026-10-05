@@ -1,0 +1,22 @@
+{{define "content"}}
+<h1>Organisations</h1>
+{{if .Orgs}}
+<table>
+  <thead><tr><th>Name</th><th>Your role</th><th>Tier</th></tr></thead>
+  <tbody>
+  {{range .Orgs}}<tr><td><a href="/console/orgs/{{.Org.Slug}}">{{.Org.Name}}</a>{{if .Org.Personal}} <span class="muted">(personal)</span>{{end}}</td><td>{{.Role}}</td><td>{{.Org.Tier}}</td></tr>{{end}}
+  </tbody>
+</table>
+{{else}}
+<p>You are not in any organisation yet.</p>
+{{end}}
+<div class="card">
+  <h2>Create an organisation</h2>
+  <form method="post" action="/console/orgs">
+    <input type="hidden" name="csrf" value="{{.CSRF}}">
+    <label for="name">Name</label>
+    <input id="name" name="name" required maxlength="100">
+    <button type="submit">Create</button>
+  </form>
+</div>
+{{end}}

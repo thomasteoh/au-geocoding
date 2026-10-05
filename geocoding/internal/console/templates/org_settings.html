@@ -1,0 +1,31 @@
+{{define "content"}}
+<h1>Settings</h1>
+{{$slug := .Org.Org.Slug}}{{$csrf := .CSRF}}{{$o := .Org.Org}}
+<div class="card">
+  <form method="post" action="/console/orgs/{{$slug}}/settings">
+    <input type="hidden" name="csrf" value="{{$csrf}}">
+    <label for="name">Name</label>
+    <input id="name" name="name" required maxlength="100" value="{{$o.Name}}">
+    <label class="check"><input type="checkbox" name="jit" value="1" {{if $o.JITEnabled}}checked{{end}}> Add people who sign in through this organisation's SSO automatically (just-in-time)</label>
+    <label for="default_role">Default role for new members</label>
+    <select id="default_role" name="default_role">{{range .Data.DefaultRoles}}<option value="{{.}}" {{if eq . $o.DefaultRole}}selected{{end}}>{{.}}</option>{{end}}</select>
+    <label class="check"><input type="checkbox" name="sso_enforced" value="1" {{if $o.SSOEnforced}}checked{{end}}> Require single sign-on for people with a verified domain email</label>
+    <p class="note">Enforcing SSO needs at least one verified domain and one enabled SSO connection.</p>
+    <button type="submit">Save</button>
+  </form>
+</div>
+<div class="card">
+  <h2>Tier</h2>
+  <p>This organisation is on the <strong>{{$o.Tier}}</strong> tier. Ask a platform admin to change it.</p>
+</div>
+<div class="card">
+  <h2>Delete organisation</h2>
+  <p>Deleting revokes every API key and removes all members, connections, domains and invites. This cannot be undone.</p>
+  <form method="post" action="/console/orgs/{{$slug}}/settings/delete">
+    <input type="hidden" name="csrf" value="{{$csrf}}">
+    <label for="confirm">Type <code>{{$slug}}</code> to confirm</label>
+    <input id="confirm" name="confirm" required autocomplete="off">
+    <button type="submit" class="danger">Delete organisation</button>
+  </form>
+</div>
+{{end}}
