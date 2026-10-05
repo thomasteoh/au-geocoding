@@ -1,0 +1,16 @@
+{{define "content"}}
+<section class="login">
+  <h1>Single sign-on required</h1>
+  {{with .Data}}
+  <p><strong>{{.OrgName}}</strong> requires you to sign in with its single sign-on to see this page.</p>
+  {{if .Connections}}
+  <ul class="buttons">
+    {{range .Connections}}<li><a class="button" href="/auth/{{if eq .Kind "saml"}}saml{{else}}oidc{{end}}/{{.Slug}}/start?return_to={{$.Data.ReturnTo}}">Continue with {{.Name}}</a></li>{{end}}
+  </ul>
+  {{else}}
+  <p class="muted">{{.OrgName}} has no sign-in set up. Ask an owner.</p>
+  {{end}}
+  {{end}}
+  <p><a href="/console?all=1">Back to your organisations</a></p>
+</section>
+{{end}}

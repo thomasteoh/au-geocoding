@@ -90,6 +90,8 @@ type connView struct {
 	GroupsClaim string
 	TrustEmail  bool
 	AllowedOrgs string
+	// AllowedTenants pins a multi-tenant Entra issuer to these tenant IDs.
+	AllowedTenants string
 
 	SAMLIdPMetadata string
 	SAMLSPCert      string // public certificate for the IdP admin
@@ -112,7 +114,7 @@ type connView struct {
 func (s *Server) viewConn(c identity.Connection) connView {
 	v := connView{ID: c.ID, Slug: c.Slug, Kind: c.Kind, Preset: c.Preset, Name: c.Name, Enabled: c.Enabled, Issuer: c.Issuer,
 		ClientID: c.ClientID, HasSecret: c.ClientSecret != "", GroupsClaim: c.GroupsClaim, TrustEmail: c.TrustEmail,
-		AllowedOrgs: strings.Join(c.AllowedOrgs, " "), SAMLIdPMetadata: c.SAMLIdPMetadata, SAMLSPCert: c.SAMLSPCert,
+		AllowedOrgs: strings.Join(c.AllowedOrgs, " "), AllowedTenants: strings.Join(c.AllowedTenants, " "), SAMLIdPMetadata: c.SAMLIdPMetadata, SAMLSPCert: c.SAMLSPCert,
 		SAMLEmailAttr: c.SAMLEmailAttr, SAMLNameAttr: c.SAMLNameAttr, SAMLGroupsAttr: c.SAMLGroupsAttr, Managed: c.Managed, Created: c.Created}
 	if c.Kind == identity.KindOIDC {
 		v.ExtraScopes = strings.Join(extraScopes(c.Preset, c.Scopes), " ")
@@ -235,6 +237,10 @@ func connForm(r *http.Request, c *identity.Connection, platform bool) string {
 			return "Enter the client ID."
 		}
 		c.GroupsClaim = f("groups_claim")
+		c.AllowedTenants = strings.Fields(strings.ReplaceAll(r.PostFormValue("allowed_tenants"), ",", " "))
+		if identity.MultiTenantIssuer(c.Issuer) && c.OrgID != 0 && len(c.AllowedTenants) == 0 {
+			return "A shared Microsoft issuer (common or organizations) needs your Entra tenant IDs under Allowed tenants."
+		}
 		c.Scopes = nil
 		if extra := strings.Fields(r.PostFormValue("scopes")); len(extra) > 0 {
 			c.Scopes = append(append([]string{}, oidcrp.PresetFor(c.Preset).Scopes...), extraScopes(c.Preset, extra)...)

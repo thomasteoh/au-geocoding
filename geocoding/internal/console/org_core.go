@@ -397,7 +397,14 @@ func (s *Server) handleInviteCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.audit(r, oc.Org.ID, "invite.create", email, "role="+role.String())
-	redirectFlash(w, r, back, "Invited "+email+". They join as "+role.String()+" when they next sign in.")
+	msg := "Invited " + email + ". They join as " + role.String() + " when they next sign in."
+	switch s.sendInviteEmail(r, oc.Org, v.User, email, role, time.Now().Add(inviteTTL)) {
+	case inviteMailSent:
+		msg += " We emailed them a sign-in link."
+	case inviteMailFailed:
+		msg += " The invitation email could not be sent; send them " + s.abs("/auth/login") + " yourself."
+	}
+	redirectFlash(w, r, back, msg)
 }
 
 func (s *Server) handleInviteDelete(w http.ResponseWriter, r *http.Request) {
@@ -604,6 +611,14 @@ func (s *Server) handleSettingsSave(w http.ResponseWriter, r *http.Request) {
 		}
 		if !verified || len(conns) == 0 {
 			redirectFlash(w, r, back, "To enforce single sign-on, first verify a domain and enable an SSO connection.")
+			return
+		}
+		// The owner turning it on must already be signed in the enforced way,
+		// or the next page would lock them out.
+		enforced := *oc
+		enforced.Org.SSOEnforced = true
+		if !s.ssoSatisfied(r, viewerFrom(r.Context()), &enforced) {
+			redirectFlash(w, r, back, "Sign in with one of this organisation's SSO connections first (link it from your account page), then turn on enforcement.")
 			return
 		}
 	}

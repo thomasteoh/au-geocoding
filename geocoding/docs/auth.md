@@ -133,9 +133,35 @@ emailAddress or it contains `@`, else `email`, `mail`,
 `groups`, `http://schemas.microsoft.com/ws/2008/06/identity/claims/groups`,
 `memberOf`). Attributes match on Name or FriendlyName, ignoring case.
 
-SAML single logout is not implemented; ending the console session does not
-end the IdP session. Use SCIM deprovisioning or short session lifetimes for
-prompt revocation.
+Single logout uses `/auth/saml/{slug}/slo`, advertised in the SP metadata
+for the HTTP-Redirect and HTTP-POST bindings:
+
+- **SP-initiated.** `POST /auth/logout` on a SAML session deletes the local
+  session first. Then, if the IdP metadata lists an HTTP-Redirect
+  SingleLogoutService, it redirects the browser there with a LogoutRequest
+  (NameID and SessionIndex from the session) signed in the query string
+  (RSA-SHA256). The IdP's LogoutResponse at the SLO URL must verify (see
+  below) and report success; the browser then lands on the login page with
+  "You have signed out." Anything else gets a generic error page. The local
+  session is gone either way. Without an IdP SLO endpoint, logout is local
+  only.
+- **IdP-initiated.** A LogoutRequest at the SLO URL ends the connection's
+  sessions with that SessionIndex or, if it has none, that NameID. It is
+  audited as `logout.saml_slo` and answered with a LogoutResponse (Success,
+  RelayState echoed) signed in the query and sent by redirect to the IdP's
+  SLO endpoint (`ResponseLocation` if given). Request IDs are recorded to
+  refuse replays.
+
+Inbound logout messages must be signed by a signing certificate in the IdP
+metadata, either on the redirect query (RSA-SHA256/384/512 over the
+parameters as sent) or as an enveloped XML signature on the message; only
+the signed element is read. The issuer must be the IdP entity ID,
+`Destination` must be the SLO URL, `IssueInstant` must fall within the issue
+window above (plus skew), and a request's `NotOnOrAfter` must not have
+passed. Anything else is a 400 that touches no session. Bodies and inflated
+messages are capped at 1 MiB, and messages are never logged. For IdPs
+without SLO, use SCIM deprovisioning or short session lifetimes for prompt
+revocation.
 
 ### Resolving a login to a user
 
@@ -179,13 +205,17 @@ into a user:
   be `POST` with a matching `csrf` field or `X-CSRF-Token` header, and an
   `Origin` (or `Referer`) equal to `AUGEO_PUBLIC_URL`.
 - Users can list and revoke their own sessions. Suspension, SCIM
-  deprovisioning and back-channel logout delete sessions immediately.
+  deprovisioning, back-channel logout and SAML single logout delete sessions
+  immediately.
 
 ### Logout
 
 - `POST /auth/logout` deletes the session. For OIDC connections that publish
   `end_session_endpoint`, the browser is redirected there with
-  `id_token_hint` and `post_logout_redirect_uri`.
+  `id_token_hint` and `post_logout_redirect_uri`. For SAML connections whose
+  IdP has an SLO endpoint, it is redirected there with a signed
+  LogoutRequest; IdP-initiated SAML logout arrives at
+  `/auth/saml/{id}/slo` (see "SAML 2.0").
 - **Back-channel logout** (OIDC): `POST /auth/oidc/{id}/backchannel-logout`
   with a `logout_token` form field. The token is verified against the
   connection's keys; `iss`, `aud`, `iat`, the back-channel `events` member and
@@ -304,6 +334,17 @@ origin checks, and an audit event.
 | `AUGEO_AUTH_SESSION_IDLE` | `28800` | Seconds |
 | `AUGEO_AUTH_SESSION_MAX` | `604800` | Seconds |
 | `AUGEO_AUTH_PROVIDERS_FILE` | | JSON list of platform connections to upsert at boot (see below) |
+| `AUGEO_SMTP_HOST` | (unset: no invite emails) | SMTP submission server for invite emails. STARTTLS is required unless the host is `localhost` or a loopback address |
+| `AUGEO_SMTP_PORT` | `587` | SMTP port (STARTTLS; implicit TLS on 465 is not supported) |
+| `AUGEO_SMTP_USERNAME` | | Enables SMTP PLAIN auth (only over TLS, or to localhost) |
+| `AUGEO_SMTP_PASSWORD` / `_FILE` | | SMTP password; redacted in the boot log |
+| `AUGEO_SMTP_FROM` | (required with host) | Sender, `noreply@geo.example.com` or `Geocoder <noreply@geo.example.com>` |
+
+When SMTP is configured, inviting someone emails them a plain-text message
+naming the inviter, organisation, role, the `{AUGEO_PUBLIC_URL}/auth/login`
+link and the expiry. A failed send never fails the invite: the console says
+the email could not be sent and logs `invite_email_failed` with the org ID and
+the error, never the recipient's address.
 
 Platform connections can be managed in the admin console or declared in the
 providers file so deployments are reproducible:
@@ -329,6 +370,7 @@ providers file so deployments are reproducible:
 | `/auth/saml/{id}/metadata` | GET | SP metadata for the IdP admin |
 | `/auth/saml/{id}/start` | GET | Begin SAML login |
 | `/auth/saml/{id}/acs` | POST | Assertion consumer service |
+| `/auth/saml/{id}/slo` | GET/POST | SAML single logout service |
 | `/auth/passkey/login/begin`, `/finish` | POST | Passkey login |
 | `/auth/logout` | POST | End session (RP-initiated logout where supported) |
 | `/console/…` | GET/POST | Web console |
@@ -364,3 +406,54 @@ An invite is always a pending row, even for an email that already has an
 account: the person joins when they next sign in with a trusted address, so
 nobody is added to an org without acting, and the response never reveals
 whether an account exists. Invites expire after 14 days.
+
+## Linking sign-in methods
+
+A signed-in person can link another identity to their account from the
+account page: they complete that provider's sign-in and the identity is
+attached. Because they hold both, no email match is needed, which is what
+lets someone who belongs to several orgs add each org's SSO (automatic
+linking at login refuses accounts with access outside the org; see rule 2
+above). Rules:
+
+- Linking needs a recent SSO sign-in (within 10 minutes, not a passkey
+  session), like adding a passkey.
+- Only platform connections and connections of orgs the person belongs to
+  are offered.
+- An org connection link still needs the asserted email in a domain that
+  org verified, and the org's invite, JIT and group-mapping rules apply.
+- An identity already linked to another account cannot be linked again.
+- Unlinking never removes the last way to sign in (identities plus
+  passkeys), and ends sessions created through that connection.
+
+## SSO enforcement
+
+An org with SSO enforcement on checks every console request to its pages:
+the session must have been created through one of that org's own
+connections. Otherwise GETs show a page with the org's sign-in buttons and
+other requests get 403. Exempt: platform admins, and owners on a passkey
+session (break-glass). Because the check runs per request, sessions that
+predate enforcement do not survive it, and guests at other domains need an
+identity in the org's IdP (linked as above).
+
+Separately, platform IdP logins for an address in an enforced org's
+verified domain are refused at sign-in. An owner can only turn enforcement
+on from a session that already satisfies it, so they cannot lock
+themselves out.
+
+## Microsoft Entra ID
+
+- Single-tenant issuer (`https://login.microsoftonline.com/{tenant}/v2.0`):
+  go-oidc checks the token's issuer, so only that tenant signs in.
+- Shared issuers (`common`, `organizations`): each token's issuer must be
+  its own tenant's, and the connection's **allowed tenants** list pins
+  which tenant IDs may sign in. The list is required on org connections and
+  optional on platform connections; back-channel logout tokens are checked
+  against it too.
+- Email is trusted for linking only with the `xms_edov` claim (see the
+  preset table).
+- Group overage: when Entra omits groups (`_claim_names.groups` or
+  `hasgroups`), the console asks Microsoft Graph (`/me/getMemberGroups`,
+  needs GroupMember.Read.All consented). If that fails, the sign-in still
+  works and the person's role is left unchanged rather than recomputed from
+  an empty list.

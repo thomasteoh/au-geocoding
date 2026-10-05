@@ -12,6 +12,26 @@
 </div>
 
 <div class="card">
+  <h2>Sign-in methods</h2>
+  <table>
+    <thead><tr><th>Method</th><th>Account</th><th>Linked</th><th>Last used</th><th></th></tr></thead>
+    <tbody>
+    {{range .Data.Identities}}<tr><td>{{.Connection.Name}}</td><td>{{.Email}}</td><td>{{when .Created}}</td><td>{{when .LastLogin}}</td>
+      <td><form method="post" action="/console/account/identities/{{.ID}}/unlink" class="inline"><input type="hidden" name="csrf" value="{{$.CSRF}}"><button type="submit" class="danger">Remove</button></form></td></tr>{{end}}
+    </tbody>
+  </table>
+  {{if .Data.Linkable}}
+  <h3>Link another sign-in method</h3>
+  {{if .Data.CanLink}}
+  <p class="muted">You will be sent to the provider to sign in; that account is then linked to this one.</p>
+  {{range .Data.Linkable}}<form method="post" action="/console/account/links/{{.Slug}}" class="inline"><input type="hidden" name="csrf" value="{{$.CSRF}}"><button type="submit">Link {{.Name}}</button></form> {{end}}
+  {{else}}
+  <p class="muted">To link another method, sign out and sign in again with single sign-on, then link it within 10 minutes.</p>
+  {{end}}
+  {{end}}
+</div>
+
+<div class="card">
   <h2>Passkeys</h2>
   <p class="muted">A passkey lets you sign in when your identity provider is unavailable. You can add one within 10 minutes of signing in with single sign-on.</p>
   {{with .Data.Passkeys}}

@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"net/url"
+	"regexp"
 	"strings"
 	"time"
 )
@@ -33,6 +34,10 @@ type Connection struct {
 	GroupsClaim  string
 	TrustEmail   bool
 	AllowedOrgs  []string // GitHub org restriction
+	// AllowedTenants pins a multi-tenant Microsoft issuer (common,
+	// organizations) to these Entra tenant IDs. Required for multi-tenant
+	// org connections; optional for platform connections.
+	AllowedTenants []string
 
 	SAMLIdPMetadata string
 	SAMLSPKey       string // opened PEM; never rendered
@@ -49,14 +54,14 @@ type Connection struct {
 func (c Connection) Platform() bool { return c.OrgID == 0 }
 
 const connCols = `id, COALESCE(org_id,0), slug, kind, preset, name, enabled, issuer, client_id, client_secret_enc, scopes, groups_claim,
-	trust_email, allowed_orgs, saml_idp_metadata, saml_sp_key_enc, saml_sp_cert, saml_email_attr, saml_name_attr, saml_groups_attr, managed, created`
+	trust_email, allowed_orgs, saml_idp_metadata, saml_sp_key_enc, saml_sp_cert, saml_email_attr, saml_name_attr, saml_groups_attr, managed, created, allowed_tenants`
 
 func (s *Store) scanConn(sc interface{ Scan(...any) error }) (Connection, error) {
 	var c Connection
 	var enabled, trust, managed int
-	var secret, scopes, orgs, key, created string
+	var secret, scopes, orgs, key, created, tenants string
 	if err := sc.Scan(&c.ID, &c.OrgID, &c.Slug, &c.Kind, &c.Preset, &c.Name, &enabled, &c.Issuer, &c.ClientID, &secret, &scopes, &c.GroupsClaim,
-		&trust, &orgs, &c.SAMLIdPMetadata, &key, &c.SAMLSPCert, &c.SAMLEmailAttr, &c.SAMLNameAttr, &c.SAMLGroupsAttr, &managed, &created); err != nil {
+		&trust, &orgs, &c.SAMLIdPMetadata, &key, &c.SAMLSPCert, &c.SAMLEmailAttr, &c.SAMLNameAttr, &c.SAMLGroupsAttr, &managed, &created, &tenants); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return c, ErrNotFound
 		}
@@ -65,6 +70,7 @@ func (s *Store) scanConn(sc interface{ Scan(...any) error }) (Connection, error)
 	c.Enabled, c.TrustEmail, c.Managed = enabled != 0, trust != 0, managed != 0
 	c.Scopes = strings.Fields(scopes)
 	c.AllowedOrgs = strings.Fields(orgs)
+	c.AllowedTenants = strings.Fields(tenants)
 	c.Created = parseTS(created)
 	var err error
 	if c.ClientSecret, err = s.open(secret); err != nil {
@@ -148,12 +154,38 @@ func validateConn(c *Connection) error {
 	default:
 		return ErrInvalid
 	}
+	for i, t := range c.AllowedTenants {
+		t = strings.ToLower(strings.TrimSpace(t))
+		if !tenantRe.MatchString(t) {
+			return ErrInvalid
+		}
+		c.AllowedTenants[i] = t
+	}
 	// A multi-tenant Entra issuer accepts every tenant's users; on an org
-	// connection any tenant admin could assert the org's addresses.
-	if c.OrgID != 0 && c.Kind == KindOIDC && MultiTenantIssuer(c.Issuer) {
+	// connection any tenant admin could assert the org's addresses, so it
+	// must be pinned to the org's own tenants.
+	if c.OrgID != 0 && c.Kind == KindOIDC && MultiTenantIssuer(c.Issuer) && len(c.AllowedTenants) == 0 {
 		return ErrInvalid
 	}
 	return nil
+}
+
+var tenantRe = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
+
+func sameSet(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	m := map[string]bool{}
+	for _, x := range a {
+		m[x] = true
+	}
+	for _, x := range b {
+		if !m[x] {
+			return false
+		}
+	}
+	return true
 }
 
 // MultiTenantIssuer reports whether issuer is a shared Microsoft endpoint
@@ -191,12 +223,13 @@ func (s *Store) SaveConnection(ctx context.Context, c Connection) (Connection, e
 	}
 	scopes := strings.Join(c.Scopes, " ")
 	orgs := strings.Join(c.AllowedOrgs, " ")
+	tenants := strings.Join(c.AllowedTenants, " ")
 	if c.ID == 0 {
 		res, err := s.db.ExecContext(ctx, `INSERT INTO connections(org_id, slug, kind, preset, name, enabled, issuer, client_id, client_secret_enc, scopes, groups_claim,
-			trust_email, allowed_orgs, saml_idp_metadata, saml_sp_key_enc, saml_sp_cert, saml_email_attr, saml_name_attr, saml_groups_attr, managed, created)
-			VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+			trust_email, allowed_orgs, saml_idp_metadata, saml_sp_key_enc, saml_sp_cert, saml_email_attr, saml_name_attr, saml_groups_attr, managed, created, allowed_tenants)
+			VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 			nullID(c.OrgID), c.Slug, c.Kind, c.Preset, c.Name, b2i(c.Enabled), c.Issuer, c.ClientID, secret, scopes, c.GroupsClaim,
-			b2i(c.TrustEmail), orgs, c.SAMLIdPMetadata, key, c.SAMLSPCert, c.SAMLEmailAttr, c.SAMLNameAttr, c.SAMLGroupsAttr, b2i(c.Managed), now())
+			b2i(c.TrustEmail), orgs, c.SAMLIdPMetadata, key, c.SAMLSPCert, c.SAMLEmailAttr, c.SAMLNameAttr, c.SAMLGroupsAttr, b2i(c.Managed), now(), tenants)
 		if err != nil {
 			if isUnique(err) {
 				return c, ErrConflict
@@ -218,10 +251,10 @@ func (s *Store) SaveConnection(ctx context.Context, c Connection) (Connection, e
 	res, err := tx.ExecContext(ctx, `UPDATE connections SET slug=?, preset=?, name=?, enabled=?, issuer=?, client_id=?,
 		client_secret_enc=CASE WHEN ?='' THEN client_secret_enc ELSE ? END, scopes=?, groups_claim=?, trust_email=?, allowed_orgs=?,
 		saml_idp_metadata=?, saml_sp_key_enc=CASE WHEN ?='' THEN saml_sp_key_enc ELSE ? END,
-		saml_sp_cert=CASE WHEN ?='' THEN saml_sp_cert ELSE ? END, saml_email_attr=?, saml_name_attr=?, saml_groups_attr=?, managed=?
+		saml_sp_cert=CASE WHEN ?='' THEN saml_sp_cert ELSE ? END, saml_email_attr=?, saml_name_attr=?, saml_groups_attr=?, managed=?, allowed_tenants=?
 		WHERE id=? AND COALESCE(org_id,0)=? AND kind=?`,
 		c.Slug, c.Preset, c.Name, b2i(c.Enabled), c.Issuer, c.ClientID, secret, secret, scopes, c.GroupsClaim, b2i(c.TrustEmail), orgs,
-		c.SAMLIdPMetadata, key, key, c.SAMLSPCert, c.SAMLSPCert, c.SAMLEmailAttr, c.SAMLNameAttr, c.SAMLGroupsAttr, b2i(c.Managed),
+		c.SAMLIdPMetadata, key, key, c.SAMLSPCert, c.SAMLSPCert, c.SAMLEmailAttr, c.SAMLNameAttr, c.SAMLGroupsAttr, b2i(c.Managed), tenants,
 		c.ID, c.OrgID, c.Kind)
 	if err != nil {
 		if isUnique(err) {
@@ -236,7 +269,7 @@ func (s *Store) SaveConnection(ctx context.Context, c Connection) (Connection, e
 	// connection now points at a different IdP, its old identities and
 	// sessions must not carry over, or the new IdP could replay a known
 	// subject to become that user.
-	if old.Issuer != c.Issuer || old.ClientID != c.ClientID || (c.SAMLIdPMetadata != "" && old.SAMLIdPMetadata != c.SAMLIdPMetadata) {
+	if old.Issuer != c.Issuer || old.ClientID != c.ClientID || !sameSet(old.AllowedTenants, c.AllowedTenants) || (c.SAMLIdPMetadata != "" && old.SAMLIdPMetadata != c.SAMLIdPMetadata) {
 		if _, err := tx.ExecContext(ctx, `DELETE FROM identities WHERE connection_id=?`, c.ID); err != nil {
 			return c, err
 		}

@@ -415,7 +415,7 @@ func TestSettings(t *testing.T) {
 	h := newHarness(t, open)
 	owner := h.user("owner@acme.example")
 	org := h.org("acme", owner)
-	ob, _ := h.member("owner2@acme.example", org, identity.RoleOwner)
+	ob, owner2 := h.member("owner2@acme.example", org, identity.RoleOwner)
 	admin, _ := h.member("admin@acme.example", org, identity.RoleAdmin)
 
 	if r := admin.get("/console/orgs/acme/settings"); r.Status != http.StatusForbidden {
@@ -437,6 +437,13 @@ func TestSettings(t *testing.T) {
 		Enabled: true, Issuer: "https://acme.okta.example", ClientID: "x"}); err != nil {
 		t.Fatal(err)
 	}
+	// The owner is signed in through a platform IdP, so turning enforcement
+	// on would lock them out: refused.
+	if r := ob.post("/console/orgs/acme/settings", form, true); !strings.Contains(ob.flash(r), "SSO connections first") {
+		t.Fatal("enforcement enabled from a non-SSO session")
+	}
+	// A platform admin may (and is exempt from enforcement).
+	h.ids.SetPlatformAdmin(h.ctx, owner2.ID, true)
 	if r := ob.post("/console/orgs/acme/settings", form, true); !strings.Contains(ob.flash(r), "Settings saved") {
 		t.Fatal("not saved")
 	}

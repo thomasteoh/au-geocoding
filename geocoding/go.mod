@@ -9,6 +9,7 @@ require (
 	github.com/crewjam/saml v0.5.1
 	github.com/go-jose/go-jose/v4 v4.1.5
 	github.com/go-webauthn/webauthn v0.18.2
+	github.com/mattermost/xml-roundtrip-validator v0.1.0
 	github.com/russellhaering/goxmldsig v1.4.0
 	golang.org/x/oauth2 v0.37.0
 	modernc.org/sqlite v1.58.0
@@ -23,7 +24,6 @@ require (
 	github.com/google/go-tpm v0.9.8 // indirect
 	github.com/google/uuid v1.6.0 // indirect
 	github.com/jonboulle/clockwork v0.2.2 // indirect
-	github.com/mattermost/xml-roundtrip-validator v0.1.0 // indirect
 	github.com/mattn/go-isatty v0.0.24 // indirect
 	github.com/ncruces/go-strftime v1.0.0 // indirect
 	github.com/philhofer/fwd v1.2.0 // indirect

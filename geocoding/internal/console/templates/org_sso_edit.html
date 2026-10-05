@@ -52,6 +52,9 @@
   <label for="groups_claim">Groups claim</label>
   <input id="groups_claim" name="groups_claim" maxlength="100" value="{{$c.GroupsClaim}}" placeholder="{{(preset $c.Preset).GroupsClaim}}" aria-describedby="groups-help">
   <p id="groups-help" class="note">The ID token claim that lists the user's groups. Leave blank for the provider default.</p>
+  <label for="allowed_tenants">Allowed Entra tenants</label>
+  <input id="allowed_tenants" name="allowed_tenants" value="{{$c.AllowedTenants}}" aria-describedby="tenants-help">
+  <p id="tenants-help" class="note">Microsoft Entra only: space-separated tenant IDs. Required when the issuer is a shared endpoint (<code>/common/</code> or <code>/organizations/</code>) on an organisation connection, so only your tenants can sign in. With a group overage, grant the app GroupMember.Read.All so groups can be read from Microsoft Graph; without it, roles are left unchanged at sign-in.</p>
   {{end}}
 
   {{if eq $c.Kind "github"}}

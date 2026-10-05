@@ -222,3 +222,54 @@ func TestGitHubLogin(t *testing.T) {
 		t.Fatalf("org restriction: %v", err)
 	}
 }
+
+func TestEntraTenantAllowlist(t *testing.T) {
+	rp, idp, c := setup(t)
+	c.Preset = "entra"
+	c.AllowedTenants = []string{"11111111-1111-1111-1111-111111111111"}
+	idp.SetUser(authtest.User{Subject: "u1", Email: "a@b.example"})
+	idp.Tamper = func(m map[string]any) { m["tid"] = "22222222-2222-2222-2222-222222222222" }
+	f := flow()
+	_, err := rp.Callback(ctx, c, f, authorize(t, rp, c, f, "st"))
+	var d *identity.Denial
+	if !errors.As(err, &d) || d.Code != "tenant_not_allowed" {
+		t.Fatalf("foreign tenant: %v", err)
+	}
+	idp.Tamper = func(m map[string]any) { m["tid"] = "11111111-1111-1111-1111-111111111111" }
+	f = flow()
+	if _, err := rp.Callback(ctx, c, f, authorize(t, rp, c, f, "st")); err != nil {
+		t.Fatalf("allowed tenant: %v", err)
+	}
+}
+
+func TestEntraGroupOverage(t *testing.T) {
+	rp, idp, c := setup(t)
+	c.Preset = "entra"
+	status := http.StatusOK
+	graph := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/me/getMemberGroups" || !strings.HasPrefix(r.Header.Get("Authorization"), "Bearer ") {
+			http.Error(w, "bad", http.StatusBadRequest)
+			return
+		}
+		w.WriteHeader(status)
+		json.NewEncoder(w).Encode(map[string]any{"value": []string{"g-1", "g-2"}})
+	}))
+	defer graph.Close()
+	rp.GraphURL = graph.URL
+	idp.SetUser(authtest.User{Subject: "u1"})
+	idp.Tamper = func(m map[string]any) {
+		m["_claim_names"] = map[string]any{"groups": "src1"}
+		m["_claim_sources"] = map[string]any{"src1": map[string]any{"endpoint": "https://graph.windows.net/x/users/y/getMemberObjects"}}
+	}
+	f := flow()
+	a, err := rp.Callback(ctx, c, f, authorize(t, rp, c, f, "st"))
+	if err != nil || len(a.Groups) != 2 || a.GroupsUnknown {
+		t.Fatalf("overage via graph: %+v %v", a, err)
+	}
+	status = http.StatusForbidden
+	f = flow()
+	a, err = rp.Callback(ctx, c, f, authorize(t, rp, c, f, "st"))
+	if err != nil || !a.GroupsUnknown {
+		t.Fatalf("graph failure should mark groups unknown: %+v %v", a, err)
+	}
+}
