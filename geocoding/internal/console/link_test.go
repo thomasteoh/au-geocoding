@@ -155,17 +155,25 @@ func itoa(n int64) string { return strconv.FormatInt(n, 10) }
 func TestSSOSatisfiedRules(t *testing.T) {
 	h := newHarness(t, open)
 	org, _, c := h.orgSSO(t)
+	u := h.user("dev@acme.example")
 	oc := &OrgContext{Org: org, Role: identity.RoleDeveloper}
 	r, _ := http.NewRequest("GET", "/", nil)
-	v := &Viewer{User: identity.User{ID: 1}, Session: identity.Session{Method: "oidc", ConnectionID: h.conn.ID}}
+	sess := func(method string, conn int64) identity.Session {
+		_, x, err := h.ids.CreateSession(h.ctx, identity.NewSession{UserID: u.ID, Method: method, ConnectionID: conn}, h.con.Cfg.Session)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return x
+	}
+	v := &Viewer{User: u, Session: sess("oidc", h.conn.ID)}
 	if h.con.ssoSatisfied(r, v, oc) {
 		t.Fatal("platform session satisfied enforcement")
 	}
-	v.Session.ConnectionID = c.ID
+	v.Session = sess("oidc", c.ID)
 	if !h.con.ssoSatisfied(r, v, oc) {
 		t.Fatal("org session refused")
 	}
-	v.Session = identity.Session{Method: "passkey"}
+	v.Session = sess("passkey", 0)
 	if h.con.ssoSatisfied(r, v, oc) {
 		t.Fatal("passkey developer satisfied enforcement")
 	}
@@ -177,5 +185,52 @@ func TestSSOSatisfiedRules(t *testing.T) {
 	v.User.PlatformAdmin = true
 	if !h.con.ssoSatisfied(r, v, oc) {
 		t.Fatal("platform admin refused")
+	}
+}
+
+// TestSessionSatisfiesTwoEnforcedOrgs covers the multi-org limit: signing in
+// to a second enforced org's SSO keeps access to the first.
+func TestSessionSatisfiesTwoEnforcedOrgs(t *testing.T) {
+	h := newHarness(t, open)
+	acme, idpA, _ := h.orgSSO(t)
+	owner := h.user("owner@beta.example")
+	beta := h.org("beta", owner)
+	d, _ := h.ids.AddDomain(h.ctx, beta.ID, "beta.example")
+	h.ids.MarkDomainVerified(h.ctx, beta.ID, d.ID)
+	h.ids.UpdateOrgSettings(h.ctx, beta.ID, identity.OrgSettings{Name: "Beta", SSOEnforced: true, DefaultRole: identity.RoleViewer})
+	idpB := authtest.NewIdP(t)
+	if _, err := h.ids.SaveConnection(h.ctx, identity.Connection{OrgID: beta.ID, Slug: "beta-sso", Kind: identity.KindOIDC, Preset: "okta", Name: "Beta SSO",
+		Enabled: true, Issuer: idpB.Issuer, ClientID: idpB.ClientID, ClientSecret: idpB.ClientSecret}); err != nil {
+		t.Fatal(err)
+	}
+	// A consultant who works for both orgs, with an account in each IdP.
+	b := h.browser()
+	b.mustLogin(authtest.User{Subject: "c1", Email: "consultant@personal.example", EmailVerified: true})
+	u, _ := h.ids.UserByEmail(h.ctx, "consultant@personal.example")
+	h.ids.SetMembership(h.ctx, acme.ID, u.ID, identity.RoleDeveloper, "manual")
+	h.ids.SetMembership(h.ctx, beta.ID, u.ID, identity.RoleDeveloper, "manual")
+	idpA.SetUser(authtest.User{Subject: "a-consultant", Email: "consultant@acme.example"})
+	b.follow(b.post("/console/account/links/acme-sso", nil, true), 2)
+	idpB.SetUser(authtest.User{Subject: "b-consultant", Email: "consultant@beta.example"})
+	b.follow(b.post("/console/account/links/beta-sso", nil, true), 2)
+
+	b.follow(b.get("/auth/oidc/acme-sso/start"), 3)
+	if r := b.get("/console/orgs/acme/keys"); r.Status != http.StatusOK {
+		t.Fatalf("acme after acme SSO: %d", r.Status)
+	}
+	b.follow(b.get("/auth/oidc/beta-sso/start"), 3)
+	if r := b.get("/console/orgs/beta/keys"); r.Status != http.StatusOK {
+		t.Fatalf("beta after beta SSO: %d", r.Status)
+	}
+	if r := b.get("/console/orgs/acme/keys"); r.Status != http.StatusOK {
+		t.Fatalf("acme lost after beta SSO: %d", r.Status)
+	}
+	// Proofs never move to another person's session.
+	other := h.browser()
+	other.mustLogin(authtest.User{Subject: "o1", Email: "other@personal.example", EmailVerified: true})
+	ou, _ := h.ids.UserByEmail(h.ctx, "other@personal.example")
+	h.ids.SetMembership(h.ctx, acme.ID, ou.ID, identity.RoleDeveloper, "manual")
+	if r := other.get("/console/orgs/acme/keys"); r.Status != http.StatusForbidden {
+		t.Fatalf("other user reached acme: %d", r.Status)
 	}
 }

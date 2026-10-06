@@ -220,6 +220,14 @@ CREATE INDEX idx_audit_org_ts ON audit_events(org_id, ts);
 `,
 	// 2: Entra tenant allowlist on connections.
 	`ALTER TABLE connections ADD COLUMN allowed_tenants TEXT NOT NULL DEFAULT '';`,
+	// 3: connections a session has signed in through (per-org SSO proofs).
+	`CREATE TABLE session_proofs (
+	id_hash       BLOB NOT NULL REFERENCES sessions(id_hash) ON DELETE CASCADE,
+	connection_id INTEGER NOT NULL REFERENCES connections(id) ON DELETE CASCADE,
+	created       TEXT NOT NULL,
+	PRIMARY KEY (id_hash, connection_id)
+);
+CREATE INDEX idx_session_proofs_conn ON session_proofs(connection_id);`,
 }
 
 func migrate(db *sql.DB) error {

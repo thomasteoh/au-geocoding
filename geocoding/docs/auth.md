@@ -436,6 +436,14 @@ session (break-glass). Because the check runs per request, sessions that
 predate enforcement do not survive it, and guests at other domains need an
 identity in the org's IdP (linked as above).
 
+A session remembers every connection it has signed in through (session
+proofs). Signing in again as the same person, for example into a second
+enforced org's SSO, rotates the session ID but carries the earlier proofs
+across with their original times, so one browser can work in several
+enforced orgs. Proofs count only within the session lifetime they were
+earned under, never move between different people's sessions, and are
+dropped when the connection is deleted or unlinked.
+
 Separately, platform IdP logins for an address in an enforced org's
 verified domain are refused at sign-in. An owner can only turn enforcement
 on from a session that already satisfies it, so they cannot lock

@@ -144,6 +144,10 @@ func (s *Store) UnlinkIdentity(ctx context.Context, userID, identityID int64) (C
 	if _, err := tx.ExecContext(ctx, `DELETE FROM sessions WHERE user_id=? AND connection_id=?`, userID, connID); err != nil {
 		return Connection{}, err
 	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM session_proofs WHERE connection_id=? AND id_hash IN (SELECT id_hash FROM sessions WHERE user_id=?)`,
+		connID, userID); err != nil {
+		return Connection{}, err
+	}
 	if err := tx.Commit(); err != nil {
 		return Connection{}, err
 	}
@@ -176,13 +180,3 @@ func (s *Store) LinkableConnections(ctx context.Context, userID int64) ([]Connec
 	return conns, nil
 }
 
-// SessionConnectionOrg returns the org ID owning a session's connection (0
-// for a platform connection or none).
-func (s *Store) SessionConnectionOrg(ctx context.Context, connectionID int64) int64 {
-	if connectionID == 0 {
-		return 0
-	}
-	var org sql.NullInt64
-	s.db.QueryRowContext(ctx, `SELECT org_id FROM connections WHERE id=?`, connectionID).Scan(&org)
-	return org.Int64
-}

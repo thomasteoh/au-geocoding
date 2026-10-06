@@ -221,15 +221,23 @@ func (s *Server) completeLogin(w http.ResponseWriter, r *http.Request, a identit
 // startSession replaces any current session with a new one (new ID on every
 // login, A1) and sets the cookie.
 func (s *Server) startSession(w http.ResponseWriter, r *http.Request, u identity.User, n identity.NewSession) bool {
-	if old := cookieValue(r, sessionCookie); old != "" {
-		s.IDs.DeleteSession(r.Context(), identity.HashToken(old))
-	}
 	n.UserID = u.ID
 	n.UserAgent = r.UserAgent()
-	raw, _, err := s.IDs.CreateSession(r.Context(), n, s.Cfg.Session)
+	raw, sess, err := s.IDs.CreateSession(r.Context(), n, s.Cfg.Session)
 	if err != nil {
 		s.serverError(w, r, err)
 		return false
+	}
+	if old := cookieValue(r, sessionCookie); old != "" {
+		// Same person signing in again (e.g. into a second org's SSO): keep
+		// the orgs the old session already satisfied. CarrySessionProofs
+		// only copies between sessions of one user, and only live ones.
+		if _, prev, err := s.IDs.LookupSession(r.Context(), old, s.Cfg.Session); err == nil && prev.ID == u.ID {
+			if err := s.IDs.CarrySessionProofs(r.Context(), identity.HashToken(old), sess.IDHash); err != nil {
+				s.Log.Error("session_proofs_failed", "error", err.Error())
+			}
+		}
+		s.IDs.DeleteSession(r.Context(), identity.HashToken(old))
 	}
 	setCookie(w, sessionCookie, raw, s.Cfg.Session.Max, http.SameSiteLaxMode)
 	return true

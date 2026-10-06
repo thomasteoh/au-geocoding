@@ -221,7 +221,7 @@ func (s *Server) ssoSatisfied(r *http.Request, v *Viewer, oc *OrgContext) bool {
 	if v.Session.Method == "passkey" && oc.Role == identity.RoleOwner {
 		return true
 	}
-	return s.IDs.SessionConnectionOrg(r.Context(), v.Session.ConnectionID) == oc.Org.ID
+	return s.IDs.SessionSatisfiesOrg(r.Context(), v.Session.IDHash, oc.Org.ID, s.Cfg.Session.Max)
 }
 
 // requireOrgSSO tells the person to sign in through the org's SSO. GETs
