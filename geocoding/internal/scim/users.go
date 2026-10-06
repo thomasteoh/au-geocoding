@@ -528,38 +528,33 @@ func (c *call) createUser() {
 }
 
 // replaceUser handles PUT (ops nil: the body is the full resource) and
-// PATCH (ops applied to the stored resource).
+// PATCH (ops applied to the stored resource). The read, the patch and the
+// write run in one store transaction, so concurrent PATCHes cannot lose
+// each other's changes.
 func (c *call) replaceUser(id string, ops []patchOp) {
 	ctx := c.r.Context()
-	cur, err := c.s.IDs.SCIMUserByID(ctx, c.org, id)
-	if err != nil {
-		c.fail(err)
-		return
-	}
-	var u scimUser
+	var put scimUser
 	if ops == nil {
 		m, err := c.decode()
 		if err != nil {
 			c.fail(err)
 			return
 		}
-		if u, err = parseUser(m); err != nil {
-			c.fail(err)
-			return
-		}
-	} else {
-		u = fromStored(cur)
-		if err := u.apply(ops); err != nil {
+		if put, err = parseUser(m); err != nil {
 			c.fail(err)
 			return
 		}
 	}
-	in, err := u.input()
-	if err != nil {
-		c.fail(err)
-		return
-	}
-	su, changed, err := c.s.IDs.ReplaceSCIMUser(ctx, c.org, id, in)
+	cur, su, changed, err := c.s.IDs.PatchSCIMUser(ctx, c.org, id, func(cur identity.SCIMUser) (identity.SCIMUserInput, error) {
+		u := put
+		if ops != nil {
+			u = fromStored(cur)
+			if err := u.apply(ops); err != nil {
+				return identity.SCIMUserInput{}, err
+			}
+		}
+		return u.input()
+	})
 	if err != nil {
 		c.fail(err)
 		return

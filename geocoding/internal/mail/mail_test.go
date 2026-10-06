@@ -24,6 +24,8 @@ import (
 type fakeSMTP struct {
 	ln       net.Listener
 	tls      *tls.Config // non-nil: offer STARTTLS
+	implicit bool        // TLS from the first byte (port 465 style)
+	rcptCode string      // reply to RCPT; "" = 250
 	mu       sync.Mutex
 	from, to string
 	data     string
@@ -52,10 +54,23 @@ func newFakeSMTP(t *testing.T, tc *tls.Config) *fakeSMTP {
 
 func (f *fakeSMTP) serve(c net.Conn) {
 	defer c.Close()
+	secure := false
+	f.mu.Lock()
+	implicit := f.implicit
+	f.mu.Unlock()
+	if implicit {
+		tc := tls.Server(c, f.tls)
+		if err := tc.Handshake(); err != nil {
+			return
+		}
+		c, secure = tc, true
+		f.mu.Lock()
+		f.usedTLS = true
+		f.mu.Unlock()
+	}
 	r, w := bufio.NewReader(c), bufio.NewWriter(c)
 	say := func(s string) { w.WriteString(s + "\r\n"); w.Flush() }
 	say("220 fake ESMTP")
-	secure := false
 	for {
 		line, err := r.ReadString('\n')
 		if err != nil {
@@ -96,7 +111,12 @@ func (f *fakeSMTP) serve(c net.Conn) {
 		case "RCPT":
 			f.mu.Lock()
 			f.to = line
+			code := f.rcptCode
 			f.mu.Unlock()
+			if code != "" {
+				say(code + " 5.1.1 <someone@example.com>: mailbox unavailable")
+				continue
+			}
 			say("250 ok")
 		case "DATA":
 			say("354 go")
@@ -283,4 +303,61 @@ func testCert(t *testing.T, host string) (tls.Certificate, *x509.CertPool) {
 	pool := x509.NewCertPool()
 	pool.AddCert(c)
 	return tls.Certificate{Certificate: [][]byte{der}, PrivateKey: key}, pool
+}
+
+func TestSendImplicitTLS(t *testing.T) {
+	cert, pool := testCert(t, "mail.example.com")
+	f := newFakeSMTP(t, &tls.Config{Certificates: []tls.Certificate{cert}})
+	f.mu.Lock()
+	f.implicit = true
+	f.mu.Unlock()
+	s := f.sender(t, "mail.example.com", Config{Username: "user", Password: "pw", Port: 465})
+	if s.cfg.TLS != TLSImplicit {
+		t.Fatalf("port 465 should imply implicit TLS, got %q", s.cfg.TLS)
+	}
+	s.tlsConfig = &tls.Config{ServerName: "mail.example.com", RootCAs: pool, MinVersion: tls.VersionTLS12}
+	if err := s.Send(context.Background(), "ada@example.com", "hi", "body"); err != nil {
+		t.Fatal(err)
+	}
+	f.mu.Lock()
+	if !f.usedTLS || f.auth != "\x00user\x00pw" || !strings.Contains(f.data, "body") {
+		t.Fatalf("tls=%v auth=%q data=%q", f.usedTLS, f.auth, f.data)
+	}
+	f.mu.Unlock()
+
+	// An untrusted certificate fails at the TLS stage, before any SMTP.
+	s2 := f.sender(t, "mail.example.com", Config{Port: 2465, TLS: TLSImplicit})
+	err := s2.Send(context.Background(), "ada@example.com", "hi", "body")
+	if ErrorCode(err) != "tls" || Permanent(err) {
+		t.Fatalf("untrusted cert: %v code=%q", err, ErrorCode(err))
+	}
+
+	// Explicit starttls on 465 is honoured; bad modes are refused.
+	if s, err := NewSMTP(Config{Host: "smtp.example", From: "a@b.example", Port: 465, TLS: TLSStartTLS}); err != nil || s.cfg.TLS != TLSStartTLS {
+		t.Fatalf("explicit starttls: %v", err)
+	}
+	if _, err := NewSMTP(Config{Host: "smtp.example", From: "a@b.example", TLS: "ssl"}); err == nil {
+		t.Fatal("accepted TLS mode ssl")
+	}
+}
+
+func TestErrorCodeAndPermanent(t *testing.T) {
+	f := newFakeSMTP(t, nil)
+	f.mu.Lock()
+	f.rcptCode = "550"
+	f.mu.Unlock()
+	s := f.sender(t, "localhost", Config{})
+	err := s.Send(context.Background(), "someone@example.com", "hi", "b")
+	if ErrorCode(err) != "rcpt_550" || !Permanent(err) {
+		t.Fatalf("code=%q permanent=%v err=%v", ErrorCode(err), Permanent(err), err)
+	}
+	if strings.Contains(ErrorCode(err), "@") {
+		t.Fatal("code leaks an address")
+	}
+	if ErrorCode(ErrInvalid) != "invalid" || !Permanent(ErrInvalid) {
+		t.Fatal("invalid")
+	}
+	if Permanent(&SendError{Stage: "dial", Err: errors.New("refused")}) {
+		t.Fatal("dial failure is temporary")
+	}
 }

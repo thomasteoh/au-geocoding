@@ -398,9 +398,12 @@ func (s *Server) handleInviteCreate(w http.ResponseWriter, r *http.Request) {
 	}
 	s.audit(r, oc.Org.ID, "invite.create", email, "role="+role.String())
 	msg := "Invited " + email + ". They join as " + role.String() + " when they next sign in."
-	switch s.sendInviteEmail(r, oc.Org, v.User, email, role, time.Now().Add(inviteTTL)) {
-	case inviteMailSent:
-		msg += " We emailed them a sign-in link."
+	switch s.queueInviteEmail(r, oc.Org, v.User, email, role, time.Now().Add(inviteTTL)) {
+	case inviteMailQueued:
+		msg += " We are emailing them a sign-in link."
+	case inviteMailLimited:
+		msg += " No email was sent: too many invitation emails went to this address or from this organisation recently. Send them " +
+			s.abs("/auth/login") + " yourself."
 	case inviteMailFailed:
 		msg += " The invitation email could not be sent; send them " + s.abs("/auth/login") + " yourself."
 	}

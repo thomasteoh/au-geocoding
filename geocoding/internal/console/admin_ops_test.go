@@ -11,8 +11,10 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"augeocoding/internal/identity"
+	"augeocoding/internal/outbox"
 	"augeocoding/internal/publicapi"
 	"ausystem/shared/slog"
 )
@@ -43,15 +45,23 @@ func TestInviteEmail(t *testing.T) {
 	h.org("acme", owner)
 	h.ids.UpdateOrgSettings(h.ctx, mustOrg(h, "acme").ID, identity.OrgSettings{Name: "Acme\r\nBcc: eve@example.com", DefaultRole: identity.RoleViewer})
 	fm := &fakeMail{}
-	h.con.Mail = fm
 	var logs bytes.Buffer
 	h.con.Log = slog.New(&logs, slog.LevelDebug, nil)
+	worker := outbox.New(h.ids, fm, h.con.Log)
+	worker.Backoff = []time.Duration{0}
+	woken := 0
+	h.con.MailOn, h.con.MailWake = true, func() { woken++ }
 	b := h.signIn(owner)
 
+	// The handler only queues; nothing is sent on the request path.
 	r := b.post("/console/orgs/acme/invites", url.Values{"email": {"new@example.com"}, "role": {"developer"}}, true)
-	if !strings.Contains(b.flash(r), "We emailed them") {
-		t.Fatal("no sent flash")
+	if !strings.Contains(b.flash(r), "We are emailing them") || woken != 1 {
+		t.Fatalf("no queued flash / wake (%d)", woken)
 	}
+	if len(fm.sent) != 0 {
+		t.Fatal("sent on the request path")
+	}
+	worker.RunOnce(h.ctx)
 	if len(fm.sent) != 1 {
 		t.Fatalf("sent: %+v", fm.sent)
 	}
@@ -65,23 +75,49 @@ func TestInviteEmail(t *testing.T) {
 		}
 	}
 
-	// A failed send keeps the invite, says so, and logs without the address.
+	// A failing server: the invite stands, the worker retries then gives
+	// up, and nothing logged carries the address.
 	fm.err = errors.New("550 5.1.1 <second@example.com>: mailbox unavailable")
-	r = b.post("/console/orgs/acme/invites", url.Values{"email": {"second@example.com"}, "role": {"viewer"}}, true)
-	if !strings.Contains(b.flash(r), "could not be sent") {
-		t.Fatal("no failure flash")
-	}
+	b.post("/console/orgs/acme/invites", url.Values{"email": {"second@example.com"}, "role": {"viewer"}}, true)
+	worker.RunOnce(h.ctx)
 	if inv, _ := h.ids.Invites(h.ctx, mustOrg(h, "acme").ID); len(inv) != 2 {
 		t.Fatalf("invite lost on mail failure: %+v", inv)
 	}
-	if !strings.Contains(logs.String(), "invite_email_failed") || strings.Contains(logs.String(), "second@example.com") {
+	st, _ := h.ids.MailStatuses(h.ctx)
+	if len(st) != 2 || st[1].Status != identity.MailFailed || st[1].Attempts != 2 || st[1].HasBody || st[1].HasRcpt {
+		t.Fatalf("outbox: %+v", st)
+	}
+	if !strings.Contains(logs.String(), "mail_failed") || strings.Contains(logs.String(), "second@example.com") {
 		t.Fatalf("log: %s", logs.String())
+	}
+	fm.err = nil
+
+	// Per-recipient limit: re-inviting the same address a fourth time in a
+	// day still updates the invite but queues no email.
+	for i := 0; i < 2; i++ {
+		r = b.post("/console/orgs/acme/invites", url.Values{"email": {"new@example.com"}, "role": {"developer"}}, true)
+		if !strings.Contains(b.flash(r), "We are emailing them") {
+			t.Fatalf("re-invite %d not queued", i)
+		}
+	}
+	r = b.post("/console/orgs/acme/invites", url.Values{"email": {"new@example.com"}, "role": {"admin"}}, true)
+	if f := b.flash(r); !strings.Contains(f, "No email was sent") || !strings.Contains(f, "Invited new@example.com") {
+		t.Fatalf("limit flash: %q", f)
+	}
+	if st, _ := h.ids.MailStatuses(h.ctx); len(st) != 4 {
+		t.Fatalf("queued over the limit: %d rows", len(st))
+	}
+	inv, _ := h.ids.Invites(h.ctx, mustOrg(h, "acme").ID)
+	for _, i := range inv {
+		if i.Email == "new@example.com" && i.Role != identity.RoleAdmin {
+			t.Fatal("invite not updated when the email was limited")
+		}
 	}
 
 	// No mail configured: the flash says nothing about email.
-	h.con.Mail = nil
+	h.con.MailOn = false
 	r = b.post("/console/orgs/acme/invites", url.Values{"email": {"third@example.com"}, "role": {"viewer"}}, true)
-	if body := b.flash(r); strings.Contains(body, "emailed") || strings.Contains(body, "could not be sent") {
+	if body := b.flash(r); strings.Contains(body, "emailing") || strings.Contains(body, "No email was sent") || strings.Contains(body, "could not be sent") {
 		t.Fatal("mail flash without mail")
 	}
 }

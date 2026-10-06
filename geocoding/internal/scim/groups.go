@@ -258,41 +258,40 @@ func (c *call) createGroup() {
 }
 
 // replaceGroup handles PUT (full resource) and PATCH (ops on the stored
-// group). PATCH answers 204, as Okta and Entra expect; PUT returns the group.
+// group, applied inside the store transaction so concurrent PATCHes cannot
+// lose members). PATCH answers 204, as Okta and Entra expect; PUT returns
+// the group.
 func (c *call) replaceGroup(id string) {
 	ctx := c.r.Context()
-	cur, err := c.s.IDs.SCIMGroupByID(ctx, c.org, id, true)
-	if err != nil {
-		c.fail(err)
-		return
-	}
 	m, err := c.decode()
 	if err != nil {
 		c.fail(err)
 		return
 	}
-	var g scimGroup
+	var put scimGroup
+	var ops []patchOp
 	if c.r.Method == http.MethodPut {
-		if g, err = parseGroup(m); err != nil {
+		if put, err = parseGroup(m); err != nil {
 			c.fail(err)
 			return
 		}
-	} else {
-		ops, err := parsePatch(m)
-		if err != nil {
-			c.fail(err)
-			return
-		}
-		g = scimGroup{displayName: cur.DisplayName, externalID: cur.ExternalID}
-		for _, mem := range cur.Members {
-			g.members = append(g.members, mem.SCIMID)
-		}
-		if err := g.apply(ops); err != nil {
-			c.fail(err)
-			return
-		}
+	} else if ops, err = parsePatch(m); err != nil {
+		c.fail(err)
+		return
 	}
-	sg, err := c.s.IDs.ReplaceSCIMGroup(ctx, c.org, id, g.displayName, g.externalID, g.members)
+	cur, sg, err := c.s.IDs.PatchSCIMGroup(ctx, c.org, id, func(cur identity.SCIMGroup) (string, string, []string, error) {
+		g := put
+		if c.r.Method != http.MethodPut {
+			g = scimGroup{displayName: cur.DisplayName, externalID: cur.ExternalID}
+			for _, mem := range cur.Members {
+				g.members = append(g.members, mem.SCIMID)
+			}
+			if err := g.apply(ops); err != nil {
+				return "", "", nil, err
+			}
+		}
+		return g.displayName, g.externalID, g.members, nil
+	})
 	if err != nil {
 		c.fail(err)
 		return

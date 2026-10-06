@@ -306,44 +306,75 @@ func (s *Store) CreateSCIMUser(ctx context.Context, orgID int64, in SCIMUserInpu
 // no orgs); activating restores the membership. changed reports an
 // activation change: +1 reactivated, -1 deactivated, 0 none.
 func (s *Store) ReplaceSCIMUser(ctx context.Context, orgID int64, scimID string, in SCIMUserInput) (su SCIMUser, changed int, err error) {
-	email := NormaliseEmail(in.Email)
+	_, su, changed, err = s.PatchSCIMUser(ctx, orgID, scimID, func(SCIMUser) (SCIMUserInput, error) { return in, nil })
+	return su, changed, err
+}
+
+// PatchSCIMUser is a read-modify-write of a SCIM user in one transaction:
+// it takes the write lock, reads the current state, calls mutate for the
+// new state and writes it (as ReplaceSCIMUser). Concurrent patches are
+// serialised, so none is lost. An error from mutate aborts with no change.
+// prev is the state mutate saw.
+func (s *Store) PatchSCIMUser(ctx context.Context, orgID int64, scimID string, mutate func(cur SCIMUser) (SCIMUserInput, error)) (prev, su SCIMUser, changed int, err error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return su, 0, err
+		return prev, su, 0, err
 	}
 	defer tx.Rollback()
-	cur, err := scanSCIMUser(tx.QueryRowContext(ctx, scimUserSelect+` WHERE s.org_id=? AND s.scim_id=?`, orgID, scimID))
-	if err != nil {
-		return su, 0, err
+	// A write first takes SQLite's write lock (waiting out busy_timeout)
+	// before the read, as BEGIN IMMEDIATE would; a read first could act on
+	// a snapshot another writer is about to replace.
+	if _, err := tx.ExecContext(ctx, `UPDATE scim_users SET updated=updated WHERE org_id=? AND scim_id=?`, orgID, scimID); err != nil {
+		return prev, su, 0, err
 	}
+	prev, err = scanSCIMUser(tx.QueryRowContext(ctx, scimUserSelect+` WHERE s.org_id=? AND s.scim_id=?`, orgID, scimID))
+	if err != nil {
+		return prev, su, 0, err
+	}
+	in, err := mutate(prev)
+	if err != nil {
+		return prev, su, 0, err
+	}
+	if changed, err = s.replaceSCIMUserTx(ctx, tx, orgID, prev, in); err != nil {
+		return prev, su, 0, err
+	}
+	if err := tx.Commit(); err != nil {
+		return prev, su, 0, err
+	}
+	su, err = s.SCIMUserByID(ctx, orgID, scimID)
+	return prev, su, changed, err
+}
+
+func (s *Store) replaceSCIMUserTx(ctx context.Context, tx *sql.Tx, orgID int64, cur SCIMUser, in SCIMUserInput) (changed int, err error) {
+	email := NormaliseEmail(in.Email)
 	shared, err := sharedUserTx(ctx, tx, orgID, cur.UserID)
 	if err != nil {
-		return su, 0, err
+		return 0, err
 	}
 	if email != cur.Email {
 		// Only a new address is checked against verified domains, so an
 		// org that drops a domain can still deactivate its users.
 		if _, err := s.checkSCIMEmail(ctx, orgID, email); err != nil {
-			return su, 0, err
+			return 0, err
 		}
 		if shared {
-			return su, 0, ErrSCIMShared
+			return 0, ErrSCIMShared
 		}
 		if _, err := tx.ExecContext(ctx, `UPDATE users SET email=? WHERE id=?`, email, cur.UserID); err != nil {
 			if isUnique(err) {
-				return su, 0, ErrConflict
+				return 0, ErrConflict
 			}
-			return su, 0, err
+			return 0, err
 		}
 	}
 	if !shared && trimName(in.Name) != "" {
 		if _, err := tx.ExecContext(ctx, `UPDATE users SET name=? WHERE id=?`, trimName(in.Name), cur.UserID); err != nil {
-			return su, 0, err
+			return 0, err
 		}
 	}
 	if _, err := tx.ExecContext(ctx, `UPDATE scim_users SET external_id=?, active=?, data=?, updated=? WHERE org_id=? AND user_id=?`,
 		in.ExternalID, b2i(in.Active), dataOr(in.Data), now(), orgID, cur.UserID); err != nil {
-		return su, 0, err
+		return 0, err
 	}
 	switch {
 	case in.Active && !cur.Active:
@@ -354,13 +385,9 @@ func (s *Store) ReplaceSCIMUser(ctx context.Context, orgID int64, scimID string,
 		err = scimDeactivateTx(ctx, tx, orgID, cur.UserID)
 	}
 	if err != nil {
-		return su, 0, err
+		return 0, err
 	}
-	if err := tx.Commit(); err != nil {
-		return su, 0, err
-	}
-	su, err = s.SCIMUserByID(ctx, orgID, scimID)
-	return su, changed, err
+	return changed, nil
 }
 
 // DeleteSCIMUser unlinks a SCIM user: removes the scim_users row, the user's
@@ -511,6 +538,37 @@ func scimRecomputeTx(ctx context.Context, tx *sql.Tx, orgID, userID int64) error
 	}
 	_, err = tx.ExecContext(ctx, `UPDATE memberships SET role=? WHERE org_id=? AND user_id=?`, role.String(), orgID, userID)
 	return err
+}
+
+// scimRecomputeOrgTx recomputes the role of every SCIM user of an org after
+// its SCIM group mappings changed. Only SCIM-sourced memberships change.
+func scimRecomputeOrgTx(ctx context.Context, tx *sql.Tx, orgID int64) error {
+	rows, err := tx.QueryContext(ctx, `SELECT user_id FROM scim_users WHERE org_id=?`, orgID)
+	if err != nil {
+		return err
+	}
+	var uids []int64
+	for rows.Next() {
+		var uid int64
+		if err := rows.Scan(&uid); err != nil {
+			rows.Close()
+			return err
+		}
+		uids = append(uids, uid)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	// Only removing an owner mapping can demote an owner, and that change
+	// promotes nobody to owner, so user order cannot matter to the
+	// last-owner check.
+	for _, uid := range uids {
+		if err := scimRecomputeTx(ctx, tx, orgID, uid); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // --- groups ---
@@ -675,48 +733,80 @@ func (s *Store) CreateSCIMGroup(ctx context.Context, orgID int64, displayName, e
 // then recomputes the role of every user whose groups changed (all members
 // when the name changed, since mappings match on name).
 func (s *Store) ReplaceSCIMGroup(ctx context.Context, orgID int64, scimID, displayName, externalID string, members []string) (SCIMGroup, error) {
-	displayName = strings.TrimSpace(displayName)
-	if !validGroupName(displayName) {
-		return SCIMGroup{}, ErrInvalid
-	}
+	_, g, err := s.PatchSCIMGroup(ctx, orgID, scimID, func(SCIMGroup) (string, string, []string, error) {
+		return displayName, externalID, members, nil
+	})
+	return g, err
+}
+
+// PatchSCIMGroup is a read-modify-write of a group in one transaction (see
+// PatchSCIMUser): mutate gets the current group with members and returns
+// the new name, external ID and member SCIM IDs. prev is what mutate saw.
+func (s *Store) PatchSCIMGroup(ctx context.Context, orgID int64, scimID string,
+	mutate func(cur SCIMGroup) (displayName, externalID string, members []string, err error)) (prev, g SCIMGroup, err error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return SCIMGroup{}, err
+		return prev, g, err
 	}
 	defer tx.Rollback()
-	g, err := scanSCIMGroup(tx.QueryRowContext(ctx, scimGroupSelect+` WHERE g.org_id=? AND g.scim_id=?`, orgID, scimID))
-	if err != nil {
-		return g, err
+	if _, err := tx.ExecContext(ctx, `UPDATE scim_groups SET updated=updated WHERE org_id=? AND scim_id=?`, orgID, scimID); err != nil {
+		return prev, g, err
 	}
+	prev, err = scanSCIMGroup(tx.QueryRowContext(ctx, scimGroupSelect+` WHERE g.org_id=? AND g.scim_id=?`, orgID, scimID))
+	if err != nil {
+		return prev, g, err
+	}
+	if prev.Members, err = scimGroupMembers(ctx, tx, prev.ID); err != nil {
+		return prev, g, err
+	}
+	displayName, externalID, members, err := mutate(prev)
+	if err != nil {
+		return prev, g, err
+	}
+	displayName = strings.TrimSpace(displayName)
+	if !validGroupName(displayName) {
+		return prev, g, ErrInvalid
+	}
+	if err := replaceSCIMGroupTx(ctx, tx, orgID, prev, displayName, externalID, members); err != nil {
+		return prev, g, err
+	}
+	if err := tx.Commit(); err != nil {
+		return prev, g, err
+	}
+	g, err = s.SCIMGroupByID(ctx, orgID, scimID, true)
+	return prev, g, err
+}
+
+func replaceSCIMGroupTx(ctx context.Context, tx *sql.Tx, orgID int64, g SCIMGroup, displayName, externalID string, members []string) error {
 	want, err := resolveMembersTx(ctx, tx, orgID, members)
 	if err != nil {
-		return g, err
+		return err
 	}
 	have := map[int64]bool{}
 	rows, err := tx.QueryContext(ctx, `SELECT user_id FROM scim_group_members WHERE group_id=?`, g.ID)
 	if err != nil {
-		return g, err
+		return err
 	}
 	for rows.Next() {
 		var uid int64
 		if err := rows.Scan(&uid); err != nil {
 			rows.Close()
-			return g, err
+			return err
 		}
 		have[uid] = true
 	}
 	rows.Close()
 	if _, err := tx.ExecContext(ctx, `UPDATE scim_groups SET display_name=?, external_id=?, updated=? WHERE id=?`, displayName, externalID, now(), g.ID); err != nil {
 		if isUnique(err) {
-			return g, ErrConflict
+			return ErrConflict
 		}
-		return g, err
+		return err
 	}
 	affected := map[int64]bool{}
 	for uid := range have {
 		if !want[uid] {
 			if _, err := tx.ExecContext(ctx, `DELETE FROM scim_group_members WHERE group_id=? AND user_id=?`, g.ID, uid); err != nil {
-				return g, err
+				return err
 			}
 			affected[uid] = true
 		} else if displayName != g.DisplayName {
@@ -726,20 +816,17 @@ func (s *Store) ReplaceSCIMGroup(ctx context.Context, orgID int64, scimID, displ
 	for uid := range want {
 		if !have[uid] {
 			if _, err := tx.ExecContext(ctx, `INSERT INTO scim_group_members(group_id, user_id) VALUES (?,?)`, g.ID, uid); err != nil {
-				return g, err
+				return err
 			}
 			affected[uid] = true
 		}
 	}
 	for uid := range affected {
 		if err := scimRecomputeTx(ctx, tx, orgID, uid); err != nil {
-			return g, err
+			return err
 		}
 	}
-	if err := tx.Commit(); err != nil {
-		return g, err
-	}
-	return s.SCIMGroupByID(ctx, orgID, scimID, true)
+	return nil
 }
 
 // DeleteSCIMGroup deletes a group and recomputes its former members' roles.

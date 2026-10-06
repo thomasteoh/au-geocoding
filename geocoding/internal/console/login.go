@@ -82,6 +82,12 @@ func startPath(c identity.Connection, ret string) string {
 // carry a Lax cookie; the cookie is only a random binding, useless alone.
 func (s *Server) beginFlow(w http.ResponseWriter, r *http.Request, f identity.Flow) (state string, ok bool) {
 	state, binding, err := s.IDs.StartFlow(r.Context(), f)
+	if errors.Is(err, identity.ErrTooManyFlows) {
+		s.Log.Warn("auth_flows_full")
+		w.Header().Set("Retry-After", "60")
+		s.renderError(w, r, http.StatusServiceUnavailable, "Sign-in is busy. Try again in a minute.")
+		return "", false
+	}
 	if err != nil {
 		s.serverError(w, r, err)
 		return "", false

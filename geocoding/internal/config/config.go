@@ -106,6 +106,10 @@ type SMTP struct {
 	Username string `json:"username"`
 	Password string `json:"password"`
 	From     string `json:"from"`
+	// TLS is "starttls" (upgrade a plain connection; required off
+	// localhost) or "implicit" (TLS from the first byte, port 465). Empty
+	// means implicit on port 465 and starttls otherwise.
+	TLS string `json:"tls"`
 }
 
 // Auth configures the console, SSO, SCIM and API bearer tokens
@@ -125,6 +129,10 @@ type Auth struct {
 	// AllowPrivateFetch lets OIDC discovery, JWKS and SAML metadata fetches
 	// reach private and loopback addresses. Development only.
 	AllowPrivateFetch bool `json:"allow_private_fetch"`
+	// RateRPS and RateBurst size the per-client-IP token bucket on the
+	// anonymous sign-in endpoints. RateRPS 0 turns the limit off.
+	RateRPS   float64 `json:"rate_rps"`
+	RateBurst float64 `json:"rate_burst"`
 }
 
 // ConsoleEnabled reports whether the console and SSO are configured.
@@ -229,6 +237,9 @@ func validateAuth(a *Auth) []string {
 	if a.SessionIdle <= 0 || a.SessionMax <= 0 || a.SessionIdle > a.SessionMax {
 		errs = append(errs, "auth session idle and max must be positive, idle <= max")
 	}
+	if a.RateRPS < 0 || a.RateBurst < 0 || (a.RateRPS > 0 && a.RateBurst < 1) {
+		errs = append(errs, "AUGEO_AUTH_RATE_RPS must be >= 0 and AUGEO_AUTH_RATE_BURST >= 1 when the limit is on")
+	}
 	return errs
 }
 
@@ -252,6 +263,17 @@ func validateSMTP(m *SMTP) []string {
 	}
 	if m.Password != "" && m.Username == "" {
 		errs = append(errs, "AUGEO_SMTP_PASSWORD needs AUGEO_SMTP_USERNAME")
+	}
+	m.TLS = strings.ToLower(strings.TrimSpace(m.TLS))
+	switch m.TLS {
+	case "":
+		m.TLS = "starttls"
+		if m.Port == 465 {
+			m.TLS = "implicit"
+		}
+	case "starttls", "implicit":
+	default:
+		errs = append(errs, "AUGEO_SMTP_TLS must be implicit or starttls")
 	}
 	return errs
 }
@@ -316,6 +338,8 @@ func setDefaults(c *Config) {
 	c.Auth.SessionIdle = 8 * 3600
 	c.Auth.SessionMax = 7 * 24 * 3600
 	c.Auth.JWTBearer = true
+	c.Auth.RateRPS = 1
+	c.Auth.RateBurst = 20
 	c.SMTP.Port = 587
 }
 
@@ -425,6 +449,8 @@ func applyEnv(c *Config) {
 	str("AUTH_PROVIDERS_FILE", &c.Auth.ProvidersFile)
 	boolean("AUTH_JWT_BEARER", &c.Auth.JWTBearer)
 	boolean("AUTH_ALLOW_PRIVATE_FETCH", &c.Auth.AllowPrivateFetch)
+	flt("AUTH_RATE_RPS", &c.Auth.RateRPS)
+	flt("AUTH_RATE_BURST", &c.Auth.RateBurst)
 	if v, ok := os.LookupEnv("AUGEO_AUTH_BOOTSTRAP_ADMINS"); ok {
 		c.Auth.BootstrapAdmins = nil
 		for _, e := range strings.Split(v, ",") {
@@ -438,6 +464,7 @@ func applyEnv(c *Config) {
 	num("SMTP_PORT", &c.SMTP.Port)
 	str("SMTP_USERNAME", &c.SMTP.Username)
 	str("SMTP_FROM", &c.SMTP.From)
+	str("SMTP_TLS", &c.SMTP.TLS)
 	secretFromEnv("SMTP_PASSWORD", &c.SMTP.Password)
 
 	// LLM enabled only when BaseURL is set.

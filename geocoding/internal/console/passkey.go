@@ -59,6 +59,12 @@ func readPasskeyFinish(w http.ResponseWriter, r *http.Request) (passkeyFinish, b
 // with the state and the browser options.
 func (s *Server) beginPasskeyFlow(w http.ResponseWriter, r *http.Request, f identity.Flow, opts passkey.Options) {
 	state, binding, err := s.IDs.StartFlow(r.Context(), f)
+	if errors.Is(err, identity.ErrTooManyFlows) {
+		s.Log.Warn("auth_flows_full")
+		w.Header().Set("Retry-After", "60")
+		jsonError(w, http.StatusServiceUnavailable, "Sign-in is busy. Try again in a minute.")
+		return
+	}
 	if err != nil {
 		s.Log.Error("console_error", "path", r.URL.Path, "error", err.Error())
 		jsonError(w, http.StatusInternalServerError, "Something went wrong. Try again.")

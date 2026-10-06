@@ -224,15 +224,39 @@ type Flow struct {
 // FlowTTL bounds how long a user has to complete a login at the IdP.
 const FlowTTL = 10 * time.Minute
 
+// MaxFlows caps unexpired login flows so anonymous sign-in starts cannot
+// grow app.db without bound. Past it StartFlow returns ErrTooManyFlows.
+var MaxFlows = 100000
+
+// ErrTooManyFlows: MaxFlows unexpired flows exist.
+var ErrTooManyFlows = errors.New("too many sign-in attempts in progress")
+
 // StartFlow stores a flow and returns the state (sent to the IdP) and the
 // binding (set as the flow cookie).
 func (s *Store) StartFlow(ctx context.Context, f Flow) (state, binding string, err error) {
 	state, binding = RandomToken(32), RandomToken(32)
-	s.db.ExecContext(ctx, `DELETE FROM auth_flows WHERE expires<?`, now())
-	_, err = s.db.ExecContext(ctx, `INSERT INTO auth_flows(state_hash, binding, kind, connection_id, nonce, pkce_verifier, request_id, return_to, data, user_id, expires)
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return "", "", err
+	}
+	defer tx.Rollback()
+	// The prune is a write, so the count below runs under the write lock.
+	if _, err := tx.ExecContext(ctx, `DELETE FROM auth_flows WHERE expires<?`, now()); err != nil {
+		return "", "", err
+	}
+	var n int
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM auth_flows`).Scan(&n); err != nil {
+		return "", "", err
+	}
+	if n >= MaxFlows {
+		return "", "", ErrTooManyFlows
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO auth_flows(state_hash, binding, kind, connection_id, nonce, pkce_verifier, request_id, return_to, data, user_id, expires)
 		VALUES (?,?,?,?,?,?,?,?,?,?,?)`, HashToken(state), binding, f.Kind, nullID(f.ConnectionID), f.Nonce, f.PKCEVerifier, f.RequestID, f.ReturnTo,
-		f.Data, nullID(f.UserID), ts(clock().Add(FlowTTL)))
-	return state, binding, err
+		f.Data, nullID(f.UserID), ts(clock().Add(FlowTTL))); err != nil {
+		return "", "", err
+	}
+	return state, binding, tx.Commit()
 }
 
 // TakeFlow consumes a flow by state. The binding from the browser's flow

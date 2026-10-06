@@ -220,6 +220,31 @@ CREATE INDEX idx_audit_org_ts ON audit_events(org_id, ts);
 `,
 	// 2: Entra tenant allowlist on connections.
 	`ALTER TABLE connections ADD COLUMN allowed_tenants TEXT NOT NULL DEFAULT '';`,
+	// 3: outbound mail queue (invite emails). recipient and body are blanked
+	// once a message is sent or has finally failed; the row stays a while
+	// (with the recipient hash) for rate limiting.
+	`
+CREATE TABLE mail_outbox (
+	id             INTEGER PRIMARY KEY AUTOINCREMENT,
+	org_id         INTEGER REFERENCES orgs(id) ON DELETE CASCADE,
+	kind           TEXT NOT NULL,
+	recipient      TEXT NOT NULL,
+	recipient_hash BLOB NOT NULL,
+	subject        TEXT NOT NULL,
+	body           TEXT NOT NULL,
+	status         TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','sent','failed')),
+	attempts       INTEGER NOT NULL DEFAULT 0,
+	next_attempt   TEXT NOT NULL,
+	last_error     TEXT NOT NULL DEFAULT '',
+	created        TEXT NOT NULL,
+	updated        TEXT NOT NULL
+);
+CREATE INDEX idx_mail_outbox_due ON mail_outbox(status, next_attempt);
+CREATE INDEX idx_mail_outbox_org ON mail_outbox(org_id, created);
+CREATE INDEX idx_mail_outbox_rcpt ON mail_outbox(recipient_hash, created);
+-- StartFlow prunes expired flows on every call.
+CREATE INDEX idx_auth_flows_expires ON auth_flows(expires);
+`,
 }
 
 func migrate(db *sql.DB) error {
