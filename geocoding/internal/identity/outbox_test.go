@@ -16,14 +16,18 @@ func TestMailOutboxRateLimits(t *testing.T) {
 	}
 	other, _ := s.CreateOrg(ctx, "Beta", "beta", owner.ID, false, false)
 
-	// Per recipient, across orgs and case-insensitively.
-	for i, o := range []int64{org.ID, other.ID, org.ID} {
-		if err := s.EnqueueInviteMail(ctx, o, "Ada@example.com", "s", "b"); err != nil {
+	// Per recipient per org, case-insensitively: one org cannot use up
+	// another org's allowance for the same address.
+	for i := 0; i < MailRecipientPerDay; i++ {
+		if err := s.EnqueueInviteMail(ctx, org.ID, "Ada@example.com", "s", "b"); err != nil {
 			t.Fatalf("send %d: %v", i, err)
 		}
 	}
-	if err := s.EnqueueInviteMail(ctx, other.ID, "ada@example.com", "s", "b"); !errors.Is(err, ErrMailRateLimited) {
-		t.Fatalf("4th to one recipient: %v", err)
+	if err := s.EnqueueInviteMail(ctx, org.ID, "ada@example.com", "s", "b"); !errors.Is(err, ErrMailRateLimited) {
+		t.Fatalf("4th from one org: %v", err)
+	}
+	if err := s.EnqueueInviteMail(ctx, other.ID, "ada@example.com", "s", "b"); err != nil {
+		t.Fatalf("other org blocked by first org's sends: %v", err)
 	}
 	// Finishing a message does not reset the count.
 	due, _ := s.DueMail(ctx, 10)
@@ -34,8 +38,8 @@ func TestMailOutboxRateLimits(t *testing.T) {
 		t.Fatalf("after send: %v", err)
 	}
 
-	// Per org per hour: org already queued 2.
-	for i := 2; i < MailOrgPerHour; i++ {
+	// Per org per hour: org already queued 3.
+	for i := 3; i < MailOrgPerHour; i++ {
 		if err := s.EnqueueInviteMail(ctx, org.ID, fmt.Sprintf("u%d@example.com", i), "s", "b"); err != nil {
 			t.Fatalf("org send %d: %v", i, err)
 		}
@@ -119,5 +123,28 @@ func TestStartFlowCap(t *testing.T) {
 	clock = func() time.Time { return oldClock().Add(FlowTTL + time.Minute) }
 	if _, _, err := s.StartFlow(ctx, Flow{Kind: "oidc"}); err != nil {
 		t.Fatalf("after expiry: %v", err)
+	}
+}
+
+func TestMailRecipientGlobalLimit(t *testing.T) {
+	s := newStore(t)
+	owner, _ := s.CreateUser(ctx, "owner@acme.example", "")
+	sent := 0
+	for i := 0; sent < MailRecipientGlobalPerDay+5; i++ {
+		o, err := s.CreateOrg(ctx, fmt.Sprintf("Org %d", i), "", owner.ID, false, true)
+		if err != nil {
+			t.Fatal(err)
+		}
+		err = s.EnqueueInviteMail(ctx, o.ID, "victim@example.com", "s", "b")
+		if errors.Is(err, ErrMailRateLimited) {
+			break
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		sent++
+	}
+	if sent != MailRecipientGlobalPerDay {
+		t.Fatalf("global cap: %d sent", sent)
 	}
 }

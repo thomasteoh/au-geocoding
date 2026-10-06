@@ -399,11 +399,13 @@ link and the expiry. Sending is off the request path:
 - Recipient and body are blanked when a message is sent or finally fails.
   `last_error` holds only a short code such as `dial`, `starttls`,
   `rcpt_550` or `tls_timeout`. Finished rows (no address, no body, a salted
-  SHA-256 of the address) are deleted after 48 hours.
+  HMAC of the address, keyed from `AUGEO_SECRET_KEY`) are deleted after 48
+  hours.
 - Logs (`mail_sent`, `mail_retry`, `mail_failed`) carry the outbox ID, org ID,
   attempt and code, never the recipient's address.
-- Rate limits: an org may queue 50 invite emails per hour, and one address
-  may receive 3 per day across all orgs. Over either limit the invite is
+- Rate limits: an org may queue 50 invite emails per hour and 3 per day to
+  any one address; one address receives at most 20 per day from all orgs
+  together. Over either limit the invite is
   still created (or renewed) but no email is queued, and the console tells
   the inviter to send the sign-in link themselves.
 - A failure never fails the invite. An invite deleted before its email goes

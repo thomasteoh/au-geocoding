@@ -16,8 +16,13 @@ import (
 // Invite mail rate limits. Over either limit EnqueueInviteMail returns
 // ErrMailRateLimited and queues nothing.
 var (
-	MailOrgPerHour      = 50 // invite emails one org may queue per hour
-	MailRecipientPerDay = 3  // invite emails one address may receive per day, across orgs
+	MailOrgPerHour = 50 // invite emails one org may queue per hour
+	// MailRecipientPerDay bounds emails from one org to one address, so one
+	// org cannot use up another org's allowance for that address.
+	MailRecipientPerDay = 3
+	// MailRecipientGlobalPerDay bounds emails to one address from all orgs
+	// together, so many throwaway orgs cannot flood a mailbox.
+	MailRecipientGlobalPerDay = 20
 )
 
 // MailRetention is how long finished outbox rows (without recipient or body)
@@ -45,7 +50,13 @@ type QueuedMail struct {
 	Attempts int // failed attempts so far
 }
 
-func recipientHash(to string) []byte {
+// recipientHash identifies an address for rate limiting without storing
+// it. With a secret box it is keyed, so the hash cannot be matched against
+// guessed addresses.
+func (s *Store) recipientHash(to string) []byte {
+	if s.box != nil {
+		return s.box.MAC("mail-rcpt\x00" + NormaliseEmail(to))
+	}
 	h := sha256.Sum256([]byte("augeo-mail-rcpt\x00" + NormaliseEmail(to)))
 	return h[:]
 }
@@ -65,14 +76,16 @@ func (s *Store) EnqueueInviteMail(ctx context.Context, orgID int64, to, subject,
 	if _, err := tx.ExecContext(ctx, `DELETE FROM mail_outbox WHERE status<>? AND updated<?`, MailPending, ts(t.Add(-MailRetention))); err != nil {
 		return err
 	}
-	rh := recipientHash(to)
-	var nOrg, nRcpt int
+	rh := s.recipientHash(to)
+	day := ts(t.Add(-24 * time.Hour))
+	var nOrg, nRcpt, nGlobal int
 	if err := tx.QueryRowContext(ctx, `SELECT (SELECT COUNT(*) FROM mail_outbox WHERE org_id=? AND created>?),
+		(SELECT COUNT(*) FROM mail_outbox WHERE recipient_hash=? AND org_id IS ? AND created>?),
 		(SELECT COUNT(*) FROM mail_outbox WHERE recipient_hash=? AND created>?)`,
-		orgID, ts(t.Add(-time.Hour)), rh, ts(t.Add(-24*time.Hour))).Scan(&nOrg, &nRcpt); err != nil {
+		orgID, ts(t.Add(-time.Hour)), rh, nullID(orgID), day, rh, day).Scan(&nOrg, &nRcpt, &nGlobal); err != nil {
 		return err
 	}
-	if nOrg >= MailOrgPerHour || nRcpt >= MailRecipientPerDay {
+	if nOrg >= MailOrgPerHour || nRcpt >= MailRecipientPerDay || nGlobal >= MailRecipientGlobalPerDay {
 		return ErrMailRateLimited
 	}
 	if _, err := tx.ExecContext(ctx, `INSERT INTO mail_outbox(org_id, kind, recipient, recipient_hash, subject, body, next_attempt, created, updated)
