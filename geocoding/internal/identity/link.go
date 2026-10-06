@@ -179,4 +179,3 @@ func (s *Store) LinkableConnections(ctx context.Context, userID int64) ([]Connec
 	}
 	return conns, nil
 }
-
