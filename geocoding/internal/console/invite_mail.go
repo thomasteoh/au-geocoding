@@ -1,7 +1,6 @@
 package console
 
 import (
-	"context"
 	"errors"
 	"net/http"
 	"strings"
@@ -9,22 +8,23 @@ import (
 	"unicode"
 
 	"augeocoding/internal/identity"
-	"augeocoding/internal/mail"
 )
 
 // inviteMailResult says what happened to an invite email.
 type inviteMailResult int
 
 const (
-	inviteMailOff    inviteMailResult = iota // no mail server configured
-	inviteMailSent                           // handed to the mail server
-	inviteMailFailed                         // configured, but sending failed
+	inviteMailOff     inviteMailResult = iota // no mail server configured
+	inviteMailQueued                          // in the outbox; the worker sends it
+	inviteMailLimited                         // over the org or recipient rate limit; not queued
+	inviteMailFailed                          // configured, but queueing failed
 )
 
-// sendInviteEmail emails an invitee. A failure never fails the invite: it
-// is logged (without the address) and reported back to the caller.
-func (s *Server) sendInviteEmail(r *http.Request, org identity.Org, inviter identity.User, to string, role identity.Role, expires time.Time) inviteMailResult {
-	if s.Mail == nil {
+// queueInviteEmail puts an invite email in the outbox and returns at once;
+// the outbox worker delivers it with retries. A failure never fails the
+// invite: it is logged (without the address) and reported to the caller.
+func (s *Server) queueInviteEmail(r *http.Request, org identity.Org, inviter identity.User, to string, role identity.Role, expires time.Time) inviteMailResult {
+	if !s.MailOn {
 		return inviteMailOff
 	}
 	who := oneLine(inviter.Name)
@@ -40,18 +40,18 @@ func (s *Server) sendInviteEmail(r *http.Request, org identity.Org, inviter iden
 		"  " + s.abs("/auth/login") + "\n\n" +
 		"The invitation expires on " + expires.UTC().Format("2 January 2006 15:04 MST") + ".\n\n" +
 		"If you were not expecting this, you can ignore this email.\n"
-	ctx, cancel := context.WithTimeout(r.Context(), mail.Timeout)
-	defer cancel()
-	err := s.Mail.Send(ctx, to, subject, body)
+	err := s.IDs.EnqueueInviteMail(r.Context(), org.ID, to, subject, body)
 	switch {
 	case err == nil:
-		return inviteMailSent
-	case errors.Is(err, mail.ErrDisabled):
-		return inviteMailOff
+		if s.MailWake != nil {
+			s.MailWake()
+		}
+		return inviteMailQueued
+	case errors.Is(err, identity.ErrMailRateLimited):
+		s.Log.Warn("invite_email_rate_limited", "org_id", org.ID)
+		return inviteMailLimited
 	}
-	// SMTP replies often echo the recipient; keep addresses out of logs.
-	msg := strings.ReplaceAll(err.Error(), to, "<recipient>")
-	s.Log.Warn("invite_email_failed", "org_id", org.ID, "error", msg)
+	s.Log.Error("invite_email_queue_failed", "org_id", org.ID, "error", strings.ReplaceAll(err.Error(), to, "<recipient>"))
 	return inviteMailFailed
 }
 

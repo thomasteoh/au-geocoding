@@ -29,6 +29,7 @@ import (
 	"augeocoding/internal/llm"
 	"augeocoding/internal/mail"
 	"augeocoding/internal/oidcrp"
+	"augeocoding/internal/outbox"
 	"augeocoding/internal/placesclient"
 	"augeocoding/internal/publicapi"
 	"augeocoding/internal/safehttp"
@@ -114,6 +115,10 @@ func main() {
 	// Console, SSO and SCIM (docs/auth.md). Off unless AUGEO_PUBLIC_URL and
 	// AUGEO_SECRET_KEY are set.
 	var con *console.Server
+	// Background work (the mail outbox) stops when bgCtx ends at shutdown.
+	bgCtx, bgStop := context.WithCancel(context.Background())
+	defer bgStop()
+	var bgDone []chan struct{}
 	if cfg.Auth.ConsoleEnabled() {
 		if cfg.Auth.ProvidersFile != "" {
 			warnings, err := console.LoadProviders(context.Background(), ids, cfg.Auth.ProvidersFile)
@@ -135,15 +140,25 @@ func main() {
 			log.Error("boot_failed", "reason", "console", "error", err.Error())
 			os.Exit(1)
 		}
+		con.ClientIP = func(r *http.Request) string { return clientIP(r, cfg.Server.TrustedProxy) }
+		if cfg.Auth.RateRPS > 0 {
+			con.AuthLimiter = publicapi.NewRateLimiter(cfg.Auth.RateRPS, cfg.Auth.RateBurst)
+		}
 		if cfg.SMTP.Host != "" {
-			sender, err := mail.NewSMTP(mail.Config{Host: cfg.SMTP.Host, Port: cfg.SMTP.Port, Username: cfg.SMTP.Username, Password: cfg.SMTP.Password, From: cfg.SMTP.From})
+			sender, err := mail.NewSMTP(mail.Config{Host: cfg.SMTP.Host, Port: cfg.SMTP.Port, Username: cfg.SMTP.Username, Password: cfg.SMTP.Password,
+				From: cfg.SMTP.From, TLS: cfg.SMTP.TLS})
 			if err != nil {
 				log.Error("boot_failed", "reason", "smtp", "error", err.Error())
 				os.Exit(1)
 			}
-			con.Mail = sender
+			worker := outbox.New(ids, sender, log)
+			con.MailOn, con.MailWake = true, worker.Wake
+			done := make(chan struct{})
+			bgDone = append(bgDone, done)
+			go func() { defer close(done); worker.Run(bgCtx) }()
 		}
-		log.Info("console_enabled", "public_url", cfg.Auth.PublicURL, "signup", cfg.Auth.Signup, "invite_email", cfg.SMTP.Host != "")
+		log.Info("console_enabled", "public_url", cfg.Auth.PublicURL, "signup", cfg.Auth.Signup, "invite_email", cfg.SMTP.Host != "",
+			"smtp_tls", cfg.SMTP.TLS, "auth_rate_rps", cfg.Auth.RateRPS)
 	}
 
 	// LLM: runtime-configurable provider client (rung 5). The holder is seeded
@@ -198,6 +213,15 @@ func main() {
 		ctx, cancel := context.WithTimeout(context.Background(), time.Duration(cfg.Server.ShutdownGrace)*time.Second)
 		defer cancel()
 		_ = srv.Shutdown(ctx)
+		// Stop background workers; a send in flight is abandoned and left
+		// pending for the next start.
+		bgStop()
+		for _, d := range bgDone {
+			select {
+			case <-d:
+			case <-ctx.Done():
+			}
+		}
 		close(done)
 	}()
 

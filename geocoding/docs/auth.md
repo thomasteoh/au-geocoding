@@ -77,6 +77,22 @@ callback requires the cookie to match, which stops an attacker from
 completing a flow they started in someone else's browser (login CSRF). The
 row is deleted on first use.
 
+At most 100,000 unexpired flows exist at once; past that a new sign-in start
+gets a 503 "Sign-in is busy" page (JSON for passkeys) until flows expire, so
+anonymous starts cannot grow app.db without bound.
+
+### Rate limits
+
+The anonymous sign-in endpoints share a token bucket per client IP
+(`AUGEO_AUTH_RATE_RPS`, `AUGEO_AUTH_RATE_BURST`; default 1/s, burst 20):
+`POST /auth/discover`, `GET`/`POST /auth/{oidc,saml}/{id}/start`, the OIDC
+callback, the SAML ACS and `POST /auth/passkey/login/begin` and `/finish`. A
+full sign-in uses two or three tokens. Over the limit the answer is 429 with
+`Retry-After`: an error page, or JSON for the passkey endpoints. The client
+IP is the TCP peer, or the `X-Forwarded-For` client when the peer is
+`AUGEO_TRUSTED_PROXY` (the same rule as the public API). Buckets live in
+memory, per process.
+
 `return_to` must be a relative path starting with `/console`; anything else
 becomes `/console`.
 
@@ -205,7 +221,9 @@ into a user:
    later revocation sticks.
 5. **Group mappings.** For org connections with mappings, the member's role
    becomes the highest role whose group appears in the assertion; with no
-   match, the org's default role (JIT) or the existing manual role.
+   match, the org's default role (JIT) or the existing manual role. The
+   IdP's groups are only known at sign-in, so adding or removing an SSO
+   mapping changes members' roles at their next sign-in, not at once.
 6. A brand-new user with no membership gets a personal org where they are
    owner, so a self-signup user can create keys at once.
 
@@ -302,7 +320,13 @@ are accepted and ignored.
 - Tokens are shown once, stored hashed, revocable, and every SCIM write is
   audited with actor `scim` (`scim.user.create`, `.update`, `.deactivate`,
   `.reactivate`, `.delete`, `scim.group.create`, `.update`, `.delete`).
-  Mapping edits in the console apply at the next SCIM change for each user.
+- Adding or removing a SCIM group mapping in the console recomputes the role
+  of every SCIM-sourced membership in the org at once, under the same rules
+  (manual and invite memberships untouched). If that would demote the last
+  owner the mapping change is refused and the console says so.
+- `PATCH` on a user or group is one transaction: the store takes SQLite's
+  write lock, reads the resource, applies the operations and writes it back,
+  so concurrent PATCHes from an IdP are serialised and none is lost.
 
 ## API: bearer tokens
 
@@ -348,17 +372,42 @@ origin checks, and an audit event.
 | `AUGEO_AUTH_SESSION_IDLE` | `28800` | Seconds |
 | `AUGEO_AUTH_SESSION_MAX` | `604800` | Seconds |
 | `AUGEO_AUTH_PROVIDERS_FILE` | | JSON list of platform connections to upsert at boot (see below) |
-| `AUGEO_SMTP_HOST` | (unset: no invite emails) | SMTP submission server for invite emails. STARTTLS is required unless the host is `localhost` or a loopback address |
-| `AUGEO_SMTP_PORT` | `587` | SMTP port (STARTTLS; implicit TLS on 465 is not supported) |
+| `AUGEO_AUTH_RATE_RPS` | `1` | Per-client-IP refill rate (requests/second) on the anonymous sign-in endpoints; `0` turns the limit off |
+| `AUGEO_AUTH_RATE_BURST` | `20` | Bucket size for the above |
+| `AUGEO_SMTP_HOST` | (unset: no invite emails) | SMTP submission server for invite emails. With `starttls`, STARTTLS is required unless the host is `localhost` or a loopback address |
+| `AUGEO_SMTP_PORT` | `587` | SMTP port |
+| `AUGEO_SMTP_TLS` | `starttls` (`implicit` on port 465) | `starttls` upgrades a plain connection; `implicit` speaks TLS from the first byte (SMTPS, port 465). The certificate must be valid for the host |
 | `AUGEO_SMTP_USERNAME` | | Enables SMTP PLAIN auth (only over TLS, or to localhost) |
 | `AUGEO_SMTP_PASSWORD` / `_FILE` | | SMTP password; redacted in the boot log |
 | `AUGEO_SMTP_FROM` | (required with host) | Sender, `noreply@geo.example.com` or `Geocoder <noreply@geo.example.com>` |
 
+### Invite emails
+
 When SMTP is configured, inviting someone emails them a plain-text message
 naming the inviter, organisation, role, the `{AUGEO_PUBLIC_URL}/auth/login`
-link and the expiry. A failed send never fails the invite: the console says
-the email could not be sent and logs `invite_email_failed` with the org ID and
-the error, never the recipient's address.
+link and the expiry. Sending is off the request path:
+
+- The invite handler writes the message to the `mail_outbox` table in app.db
+  and returns; the console says "We are emailing them a sign-in link".
+- A background worker (started at boot when SMTP is configured, stopped on
+  shutdown) sends due messages every 30 seconds and at once after an
+  enqueue. A failed attempt is retried after 1 minute, 5 minutes, 30
+  minutes, 2 hours and 2 hours; after the sixth attempt, or at once for a
+  permanent failure (a 5xx reply to MAIL, RCPT or DATA, or an invalid
+  address), the message is marked `failed`. A send cut off by shutdown stays
+  pending and does not count as an attempt.
+- Recipient and body are blanked when a message is sent or finally fails.
+  `last_error` holds only a short code such as `dial`, `starttls`,
+  `rcpt_550` or `tls_timeout`. Finished rows (no address, no body, a salted
+  SHA-256 of the address) are deleted after 48 hours.
+- Logs (`mail_sent`, `mail_retry`, `mail_failed`) carry the outbox ID, org ID,
+  attempt and code, never the recipient's address.
+- Rate limits: an org may queue 50 invite emails per hour, and one address
+  may receive 3 per day across all orgs. Over either limit the invite is
+  still created (or renewed) but no email is queued, and the console tells
+  the inviter to send the sign-in link themselves.
+- A failure never fails the invite. An invite deleted before its email goes
+  out does not cancel the email.
 
 Platform connections can be managed in the admin console or declared in the
 providers file so deployments are reproducible:
@@ -413,6 +462,7 @@ labels, never secrets, raw tokens or queries.
 | A9 | SCIM token theft | Hashed at rest, org-scoped, revocable, audited; SCIM can only touch its own org |
 | A10 | Stolen session cookie | `__Host-`, `HttpOnly`, `Secure`, `SameSite=Lax`; idle and absolute expiry; user-visible session list |
 | A11 | Secrets exposure via DB copy | Client secrets and SAML keys sealed with `AUGEO_SECRET_KEY`; tokens hashed |
+| A12 | Sign-in endpoint flooding (DB growth, IdP metadata fetches, mail bombing) | Per-IP token buckets on anonymous auth endpoints; cap on unexpired `auth_flows`; per-org and per-recipient invite email limits |
 
 ## Invites
 
