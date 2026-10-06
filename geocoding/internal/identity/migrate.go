@@ -228,6 +228,10 @@ CREATE INDEX idx_audit_org_ts ON audit_events(org_id, ts);
 	PRIMARY KEY (id_hash, connection_id)
 );
 CREATE INDEX idx_session_proofs_conn ON session_proofs(connection_id);`,
+	// 4: SAML NameID format and qualifiers (JSON) for LogoutRequest, and
+	// lookup of SAML logout flows by request ID.
+	`ALTER TABLE sessions ADD COLUMN idp_sub_qual TEXT NOT NULL DEFAULT '';
+CREATE INDEX idx_auth_flows_request ON auth_flows(request_id);`,
 }
 
 func migrate(db *sql.DB) error {

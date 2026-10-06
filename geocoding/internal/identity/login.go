@@ -22,6 +22,7 @@ type Assertion struct {
 	// then left as they are rather than recomputed from an empty list.
 	GroupsUnknown bool
 	IdPSID        string
+	IdPSubQual    NameIDQualifiers // SAML only
 	IDToken       string
 }
 

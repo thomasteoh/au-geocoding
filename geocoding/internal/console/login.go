@@ -207,7 +207,7 @@ func (s *Server) completeLogin(w http.ResponseWriter, r *http.Request, a identit
 		return
 	}
 	if !s.startSession(w, r, res.User, identity.NewSession{ConnectionID: a.Connection.ID, Method: method, IdPSID: a.IdPSID,
-		IdPSub: a.Subject, IDToken: a.IDToken}) {
+		IdPSub: a.Subject, IdPSubQual: a.IdPSubQual, IDToken: a.IDToken}) {
 		return
 	}
 	detail := method + " via " + a.Connection.Slug
@@ -259,8 +259,7 @@ func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
 	s.IDs.DeleteSession(r.Context(), v.Session.IDHash)
 	clearCookie(w, sessionCookie, http.SameSiteLaxMode)
 	s.audit(r, 0, "logout", "", v.Session.Method)
-	if u, ok := s.samlLogoutURL(r, v.Session); ok {
-		http.Redirect(w, r, u, http.StatusSeeOther)
+	if s.samlLogout(w, r, v.Session) {
 		return
 	}
 	if v.Session.ConnectionID != 0 && (v.Session.Method == identity.KindOIDC) {
