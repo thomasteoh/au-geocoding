@@ -1,10 +1,14 @@
 package console
 
 import (
+	"context"
+	"errors"
 	"net/http"
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/crewjam/saml"
 
 	"augeocoding/internal/identity"
 	"augeocoding/internal/samlsp"
@@ -112,35 +116,72 @@ func (s *Server) handleSAMLACS(w http.ResponseWriter, r *http.Request) {
 	s.completeLogin(w, r, samlsp.ToAssertion(c, sa), f.ReturnTo, identity.KindSAML)
 }
 
-// samlLogoutURL is SP-initiated single logout: the IdP SLO URL with a signed
-// LogoutRequest for a SAML session that was just ended locally. ok is false
-// when the connection or its IdP does not support it, and the caller falls
-// back to the local sign-out page.
-func (s *Server) samlLogoutURL(r *http.Request, sess identity.Session) (string, bool) {
+// flowSAMLLogout records an SP-initiated LogoutRequest so the IdP's
+// LogoutResponse can be matched to it (InResponseTo) and to this browser.
+const flowSAMLLogout = "saml-logout"
+
+// samlLogout is SP-initiated single logout for a SAML session that was just
+// ended locally: it records the LogoutRequest ID against this browser and
+// sends the signed request to the IdP (redirect, or an auto-submitted POST
+// form when the IdP only has an HTTP-POST endpoint). It returns false, having
+// written nothing, when the connection or its IdP does not support it, and
+// the caller falls back to the local sign-out page.
+func (s *Server) samlLogout(w http.ResponseWriter, r *http.Request, sess identity.Session) bool {
 	if sess.Method != identity.KindSAML || sess.ConnectionID == 0 || sess.IdPSub == "" {
-		return "", false
+		return false
 	}
 	c, err := s.IDs.ConnectionByID(r.Context(), sess.ConnectionID)
 	if err != nil || c.Kind != identity.KindSAML {
-		return "", false
+		return false
 	}
 	sp, err := samlsp.New(s.Cfg.PublicURL, c)
 	if err != nil || !samlsp.HasSLO(sp) {
-		return "", false
+		return false
 	}
-	u, err := samlsp.LogoutRequestURL(sp, sess.IdPSub, sess.IdPSID)
+	out, err := samlsp.LogoutRequest(sp, sess.IdPSub, sess.IdPSubQual, sess.IdPSID)
 	if err != nil {
 		s.Log.Warn("saml_logout_failed", "connection", c.Slug, "error", err.Error())
-		return "", false
+		return false
 	}
-	return u, true
+	if _, ok := s.beginFlow(w, r, identity.Flow{Kind: flowSAMLLogout, ConnectionID: c.ID, RequestID: out.ID}); !ok {
+		return true
+	}
+	s.sendSAML(w, r, out, http.StatusSeeOther)
+	return true
+}
+
+// samlPostData is the auto-submitting form for the HTTP-POST binding.
+type samlPostData struct {
+	Action, Param, Value, RelayState string
+}
+
+// sendSAML delivers an outbound logout message: a redirect for
+// HTTP-Redirect, or a page whose form posts it to the IdP for HTTP-POST
+// (static/autosubmit.js submits it; the button is the no-script path).
+func (s *Server) sendSAML(w http.ResponseWriter, r *http.Request, out *samlsp.Outbound, redirectStatus int) {
+	if out.Binding != saml.HTTPPostBinding {
+		http.Redirect(w, r, out.URL, redirectStatus)
+		return
+	}
+	// The local session is gone; render without the signed-in header.
+	r = r.WithContext(context.WithValue(r.Context(), viewerKey, (*Viewer)(nil)))
+	s.render(w, r, http.StatusOK, "saml_post", Page{Title: "Signing out",
+		Data: samlPostData{Action: out.URL, Param: out.Param, Value: out.Value, RelayState: out.RelayState}})
+}
+
+// rejectSLO answers a logout message that failed a check. The audit detail
+// is a short reason code; neither it nor the log includes the message.
+func (s *Server) rejectSLO(w http.ResponseWriter, r *http.Request, c identity.Connection, code, detail string) {
+	s.Log.Warn("saml_logout_rejected", "connection", c.Slug, "reason", code, "error", detail)
+	s.audit(r, c.OrgID, "logout.saml_rejected", c.Slug, code)
+	s.loginPage(w, r, http.StatusBadRequest, loginData{}, "That sign-out message could not be verified.")
 }
 
 // handleSAMLSLO is the single logout service, for both bindings. A
-// LogoutResponse answers our own LogoutRequest (the local session is already
-// gone); a LogoutRequest is IdP-initiated logout. Like the ACS it arrives
-// cross-site, so there is no Origin check: the IdP's signature is what
-// authorises it.
+// LogoutResponse must answer a LogoutRequest this browser sent (the local
+// session is already gone); a LogoutRequest is IdP-initiated logout. Like
+// the ACS it arrives cross-site, so there is no Origin check: the IdP's
+// signature is what authorises it.
 func (s *Server) handleSAMLSLO(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, samlsp.MaxResponseBytes)
 	c, err := s.IDs.ConnectionBySlug(r.Context(), r.PathValue("conn"))
@@ -156,12 +197,21 @@ func (s *Server) handleSAMLSLO(w http.ResponseWriter, r *http.Request) {
 	}
 	m, err := samlsp.ParseLogout(sp, r)
 	if err != nil {
-		// The detail names the failed check; it never includes the message.
-		s.Log.Warn("saml_logout_rejected", "connection", c.Slug, "error", err.Error())
-		s.loginPage(w, r, http.StatusBadRequest, loginData{}, "That sign-out message could not be verified.")
+		s.rejectSLO(w, r, c, samlsp.RejectCode(err), err.Error())
 		return
 	}
-	if m.Response != nil {
+	if resp := m.Response; resp != nil {
+		// Only a response to a request this browser sent, once.
+		_, err := s.IDs.TakeFlowByRequest(r.Context(), flowSAMLLogout, c.ID, resp.InResponseTo, cookieValue(r, flowCookie))
+		clearCookie(w, flowCookie, http.SameSiteNoneMode)
+		if errors.Is(err, identity.ErrNotFound) {
+			s.rejectSLO(w, r, c, "unsolicited_response", "LogoutResponse matches no pending request from this browser")
+			return
+		}
+		if err != nil {
+			s.serverError(w, r, err)
+			return
+		}
 		redirectFlash(w, r, "/auth/login", "You have signed out.")
 		return
 	}
@@ -174,8 +224,7 @@ func (s *Server) handleSAMLSLO(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !fresh {
-		s.Log.Warn("saml_logout_rejected", "connection", c.Slug, "error", "replayed LogoutRequest")
-		s.loginPage(w, r, http.StatusBadRequest, loginData{}, "That sign-out message could not be verified.")
+		s.rejectSLO(w, r, c, "replay", "replayed LogoutRequest")
 		return
 	}
 	sid := ""
@@ -189,12 +238,12 @@ func (s *Server) handleSAMLSLO(w http.ResponseWriter, r *http.Request) {
 	}
 	s.IDs.Audit(r.Context(), identity.AuditEvent{OrgID: c.OrgID, Actor: "idp", Action: "logout.saml_slo", Target: c.Slug,
 		Detail: "sessions ended: " + strconv.FormatInt(n, 10)})
-	u, err := samlsp.LogoutResponseURL(sp, req.ID, m.RelayState)
+	out, err := samlsp.LogoutResponse(sp, req.ID, m.RelayState)
 	if err != nil {
-		// No redirect endpoint to answer on; the sessions are ended anyway.
+		// No endpoint to answer on; the sessions are ended anyway.
 		s.Log.Warn("saml_logout_response_failed", "connection", c.Slug, "error", err.Error())
 		redirectFlash(w, r, "/auth/login", "You have signed out.")
 		return
 	}
-	http.Redirect(w, r, u, http.StatusFound)
+	s.sendSAML(w, r, out, http.StatusFound)
 }

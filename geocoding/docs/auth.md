@@ -137,20 +137,30 @@ Single logout uses `/auth/saml/{slug}/slo`, advertised in the SP metadata
 for the HTTP-Redirect and HTTP-POST bindings:
 
 - **SP-initiated.** `POST /auth/logout` on a SAML session deletes the local
-  session first. Then, if the IdP metadata lists an HTTP-Redirect
-  SingleLogoutService, it redirects the browser there with a LogoutRequest
-  (NameID and SessionIndex from the session) signed in the query string
-  (RSA-SHA256). The IdP's LogoutResponse at the SLO URL must verify (see
-  below) and report success; the browser then lands on the login page with
-  "You have signed out." Anything else gets a generic error page. The local
-  session is gone either way. Without an IdP SLO endpoint, logout is local
-  only.
+  session first. Then, if the IdP metadata lists a SingleLogoutService, it
+  sends a signed LogoutRequest carrying the NameID with the `Format`,
+  `NameQualifier` and `SPNameQualifier` from the login assertion (stored
+  with the session; strict IdPs such as ADFS match on them) and the
+  SessionIndex. HTTP-Redirect is preferred: the browser is redirected with
+  the request signed in the query string (RSA-SHA256). If the IdP has only
+  an HTTP-POST endpoint, the browser gets a page whose form posts the
+  request, signed with an enveloped XML signature, to the IdP;
+  `/console/static/autosubmit.js` submits it, and a Continue button does
+  the same without JavaScript (the endpoint must be `https:`, which the
+  CSP `form-action` allows). The request ID is recorded as a
+  `saml-logout` flow bound to the browser's flow cookie (10 minutes). The
+  IdP's LogoutResponse at the SLO URL must verify (see below), report
+  success, and have an `InResponseTo` matching a pending request from this
+  browser for this connection; the record is consumed on first use, match
+  or not. The browser then lands on the login page with "You have signed
+  out." Anything else gets a generic error page. The local session is gone
+  either way. Without an IdP SLO endpoint, logout is local only.
 - **IdP-initiated.** A LogoutRequest at the SLO URL ends the connection's
   sessions with that SessionIndex or, if it has none, that NameID. It is
-  audited as `logout.saml_slo` and answered with a LogoutResponse (Success,
-  RelayState echoed) signed in the query and sent by redirect to the IdP's
-  SLO endpoint (`ResponseLocation` if given). Request IDs are recorded to
-  refuse replays.
+  audited as `logout.saml_slo` and answered with a signed LogoutResponse
+  (Success, RelayState echoed) on the IdP's SLO endpoint
+  (`ResponseLocation` if given), by redirect or, for a POST-only IdP, by the
+  same auto-submitting form. Request IDs are recorded to refuse replays.
 
 Inbound logout messages must be signed by a signing certificate in the IdP
 metadata, either on the redirect query (RSA-SHA256/384/512 over the
@@ -158,7 +168,11 @@ parameters as sent) or as an enveloped XML signature on the message; only
 the signed element is read. The issuer must be the IdP entity ID,
 `Destination` must be the SLO URL, `IssueInstant` must fall within the issue
 window above (plus skew), and a request's `NotOnOrAfter` must not have
-passed. Anything else is a 400 that touches no session. Bodies and inflated
+passed. Anything else is a 400 that touches no session and is audited as
+`logout.saml_rejected` with a short reason code (`malformed`, `unsigned`,
+`bad_signature`, `wrong_issuer`, `wrong_destination`, `stale`, `expired`,
+`status_not_success`, `replay`, `unsolicited_response`, ...) and never the
+message. Bodies and inflated
 messages are capped at 1 MiB, and messages are never logged. For IdPs
 without SLO, use SCIM deprovisioning or short session lifetimes for prompt
 revocation.
@@ -213,8 +227,8 @@ into a user:
 - `POST /auth/logout` deletes the session. For OIDC connections that publish
   `end_session_endpoint`, the browser is redirected there with
   `id_token_hint` and `post_logout_redirect_uri`. For SAML connections whose
-  IdP has an SLO endpoint, it is redirected there with a signed
-  LogoutRequest; IdP-initiated SAML logout arrives at
+  IdP has an SLO endpoint, it is sent there with a signed
+  LogoutRequest (redirect, or an auto-submitted POST form); IdP-initiated SAML logout arrives at
   `/auth/saml/{id}/slo` (see "SAML 2.0").
 - **Back-channel logout** (OIDC): `POST /auth/oidc/{id}/backchannel-logout`
   with a `logout_token` form field. The token is verified against the

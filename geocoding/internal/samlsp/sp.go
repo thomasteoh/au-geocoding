@@ -244,7 +244,10 @@ var (
 func ToAssertion(c identity.Connection, a *saml.Assertion) identity.Assertion {
 	out := identity.Assertion{Connection: c, EmailTrusted: c.TrustEmail}
 	if a.Subject != nil && a.Subject.NameID != nil {
-		out.Subject = strings.TrimSpace(a.Subject.NameID.Value)
+		n := a.Subject.NameID
+		out.Subject = strings.TrimSpace(n.Value)
+		out.IdPSubQual = identity.NameIDQualifiers{Format: clip(n.Format), NameQualifier: clip(n.NameQualifier),
+			SPNameQualifier: clip(n.SPNameQualifier)}
 	}
 	for _, st := range a.AuthnStatements {
 		if st.SessionIndex != "" {
@@ -278,6 +281,15 @@ func ToAssertion(c identity.Connection, a *saml.Assertion) identity.Assertion {
 		}
 	}
 	return out
+}
+
+// clip bounds a NameID attribute kept with the session; an absurdly long
+// one is dropped rather than truncated, since it must be echoed exactly.
+func clip(s string) string {
+	if len(s) > 512 {
+		return ""
+	}
+	return s
 }
 
 func nameIDIsEmail(a *saml.Assertion) bool {
