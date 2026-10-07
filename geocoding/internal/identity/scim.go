@@ -248,6 +248,11 @@ func (s *Store) CreateSCIMUser(ctx context.Context, orgID int64, in SCIMUserInpu
 		return SCIMUser{}, err
 	}
 	defer tx.Rollback()
+	// Take the write lock before reading, so the linkability check below and
+	// the link cannot be split by a concurrent membership change.
+	if _, err := tx.ExecContext(ctx, `UPDATE orgs SET slug=slug WHERE id=?`, orgID); err != nil {
+		return SCIMUser{}, err
+	}
 	var uid int64
 	err = tx.QueryRowContext(ctx, `SELECT id FROM users WHERE email=?`, email).Scan(&uid)
 	switch {
@@ -262,11 +267,11 @@ func (s *Store) CreateSCIMUser(ctx context.Context, orgID int64, in SCIMUserInpu
 	default:
 		// Linking an account that has access elsewhere would let this org's
 		// IdP (and anyone holding its SCIM token) act on it (A9).
-		u, err := s.UserByID(ctx, uid)
+		u, err := scanUser(tx.QueryRowContext(ctx, `SELECT `+userCols+` FROM users WHERE id=?`, uid))
 		if err != nil {
 			return SCIMUser{}, err
 		}
-		if ok, err := s.orgLinkable(ctx, u, orgID); err != nil {
+		if ok, err := orgLinkableQ(ctx, tx, u, orgID); err != nil {
 			return SCIMUser{}, err
 		} else if !ok {
 			return SCIMUser{}, ErrSCIMForeign
@@ -302,8 +307,8 @@ func (s *Store) CreateSCIMUser(ctx context.Context, orgID int64, in SCIMUserInpu
 }
 
 // ReplaceSCIMUser sets a SCIM user's full state. Deactivating removes the
-// org membership and the user's sessions (and deprovisions a user left with
-// no orgs); activating restores the membership. changed reports an
+// org membership and ends the user's sessions in the org (see
+// scimDeactivateTx); activating restores the membership. changed reports an
 // activation change: +1 reactivated, -1 deactivated, 0 none.
 func (s *Store) ReplaceSCIMUser(ctx context.Context, orgID int64, scimID string, in SCIMUserInput) (su SCIMUser, changed int, err error) {
 	_, su, changed, err = s.PatchSCIMUser(ctx, orgID, scimID, func(SCIMUser) (SCIMUserInput, error) { return in, nil })
@@ -391,8 +396,8 @@ func (s *Store) replaceSCIMUserTx(ctx context.Context, tx *sql.Tx, orgID int64, 
 }
 
 // DeleteSCIMUser unlinks a SCIM user: removes the scim_users row, the user's
-// SCIM group memberships in the org and the org membership, and deletes
-// sessions. The global user row stays (it may belong to other orgs).
+// SCIM group memberships in the org and the org membership, and ends the
+// user's sessions in the org (see scimDeactivateTx). The global user row stays (it may belong to other orgs).
 func (s *Store) DeleteSCIMUser(ctx context.Context, orgID int64, scimID string) (SCIMUser, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -437,14 +442,18 @@ func scimActivateTx(ctx context.Context, tx *sql.Tx, orgID, userID int64) error 
 	return err
 }
 
-// scimDeactivateTx removes the org membership SCIM created (memberships added
-// in the console are the console's to remove; the last owner is protected).
-// A user left with no memberships who is not a platform admin is
-// deprovisioned and signed out everywhere; anyone else keeps their sessions,
-// which no longer reach this org.
+// scimDeactivateTx ends a SCIM user's access to the org. The scim_users row
+// is what puts the user under this org's SCIM control, so the membership
+// goes whatever its source (manual, invite, jit, group, scim); the last
+// owner is protected. Sessions created through this org's connections are
+// deleted, and the org's connections are dropped from the proofs of the
+// user's other sessions, so no session still satisfies this org's SSO;
+// sessions that never touched the org are kept. A user left with no
+// memberships who is not a platform admin is deprovisioned and signed out
+// everywhere.
 func scimDeactivateTx(ctx context.Context, tx *sql.Tx, orgID, userID int64) error {
 	var cur string
-	err := tx.QueryRowContext(ctx, `SELECT role FROM memberships WHERE org_id=? AND user_id=? AND source=?`, orgID, userID, SourceSCIM).Scan(&cur)
+	err := tx.QueryRowContext(ctx, `SELECT role FROM memberships WHERE org_id=? AND user_id=?`, orgID, userID).Scan(&cur)
 	switch {
 	case errors.Is(err, sql.ErrNoRows):
 	case err != nil:
@@ -455,9 +464,17 @@ func scimDeactivateTx(ctx context.Context, tx *sql.Tx, orgID, userID int64) erro
 				return err
 			}
 		}
-		if _, err := tx.ExecContext(ctx, `DELETE FROM memberships WHERE org_id=? AND user_id=? AND source=?`, orgID, userID, SourceSCIM); err != nil {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM memberships WHERE org_id=? AND user_id=?`, orgID, userID); err != nil {
 			return err
 		}
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM sessions WHERE user_id=? AND connection_id IN (SELECT id FROM connections WHERE org_id=?)`,
+		userID, orgID); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM session_proofs WHERE connection_id IN (SELECT id FROM connections WHERE org_id=?)
+		AND id_hash IN (SELECT id_hash FROM sessions WHERE user_id=?)`, orgID, userID); err != nil {
+		return err
 	}
 	res, err := tx.ExecContext(ctx, `UPDATE users SET status=? WHERE id=? AND platform_admin=0
 		AND NOT EXISTS (SELECT 1 FROM memberships WHERE user_id=?)`, StatusDeprovisioned, userID, userID)
@@ -468,6 +485,16 @@ func scimDeactivateTx(ctx context.Context, tx *sql.Tx, orgID, userID int64) erro
 		_, err = tx.ExecContext(ctx, `DELETE FROM sessions WHERE user_id=?`, userID)
 	}
 	return err
+}
+
+// scimInactive reports whether the org's SCIM has the user deactivated (a
+// scim_users row with active=0). Such a user cannot sign back into the org
+// through its connections (SSO, JIT, auto-accepted invites) until SCIM
+// reactivates them.
+func (s *Store) scimInactive(ctx context.Context, orgID, userID int64) (bool, error) {
+	var n int
+	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM scim_users WHERE org_id=? AND user_id=? AND active=0`, orgID, userID).Scan(&n)
+	return n > 0, err
 }
 
 // scimRoleTx is the role SCIM group mappings give a user in an org: the

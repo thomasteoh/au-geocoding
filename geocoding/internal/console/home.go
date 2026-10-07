@@ -3,6 +3,7 @@ package console
 import (
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"net/http"
 	"strings"
 
@@ -17,20 +18,34 @@ func (s *Server) handleHome(w http.ResponseWriter, r *http.Request) {
 		s.serverError(w, r, err)
 		return
 	}
-	if len(orgs) == 1 && r.URL.Query().Get("all") == "" {
+	invites, err := s.IDs.UserInvites(r.Context(), v.User)
+	if err != nil {
+		s.serverError(w, r, err)
+		return
+	}
+	if len(orgs) == 1 && len(invites) == 0 && r.URL.Query().Get("all") == "" {
 		http.Redirect(w, r, "/console/orgs/"+orgs[0].Org.Slug, http.StatusSeeOther)
 		return
 	}
-	s.render(w, r, http.StatusOK, "home", Page{Title: "Organisations", Orgs: orgs, Active: "home"})
+	s.render(w, r, http.StatusOK, "home", Page{Title: "Organisations", Orgs: orgs, Active: "home", Data: homeData{Invites: invites}})
 }
 
-// handleCreateOrg lets any signed-in user create an org they own.
+type homeData struct {
+	Invites []identity.PendingInvite
+}
+
+// handleCreateOrg lets any signed-in user create an org they own, up to
+// MaxOrgsPerUser (platform admins are exempt in the store).
 func (s *Server) handleCreateOrg(w http.ResponseWriter, r *http.Request) {
 	v := viewerFrom(r.Context())
 	name := strings.TrimSpace(r.PostFormValue("name"))
-	org, err := s.IDs.CreateOrg(r.Context(), name, identity.Slugify(name), v.User.ID, false, true)
+	org, err := s.IDs.CreateOrgLimited(r.Context(), name, identity.Slugify(name), v.User.ID, s.Cfg.MaxOrgsPerUser)
 	if errors.Is(err, identity.ErrInvalid) {
 		redirectFlash(w, r, "/console?all=1", "Enter an organisation name of up to 100 characters.")
+		return
+	}
+	if errors.Is(err, identity.ErrOrgLimit) {
+		redirectFlash(w, r, "/console?all=1", fmt.Sprintf("You can create up to %d organisations. Delete one you no longer need, or ask a platform admin.", s.Cfg.MaxOrgsPerUser))
 		return
 	}
 	if err != nil {

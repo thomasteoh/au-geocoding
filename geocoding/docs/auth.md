@@ -206,7 +206,10 @@ into a user:
    only if they have no access outside this org (no other org except their
    own personal workspace, not a platform admin); otherwise deny, because the
    org's IdP decides what email it asserts. Pending invites from this org
-   are accepted. Multi-tenant Entra issuers (`common`, `organizations`,
+   (and only this org) are accepted. A user the org's SCIM has deactivated
+   (`scim_users.active = 0`) is denied (`scim_inactive`), so SSO, JIT and
+   group mappings cannot bring them back until SCIM reactivates them.
+   Multi-tenant Entra issuers (`common`, `organizations`,
    `consumers`) are refused on org connections, and changing a connection's
    issuer, client ID or SAML metadata drops its linked identities and
    sessions.
@@ -216,6 +219,8 @@ into a user:
    one (when `AUGEO_AUTH_SIGNUP=open`, or when an invite or bootstrap entry
    exists). If the email is **not** trusted and a user with that email already
    exists, deny: linking on an unverified email is how accounts get taken over.
+   A platform sign-in never accepts invites; they wait for the person to
+   accept them in the console (see "Invites").
 4. **Status.** Suspended or deprovisioned users are denied.
    Bootstrap admins are promoted once, when their account is created; a
    later revocation sticks.
@@ -224,8 +229,9 @@ into a user:
    match, the org's default role (JIT) or the existing manual role. The
    IdP's groups are only known at sign-in, so adding or removing an SSO
    mapping changes members' roles at their next sign-in, not at once.
-6. A brand-new user with no membership gets a personal org where they are
-   owner, so a self-signup user can create keys at once.
+6. A user with no membership gets a personal org where they are owner, so
+   a self-signup user can create keys at once. Someone with a pending
+   invite gets none until they have decided on it.
 
 ### Sessions
 
@@ -299,18 +305,32 @@ are accepted and ignored.
 - Creating a user whose email already exists links that user (409
   `uniqueness` if already provisioned in this org) and adds an org
   membership with source `scim` and the role from SCIM group mappings, else
-  the org default role. An existing membership (e.g. manual) is kept as is.
+  the org default role. An existing membership (e.g. manual, invite, JIT) is
+  kept as is. Only an account with no access outside this org (no other org
+  except its own personal workspace, not a platform admin) can be linked;
+  the check and the link run in one transaction that takes the write lock
+  first.
+- The SCIM linkage is the `scim_users` row, not the membership's `source`
+  (an SSO group-mapped sign-in rewrites that to `group`). A linked user is
+  under the org's SCIM control whatever their membership's source.
 - The SCIM `id` is a random UUID (`scim_users.scim_id`), never the database
   user ID. Name parts, `displayName`, `externalId`, emails and `active` are
   stored per org in `scim_users` and returned as sent.
 - The global user row (`users.email`, `users.name`) only changes when the
   user belongs to no other org and is not a platform admin; changing
   `userName` for a shared user is 400 `mutability`.
-- `active: false` or `DELETE` removes the org membership (any source) and
-  deletes all the user's sessions; a user left with no memberships and no
-  platform role is marked deprovisioned. `active: true` (or re-creating
-  after delete) restores the membership and reactivates a deprovisioned
-  user. Removing the org's last owner is 400 and changes nothing.
+- `active: false` or `DELETE` ends the user's access to the org at once:
+  the org membership goes whatever its source (manual, invite, jit, group,
+  scim); sessions created through any of the org's connections are deleted;
+  the org's connections are removed from the proofs (`session_proofs`) of
+  the user's other sessions, so none of them still satisfies the org's SSO
+  enforcement. Sessions that never touched the org are kept. A user left
+  with no memberships who is not a platform admin is then marked
+  deprovisioned and signed out everywhere. While deactivated, sign-in
+  through the org's connections is denied (`scim_inactive`). `active: true`
+  (or re-creating after delete) restores the membership and reactivates a
+  deprovisioned user. Removing the org's last owner is 400 and changes
+  nothing.
 - Group members must be SCIM users of the same org (400 otherwise). After any
   group change the affected users' roles are recomputed from SCIM group
   mappings (matched on `displayName`): highest mapped role, else the org
@@ -342,6 +362,16 @@ contains the configured audience; `exp`/`nbf` with 60 s skew; scopes from
 `scope` (space-separated) or `scp` (array), with the prefix stripped, must
 include the endpoint's scope (`search` or `batch`).
 
+Registrations are unique per org on `(issuer, audience)`, not globally, so
+no org can register a shared issuer's audience first and lock its real
+owner out. The registration is chosen by the token's audience; when two
+orgs have registered the same issuer and audience, the token could belong
+to either and is refused (`audience`). **The audience must therefore be
+specific to the org** (its own app registration or API identifier, e.g.
+Entra's application ID URI), never a value other tenants of the same IdP
+also receive. The console's OAuth tokens page warns when another org has
+registered the same pair, without saying which org.
+
 The principal is `jwt:<issuer id>:<sub>`. Rate limits apply per principal;
 the daily row quota is charged to the org at the org's tier. A request with
 both `X-Api-Key` and `Authorization` is a 400.
@@ -355,6 +385,11 @@ prefix index and constant-time comparison. New:
   creator, take the org's tier and can carry an expiry. Their raw value is
   shown once.
 - Revocation in the console updates the in-memory index at once.
+- Deleting an org revokes its keys in the same transaction as the org's
+  delete, and issuing an org key checks inside its own transaction (after
+  the insert, under SQLite's write lock) that the org still exists. A key
+  created while its org is being deleted is therefore either revoked by the
+  delete or never created. The in-memory index is updated after the commit.
 - `keygen` still issues operator keys with no org; those are unchanged.
 
 T6's "no HTTP issuance endpoint" is replaced by: issuance only through an
@@ -374,6 +409,8 @@ origin checks, and an audit event.
 | `AUGEO_AUTH_PROVIDERS_FILE` | | JSON list of platform connections to upsert at boot (see below) |
 | `AUGEO_AUTH_RATE_RPS` | `1` | Per-client-IP refill rate (requests/second) on the anonymous sign-in endpoints; `0` turns the limit off |
 | `AUGEO_AUTH_RATE_BURST` | `20` | Bucket size for the above |
+| `AUGEO_AUTH_MAX_ORGS_PER_USER` | `10` | Non-personal orgs one user may create and keep (deleting one frees a slot); `0` is no cap. Platform admins are exempt |
+| `AUGEO_AUTH_DEFAULT_ORG_TIER` | `demo` | Quota tier new orgs (including personal workspaces) start on: `demo`, `standard` or `batch` |
 | `AUGEO_SMTP_HOST` | (unset: no invite emails) | SMTP submission server for invite emails. With `starttls`, STARTTLS is required unless the host is `localhost` or a loopback address |
 | `AUGEO_SMTP_PORT` | `587` | SMTP port |
 | `AUGEO_SMTP_TLS` | `starttls` (`implicit` on port 465) | `starttls` upgrades a plain connection; `implicit` speaks TLS from the first byte (SMTPS, port 465). The certificate must be valid for the host |
@@ -385,7 +422,13 @@ origin checks, and an audit event.
 
 When SMTP is configured, inviting someone emails them a plain-text message
 naming the inviter, organisation, role, the `{AUGEO_PUBLIC_URL}/auth/login`
-link and the expiry. Sending is off the request path:
+link and the expiry. The inviter's and organisation's names are chosen by
+users, so they appear in double quotes, on one line, with anything a mail
+client could turn into a link removed (`scheme://`, `www.`, and the dots of
+host-like tokens, so `login.evil.example` becomes `login evil example`); the
+message says the names are user-chosen. The sign-in link is the only link,
+on its own line, and always the platform's. Sending is off the request
+path:
 
 - The invite handler writes the message to the `mail_outbox` table in app.db
   and returns; the console says "We are emailing them a sign-in link".
@@ -405,7 +448,8 @@ link and the expiry. Sending is off the request path:
   attempt and code, never the recipient's address.
 - Rate limits: an org may queue 50 invite emails per hour and 3 per day to
   any one address; one address receives at most 20 per day from all orgs
-  together. Over either limit the invite is
+  together; one inviting user may queue at most 20 per day across all
+  their orgs. Over any limit the invite is
   still created (or renewed) but no email is queued, and the console tells
   the inviter to send the sign-in link themselves.
 - A failure never fails the invite. An invite deleted before its email goes
@@ -464,14 +508,50 @@ labels, never secrets, raw tokens or queries.
 | A9 | SCIM token theft | Hashed at rest, org-scoped, revocable, audited; SCIM can only touch its own org |
 | A10 | Stolen session cookie | `__Host-`, `HttpOnly`, `Secure`, `SameSite=Lax`; idle and absolute expiry; user-visible session list |
 | A11 | Secrets exposure via DB copy | Client secrets and SAML keys sealed with `AUGEO_SECRET_KEY`; tokens hashed |
-| A12 | Sign-in endpoint flooding (DB growth, IdP metadata fetches, mail bombing) | Per-IP token buckets on anonymous auth endpoints; cap on unexpired `auth_flows`; per-org and per-recipient invite email limits |
+| A12 | Sign-in endpoint flooding (DB growth, IdP metadata fetches, mail bombing) | Per-IP token buckets on anonymous auth endpoints; cap on unexpired `auth_flows`; per-org, per-recipient and per-inviter invite email limits |
+| A13 | Forced org join (an attacker invites a victim, who is joined at sign-in and then cannot be linked by their employer) | Invites accepted only explicitly in the console, except an org connection's own org |
+| A14 | SCIM offboarding leaving access (membership source rewritten, sessions in the org kept) | Deactivation keyed on the `scim_users` link: membership removed whatever its source, the org's sessions and proofs dropped, sign-in through the org denied |
+| A15 | Quota multiplication through many orgs; JWT audience squatting | Per-user org creation cap; per-org `(issuer, audience)` uniqueness with ambiguous pairs refused and flagged in the console |
 
 ## Invites
 
 An invite is always a pending row, even for an email that already has an
-account: the person joins when they next sign in with a trusted address, so
-nobody is added to an org without acting, and the response never reveals
-whether an account exists. Invites expire after 14 days.
+account, and the response never reveals whether an account exists. Invites
+expire after 14 days.
+
+- **Acceptance is explicit.** Signing in through a platform connection
+  never accepts an invite: the person's console home page lists their
+  pending invites (organisation, role, inviter, expiry) with Accept and
+  Decline buttons (CSRF-checked POSTs to `/console/invites/{id}/accept` and
+  `/decline`, audited as `invite.accept` / `invite.decline`). Only the
+  account whose email the invite names can accept or decline it. Otherwise
+  anyone could pull a stranger into their org, even as owner, and that
+  membership would then block the stranger's employer from linking them
+  through SSO or SCIM (an account with access elsewhere is not linkable).
+- **Exception:** signing in through an org connection accepts that org's
+  own invites (never another org's). The org's IdP vouches for the address
+  and the linkability rule already bounds whom it can sign in.
+- Accepting never lowers an existing role. An invite, once accepted or
+  declined, is gone.
+- Admins can create, renew and delete invites for viewer, developer and
+  admin; only owners can invite owners, and only owners can delete an owner
+  invite or re-invite its address with another role (the same rule as
+  changing members).
+
+## Org limits
+
+Each org has its own daily row quota at its tier, so the quota one person
+can use grows with the orgs they own (demo-tier quota is per org, not per
+user). Two limits bound that:
+
+- A user may create at most `AUGEO_AUTH_MAX_ORGS_PER_USER` (default 10)
+  non-personal orgs that still exist (`orgs.created_by`); platform admins
+  are exempt. The count and the insert share one transaction.
+- New orgs start on `AUGEO_AUTH_DEFAULT_ORG_TIER` (default `demo`); a
+  platform admin raises an org's tier.
+
+Personal workspaces are created only at sign-in, one per user with no
+membership.
 
 ## Linking sign-in methods
 

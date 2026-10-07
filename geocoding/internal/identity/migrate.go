@@ -266,6 +266,34 @@ CREATE TABLE passkey_proofs (
 	connection_id INTEGER NOT NULL REFERENCES connections(id) ON DELETE CASCADE,
 	PRIMARY KEY (passkey_id, connection_id)
 );`,
+	// 7: tenant abuse limits. orgs.created_by counts the orgs a user created
+	// (AUGEO_AUTH_MAX_ORGS_PER_USER); mail_outbox.sender_id bounds invite
+	// emails per inviting user; JWT issuer registrations are unique per org,
+	// not globally, so no org can squat an (issuer, audience) another org
+	// needs (a pair registered by two orgs is refused as ambiguous).
+	`
+ALTER TABLE orgs ADD COLUMN created_by INTEGER REFERENCES users(id) ON DELETE SET NULL;
+CREATE INDEX idx_orgs_created_by ON orgs(created_by);
+ALTER TABLE mail_outbox ADD COLUMN sender_id INTEGER;
+CREATE INDEX idx_mail_outbox_sender ON mail_outbox(sender_id, created);
+CREATE TABLE jwt_issuers_v7 (
+	id               INTEGER PRIMARY KEY AUTOINCREMENT,
+	org_id           INTEGER NOT NULL REFERENCES orgs(id) ON DELETE CASCADE,
+	issuer           TEXT NOT NULL,
+	audience         TEXT NOT NULL,
+	jwks_url         TEXT NOT NULL DEFAULT '',
+	scope_prefix     TEXT NOT NULL DEFAULT '',
+	allowed_subjects TEXT NOT NULL DEFAULT '',
+	enabled          INTEGER NOT NULL DEFAULT 1,
+	created          TEXT NOT NULL,
+	UNIQUE (org_id, issuer, audience)
+);
+INSERT INTO jwt_issuers_v7(id, org_id, issuer, audience, jwks_url, scope_prefix, allowed_subjects, enabled, created)
+	SELECT id, org_id, issuer, audience, jwks_url, scope_prefix, allowed_subjects, enabled, created FROM jwt_issuers;
+DROP TABLE jwt_issuers;
+ALTER TABLE jwt_issuers_v7 RENAME TO jwt_issuers;
+CREATE INDEX idx_jwt_issuers_iss ON jwt_issuers(issuer, audience);
+`,
 }
 
 func migrate(db *sql.DB) error {

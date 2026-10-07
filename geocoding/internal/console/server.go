@@ -34,6 +34,10 @@ type Config struct {
 	PublicURL string // origin, no trailing slash
 	Session   identity.SessionPolicy
 	Login     identity.LoginPolicy
+	// MaxOrgsPerUser caps the non-personal orgs one user may create
+	// (AUGEO_AUTH_MAX_ORGS_PER_USER); 0 means no cap. Platform admins are
+	// exempt.
+	MaxOrgsPerUser int
 }
 
 // Server serves the console.
@@ -109,6 +113,8 @@ func (s *Server) Register(mux *http.ServeMux) {
 	mux.Handle("GET /console", user(s.handleHome))
 	mux.Handle("GET /console/{$}", user(s.handleHome))
 	mux.Handle("POST /console/orgs", userPost(s.handleCreateOrg))
+	mux.Handle("POST /console/invites/{id}/accept", userPost(s.handleInviteAccept))
+	mux.Handle("POST /console/invites/{id}/decline", userPost(s.handleInviteDecline))
 
 	// Account.
 	mux.Handle("GET /console/account", user(s.handleAccount))

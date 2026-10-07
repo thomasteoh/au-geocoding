@@ -247,6 +247,13 @@ func (s *Store) ListOrgs(ctx context.Context) ([]Org, error) {
 // CreateOrg creates an org with owner as its first owner. If slug is taken
 // and uniquify is set, a numeric suffix is added.
 func (s *Store) CreateOrg(ctx context.Context, name, slug string, owner int64, personal, uniquify bool) (Org, error) {
+	return s.createOrg(ctx, name, slug, owner, personal, uniquify, 0)
+}
+
+// createOrg is CreateOrg; with maxOwned > 0 it fails with ErrOrgLimit when
+// owner (unless a platform admin) would then have created more than
+// maxOwned live non-personal orgs.
+func (s *Store) createOrg(ctx context.Context, name, slug string, owner int64, personal, uniquify bool, maxOwned int) (Org, error) {
 	name = strings.TrimSpace(name)
 	if name == "" || len(name) > 100 {
 		return Org{}, ErrInvalid
@@ -265,7 +272,8 @@ func (s *Store) CreateOrg(ctx context.Context, name, slug string, owner int64, p
 	base := slug
 	var id int64
 	for i := 1; ; i++ {
-		res, err := tx.ExecContext(ctx, `INSERT INTO orgs(slug, name, personal, created) VALUES (?,?,?,?)`, slug, name, b2i(personal), now())
+		res, err := tx.ExecContext(ctx, `INSERT INTO orgs(slug, name, personal, created, tier, created_by) VALUES (?,?,?,?,?,?)`,
+			slug, name, b2i(personal), now(), s.defaultTier(), nullID(owner))
 		if err == nil {
 			id, _ = res.LastInsertId()
 			break
@@ -286,6 +294,13 @@ func (s *Store) CreateOrg(ctx context.Context, name, slug string, owner int64, p
 		if _, err := tx.ExecContext(ctx, `INSERT INTO memberships(org_id, user_id, role, source, created) VALUES (?,?,?,?,?)`,
 			id, owner, RoleOwner.String(), "signup", now()); err != nil {
 			return Org{}, err
+		}
+		// The insert above holds the write lock, so concurrent creations
+		// by the same user are counted one after another.
+		if maxOwned > 0 && !personal {
+			if err := orgLimitTx(ctx, tx, owner, maxOwned); err != nil {
+				return Org{}, err
+			}
 		}
 	}
 	if err := tx.Commit(); err != nil {
@@ -346,16 +361,10 @@ func (s *Store) SetOrgTier(ctx context.Context, orgID int64, tier string) error 
 }
 
 // DeleteOrg deletes an org and everything it owns (cascade). API keys live
-// in the publicapi tables; the caller revokes those first.
+// in the publicapi tables; use DeleteOrgWith to revoke them in the same
+// transaction.
 func (s *Store) DeleteOrg(ctx context.Context, orgID int64) error {
-	res, err := s.db.ExecContext(ctx, `DELETE FROM orgs WHERE id=?`, orgID)
-	if err != nil {
-		return err
-	}
-	if n, _ := res.RowsAffected(); n == 0 {
-		return ErrNotFound
-	}
-	return nil
+	return s.DeleteOrgWith(ctx, orgID, nil)
 }
 
 // --- memberships ---
@@ -586,18 +595,8 @@ func (s *Store) acceptInvites(ctx context.Context, u User, orgID int64) ([]int64
 	rows.Close()
 	var orgs []int64
 	for _, i := range invs {
-		var cur string
-		err := tx.QueryRowContext(ctx, `SELECT role FROM memberships WHERE org_id=? AND user_id=?`, i.org, u.ID).Scan(&cur)
-		if errors.Is(err, sql.ErrNoRows) {
-			if _, err := tx.ExecContext(ctx, `INSERT INTO memberships(org_id, user_id, role, source, created) VALUES (?,?,?,?,?)`, i.org, u.ID, i.role.String(), "invite", now()); err != nil {
-				return nil, err
-			}
-		} else if err != nil {
+		if err := joinFromInviteTx(ctx, tx, i.org, u.ID, i.role); err != nil {
 			return nil, err
-		} else if ParseRole(cur) < i.role {
-			if _, err := tx.ExecContext(ctx, `UPDATE memberships SET role=? WHERE org_id=? AND user_id=?`, i.role.String(), i.org, u.ID); err != nil {
-				return nil, err
-			}
 		}
 		orgs = append(orgs, i.org)
 	}
@@ -605,6 +604,24 @@ func (s *Store) acceptInvites(ctx context.Context, u User, orgID int64) ([]int64
 		return nil, err
 	}
 	return orgs, tx.Commit()
+}
+
+// joinFromInviteTx turns one invite into a membership. An invite never
+// lowers an existing role.
+func joinFromInviteTx(ctx context.Context, tx *sql.Tx, orgID, userID int64, role Role) error {
+	var cur string
+	err := tx.QueryRowContext(ctx, `SELECT role FROM memberships WHERE org_id=? AND user_id=?`, orgID, userID).Scan(&cur)
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		_, err = tx.ExecContext(ctx, `INSERT INTO memberships(org_id, user_id, role, source, created) VALUES (?,?,?,?,?)`, orgID, userID, role.String(), "invite", now())
+		return err
+	case err != nil:
+		return err
+	case ParseRole(cur) < role:
+		_, err = tx.ExecContext(ctx, `UPDATE memberships SET role=? WHERE org_id=? AND user_id=?`, role.String(), orgID, userID)
+		return err
+	}
+	return nil
 }
 
 func nullID(id int64) any {

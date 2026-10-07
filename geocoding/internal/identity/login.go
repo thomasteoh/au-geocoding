@@ -236,31 +236,46 @@ func (s *Store) EnforcedSSO(ctx context.Context, u User) *Denial {
 // u: u is not a platform admin and belongs to no org other than orgID and
 // their own personal workspace.
 func (s *Store) orgLinkable(ctx context.Context, u User, orgID int64) (bool, error) {
+	return orgLinkableQ(ctx, s.db, u, orgID)
+}
+
+type rowQuerier interface {
+	QueryRowContext(ctx context.Context, q string, args ...any) *sql.Row
+}
+
+// orgLinkableQ is orgLinkable on a DB or transaction.
+func orgLinkableQ(ctx context.Context, q rowQuerier, u User, orgID int64) (bool, error) {
 	if u.PlatformAdmin {
 		return false, nil
 	}
 	var n int
-	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM memberships m JOIN orgs o ON o.id=m.org_id
+	err := q.QueryRowContext(ctx, `SELECT COUNT(*) FROM memberships m JOIN orgs o ON o.id=m.org_id
 		WHERE m.user_id=? AND m.org_id<>? AND NOT (o.personal=1 AND m.role='owner'
 			AND (SELECT COUNT(*) FROM memberships x WHERE x.org_id=o.id)=1)`, u.ID, orgID).Scan(&n)
 	return n == 0, err
 }
 
-// afterLogin applies invites, bootstrap admin, org-connection membership and
+// afterLogin applies an org connection's own invites, bootstrap admin, org-connection membership and
 // group mappings, and gives a member-less user a personal org.
 func (s *Store) afterLogin(ctx context.Context, u User, a Assertion, p LoginPolicy, created bool) error {
 	trusted := a.EmailTrusted && strings.EqualFold(u.Email, a.Email)
 	c := a.Connection
-	switch {
-	case trusted:
-		if _, err := s.acceptInvites(ctx, u, 0); err != nil {
+	if !c.Platform() {
+		// The org's SCIM deactivated this person: no way back in through
+		// SSO, JIT or the org's invites until SCIM reactivates them.
+		if off, err := s.scimInactive(ctx, c.OrgID, u.ID); err != nil {
 			return err
+		} else if off {
+			return deny("scim_inactive", "Your access to this organisation has been removed.")
 		}
-	case !c.Platform() && s.orgHasVerifiedDomain(ctx, c.OrgID, EmailDomain(u.Email)):
-		// An org connection on its verified domain vouches for the address
-		// within that org only.
-		if _, err := s.acceptInvites(ctx, u, c.OrgID); err != nil {
-			return err
+		// Invites are otherwise accepted only explicitly in the console
+		// (auth.md "Invites"). An org connection's IdP vouches for the
+		// address within its own org, and orgLinkable already bounds whom it
+		// can sign in, so that org's own invites are accepted here.
+		if trusted || s.orgHasVerifiedDomain(ctx, c.OrgID, EmailDomain(u.Email)) {
+			if _, err := s.acceptInvites(ctx, u, c.OrgID); err != nil {
+				return err
+			}
 		}
 	}
 	// Bootstrap applies once, when the account is created through a trusted
@@ -322,6 +337,14 @@ func (s *Store) afterLogin(ctx context.Context, u User, a Assertion, p LoginPoli
 		return err
 	}
 	if len(orgs) == 0 {
+		// Someone with an invite waiting decides on it in the console
+		// first; a personal workspace would only add a quota they did not
+		// ask for.
+		if pending, err := s.UserInvites(ctx, u); err != nil {
+			return err
+		} else if len(pending) > 0 {
+			return nil
+		}
 		name := u.Name
 		if name == "" {
 			name = strings.SplitN(u.Email, "@", 2)[0]

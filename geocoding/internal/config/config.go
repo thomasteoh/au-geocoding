@@ -133,6 +133,13 @@ type Auth struct {
 	// anonymous sign-in endpoints. RateRPS 0 turns the limit off.
 	RateRPS   float64 `json:"rate_rps"`
 	RateBurst float64 `json:"rate_burst"`
+	// MaxOrgsPerUser caps the non-personal orgs one user may create (0 = no
+	// cap; platform admins are exempt). Each org has its own daily quota,
+	// so this bounds how far one person can multiply theirs.
+	MaxOrgsPerUser int `json:"max_orgs_per_user"`
+	// DefaultOrgTier is the quota tier new orgs start on (demo, standard
+	// or batch).
+	DefaultOrgTier string `json:"default_org_tier"`
 }
 
 // ConsoleEnabled reports whether the console and SSO are configured.
@@ -240,6 +247,14 @@ func validateAuth(a *Auth) []string {
 	if a.RateRPS < 0 || a.RateBurst < 0 || (a.RateRPS > 0 && a.RateBurst < 1) {
 		errs = append(errs, "AUGEO_AUTH_RATE_RPS must be >= 0 and AUGEO_AUTH_RATE_BURST >= 1 when the limit is on")
 	}
+	if a.MaxOrgsPerUser < 0 {
+		errs = append(errs, "AUGEO_AUTH_MAX_ORGS_PER_USER must be >= 0")
+	}
+	switch a.DefaultOrgTier {
+	case "demo", "standard", "batch":
+	default:
+		errs = append(errs, "AUGEO_AUTH_DEFAULT_ORG_TIER must be demo, standard or batch")
+	}
 	return errs
 }
 
@@ -340,6 +355,8 @@ func setDefaults(c *Config) {
 	c.Auth.JWTBearer = true
 	c.Auth.RateRPS = 1
 	c.Auth.RateBurst = 20
+	c.Auth.MaxOrgsPerUser = 10
+	c.Auth.DefaultOrgTier = "demo"
 	c.SMTP.Port = 587
 }
 
@@ -451,6 +468,8 @@ func applyEnv(c *Config) {
 	boolean("AUTH_ALLOW_PRIVATE_FETCH", &c.Auth.AllowPrivateFetch)
 	flt("AUTH_RATE_RPS", &c.Auth.RateRPS)
 	flt("AUTH_RATE_BURST", &c.Auth.RateBurst)
+	num("AUTH_MAX_ORGS_PER_USER", &c.Auth.MaxOrgsPerUser)
+	str("AUTH_DEFAULT_ORG_TIER", &c.Auth.DefaultOrgTier)
 	if v, ok := os.LookupEnv("AUGEO_AUTH_BOOTSTRAP_ADMINS"); ok {
 		c.Auth.BootstrapAdmins = nil
 		for _, e := range strings.Split(v, ",") {

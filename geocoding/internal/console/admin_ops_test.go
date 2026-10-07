@@ -66,10 +66,10 @@ func TestInviteEmail(t *testing.T) {
 		t.Fatalf("sent: %+v", fm.sent)
 	}
 	m := fm.sent[0]
-	if m.to != "new@example.com" || strings.ContainsAny(m.subject, "\r\n") || !strings.Contains(m.subject, "Acme Bcc: eve@example.com") {
+	if m.to != "new@example.com" || strings.ContainsAny(m.subject, "\r\n") || !strings.Contains(m.subject, `"Acme Bcc: eve@example com"`) {
 		t.Fatalf("subject/to: %+v", m)
 	}
-	for _, want := range []string{"Olive Owner (owner@acme.example)", "as developer", h.srv.URL + "/auth/login", "expires on"} {
+	for _, want := range []string{`"Olive Owner" (owner@acme.example)`, "as developer", h.srv.URL + "/auth/login", "expires on"} {
 		if !strings.Contains(m.body, want) {
 			t.Errorf("body lacks %q:\n%s", want, m.body)
 		}
