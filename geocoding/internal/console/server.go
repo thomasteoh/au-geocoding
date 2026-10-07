@@ -115,10 +115,10 @@ func (s *Server) Register(mux *http.ServeMux) {
 	mux.Handle("POST /console/account/profile", userPost(s.handleAccountProfile))
 	mux.Handle("POST /console/account/sessions/revoke", userPost(s.handleRevokeSession))
 	mux.Handle("POST /console/account/sessions/revoke-others", userPost(s.handleRevokeOtherSessions))
-	mux.Handle("POST /console/account/passkeys/register/begin", userPost(s.handlePasskeyRegisterBegin))
+	mux.Handle("POST /console/account/passkeys/register/begin", rl(userPost(s.handlePasskeyRegisterBegin)))
 	mux.Handle("POST /console/account/passkeys/register/finish", userPost(s.handlePasskeyRegisterFinish))
 	mux.Handle("POST /console/account/passkeys/{id}/delete", userPost(s.handlePasskeyDelete))
-	mux.Handle("POST /console/account/links/{conn}", userPost(s.handleLinkStart))
+	mux.Handle("POST /console/account/links/{conn}", rl(userPost(s.handleLinkStart)))
 	mux.Handle("POST /console/account/identities/{id}/unlink", userPost(s.handleUnlink))
 
 	s.registerOrgRoutes(mux)

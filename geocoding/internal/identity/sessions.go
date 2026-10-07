@@ -203,22 +203,34 @@ func (s *Store) DeleteUserSessions(ctx context.Context, userID int64, keep []byt
 func (s *Store) DeleteIdPSessions(ctx context.Context, connectionID int64, sid, sub string) (int64, error) {
 	var res sql.Result
 	var err error
+	col, val := "idp_sid", sid
 	switch {
 	case sid != "":
-		res, err = s.db.ExecContext(ctx, `DELETE FROM sessions WHERE connection_id=? AND idp_sid=?`, connectionID, sid)
 	case sub != "":
-		res, err = s.db.ExecContext(ctx, `DELETE FROM sessions WHERE connection_id=? AND idp_sub=?`, connectionID, sub)
+		col, val = "idp_sub", sub
 	default:
 		return 0, ErrInvalid
 	}
+	// The IdP session may also live on as a proof carried into a later
+	// session; revoke that too (the later session keeps any other access).
+	pr, err := s.db.ExecContext(ctx, `DELETE FROM session_proofs WHERE connection_id=? AND `+col+`=?`, connectionID, val)
 	if err != nil {
 		return 0, err
 	}
-	return res.RowsAffected()
+	res, err = s.db.ExecContext(ctx, `DELETE FROM sessions WHERE connection_id=? AND `+col+`=?`, connectionID, val)
+	if err != nil {
+		return 0, err
+	}
+	n, _ := res.RowsAffected()
+	p, _ := pr.RowsAffected()
+	return n + p, nil
 }
 
 // DeleteConnectionSessions ends every session created through a connection.
 func (s *Store) DeleteConnectionSessions(ctx context.Context, connectionID int64) error {
+	if _, err := s.db.ExecContext(ctx, `DELETE FROM session_proofs WHERE connection_id=?`, connectionID); err != nil {
+		return err
+	}
 	_, err := s.db.ExecContext(ctx, `DELETE FROM sessions WHERE connection_id=?`, connectionID)
 	return err
 }
@@ -271,6 +283,13 @@ func (s *Store) StartFlow(ctx context.Context, f Flow) (state, binding string, e
 	// The prune is a write, so the count below runs under the write lock.
 	if _, err := tx.ExecContext(ctx, `DELETE FROM auth_flows WHERE expires<?`, now()); err != nil {
 		return "", "", err
+	}
+	// A user's own ceremonies (link, passkey registration) replace their
+	// earlier unfinished ones, so one account cannot pile up flows.
+	if f.UserID != 0 {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM auth_flows WHERE user_id=? AND kind=?`, f.UserID, f.Kind); err != nil {
+			return "", "", err
+		}
 	}
 	var n int
 	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM auth_flows`).Scan(&n); err != nil {

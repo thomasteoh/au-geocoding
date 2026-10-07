@@ -257,6 +257,15 @@ CREATE INDEX idx_mail_outbox_rcpt ON mail_outbox(recipient_hash, created);
 -- StartFlow prunes expired flows on every call.
 CREATE INDEX idx_auth_flows_expires ON auth_flows(expires);
 `,
+	// 6: IdP session on proofs (so IdP logout revokes carried proofs) and
+	// the org connections a passkey was registered under (break-glass).
+	`ALTER TABLE session_proofs ADD COLUMN idp_sid TEXT NOT NULL DEFAULT '';
+ALTER TABLE session_proofs ADD COLUMN idp_sub TEXT NOT NULL DEFAULT '';
+CREATE TABLE passkey_proofs (
+	passkey_id    INTEGER NOT NULL REFERENCES passkeys(id) ON DELETE CASCADE,
+	connection_id INTEGER NOT NULL REFERENCES connections(id) ON DELETE CASCADE,
+	PRIMARY KEY (passkey_id, connection_id)
+);`,
 }
 
 func migrate(db *sql.DB) error {

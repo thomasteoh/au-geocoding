@@ -177,9 +177,22 @@ func TestSSOSatisfiedRules(t *testing.T) {
 	if h.con.ssoSatisfied(r, v, oc) {
 		t.Fatal("passkey developer satisfied enforcement")
 	}
+	// An owner's passkey satisfies enforcement only through proofs granted
+	// for a passkey registered under the org's SSO.
 	oc.Role = identity.RoleOwner
+	h.ids.SetMembership(h.ctx, org.ID, u.ID, identity.RoleOwner, "manual")
+	if h.con.ssoSatisfied(r, v, oc) {
+		t.Fatal("owner passkey without org-registered passkey satisfied enforcement")
+	}
+	ssoSess := sess("oidc", c.ID)
+	pkID, err := h.ids.AddPasskey(h.ctx, identity.Passkey{UserID: u.ID, CredentialID: []byte("cred-1"), Data: "{}"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.ids.RecordPasskeyProofs(h.ctx, pkID, ssoSess.IDHash)
+	h.ids.GrantPasskeyProofs(h.ctx, v.Session.IDHash, u.ID, []byte("cred-1"))
 	if !h.con.ssoSatisfied(r, v, oc) {
-		t.Fatal("owner passkey break-glass refused")
+		t.Fatal("owner break-glass with org-registered passkey refused")
 	}
 	oc.Role = identity.RoleDeveloper
 	v.User.PlatformAdmin = true
@@ -232,5 +245,41 @@ func TestSessionSatisfiesTwoEnforcedOrgs(t *testing.T) {
 	h.ids.SetMembership(h.ctx, acme.ID, ou.ID, identity.RoleDeveloper, "manual")
 	if r := other.get("/console/orgs/acme/keys"); r.Status != http.StatusForbidden {
 		t.Fatalf("other user reached acme: %d", r.Status)
+	}
+}
+
+// TestOrgIdPSessionIsScoped covers an org IdP minting an assertion for a
+// linked subject: the resulting session reaches only that org, not the
+// person's other orgs, platform admin, or new sign-in methods.
+func TestOrgIdPSessionIsScoped(t *testing.T) {
+	h := newHarness(t, open)
+	_, idp2, _ := h.orgSSO(t)
+	acme, _ := h.ids.OrgBySlug(h.ctx, "acme")
+	h.ids.UpdateOrgSettings(h.ctx, acme.ID, identity.OrgSettings{Name: "Acme", JITEnabled: true, DefaultRole: identity.RoleViewer})
+	b := h.browser()
+	idp2.SetUser(authtest.User{Subject: "dev", Email: "dev@acme.example"})
+	b.follow(b.get("/auth/oidc/acme-sso/start"), 3)
+	u, err := h.ids.UserByEmail(h.ctx, "dev@acme.example")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Later the same person gains access elsewhere.
+	other := h.org("other", h.user("boss@other.example"))
+	h.ids.SetMembership(h.ctx, other.ID, u.ID, identity.RoleAdmin, "manual")
+	h.ids.SetPlatformAdmin(h.ctx, u.ID, true)
+	// A fresh acme-IdP sign-in (e.g. minted by acme's IdP admin).
+	b2 := h.browser()
+	b2.follow(b2.get("/auth/oidc/acme-sso/start"), 3)
+	if r := b2.get("/console/orgs/acme"); r.Status != http.StatusOK {
+		t.Fatalf("acme via acme SSO: %d", r.Status)
+	}
+	if r := b2.get("/console/orgs/other"); r.Status != http.StatusNotFound {
+		t.Fatalf("other org via acme-only session: %d", r.Status)
+	}
+	if r := b2.get("/console/admin"); r.Status != http.StatusNotFound {
+		t.Fatalf("platform admin via acme-only session: %d", r.Status)
+	}
+	if r := b2.post("/console/account/links/test-idp", nil, true); !strings.Contains(b2.flash(r), "Sign in again") {
+		t.Fatal("acme-only session added a sign-in method")
 	}
 }

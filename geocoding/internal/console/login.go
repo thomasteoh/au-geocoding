@@ -227,12 +227,18 @@ func (s *Server) completeLogin(w http.ResponseWriter, r *http.Request, a identit
 // startSession replaces any current session with a new one (new ID on every
 // login, A1) and sets the cookie.
 func (s *Server) startSession(w http.ResponseWriter, r *http.Request, u identity.User, n identity.NewSession) bool {
+	_, ok := s.startSessionWith(w, r, u, n)
+	return ok
+}
+
+// startSessionWith is startSession returning the new session.
+func (s *Server) startSessionWith(w http.ResponseWriter, r *http.Request, u identity.User, n identity.NewSession) (identity.Session, bool) {
 	n.UserID = u.ID
 	n.UserAgent = r.UserAgent()
 	raw, sess, err := s.IDs.CreateSession(r.Context(), n, s.Cfg.Session)
 	if err != nil {
 		s.serverError(w, r, err)
-		return false
+		return identity.Session{}, false
 	}
 	if old := cookieValue(r, sessionCookie); old != "" {
 		// Same person signing in again (e.g. into a second org's SSO): keep
@@ -246,7 +252,7 @@ func (s *Server) startSession(w http.ResponseWriter, r *http.Request, u identity
 		s.IDs.DeleteSession(r.Context(), identity.HashToken(old))
 	}
 	setCookie(w, sessionCookie, raw, s.Cfg.Session.Max, http.SameSiteLaxMode)
-	return true
+	return sess, true
 }
 
 func (s *Server) denyLogin(w http.ResponseWriter, r *http.Request, c identity.Connection, d *identity.Denial) {

@@ -95,7 +95,14 @@ func (s *Server) requireOrg(min identity.Role, h http.Handler) http.Handler {
 			return
 		}
 		oc := &OrgContext{Org: org, Role: role}
-		if v.User.PlatformAdmin && role < identity.RoleOwner {
+		general := s.IDs.SessionHasGeneralAccess(r.Context(), v.Session)
+		if !general && !s.IDs.SessionSatisfiesOrg(r.Context(), v.Session.IDHash, org.ID, s.Cfg.Session.Max) {
+			// This session came only through other orgs' IdPs; it does not
+			// reach this org at all.
+			s.renderError(w, r, http.StatusNotFound, "Not found. Sign in with your usual method to see your other organisations.")
+			return
+		}
+		if v.User.PlatformAdmin && general && role < identity.RoleOwner {
 			oc.Role, oc.ViaPlatformAdmin = identity.RoleOwner, true
 		}
 		if oc.Role == identity.RoleNone {
@@ -116,7 +123,7 @@ func (s *Server) requireOrg(min identity.Role, h http.Handler) http.Handler {
 
 func (s *Server) requirePlatformAdmin(h http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if v := viewerFrom(r.Context()); v == nil || !v.User.PlatformAdmin {
+		if v := viewerFrom(r.Context()); v == nil || !v.User.PlatformAdmin || !s.IDs.SessionHasGeneralAccess(r.Context(), v.Session) {
 			s.renderError(w, r, http.StatusNotFound, "Not found.")
 			return
 		}
@@ -215,12 +222,11 @@ func safeReturn(p string) string {
 // of the org's own connections. An owner on a passkey session (break-glass)
 // and platform admins are exempt.
 func (s *Server) ssoSatisfied(r *http.Request, v *Viewer, oc *OrgContext) bool {
-	if !oc.Org.SSOEnforced || v.User.PlatformAdmin {
+	if !oc.Org.SSOEnforced || (v.User.PlatformAdmin && s.IDs.SessionHasGeneralAccess(r.Context(), v.Session)) {
 		return true
 	}
-	if v.Session.Method == "passkey" && oc.Role == identity.RoleOwner {
-		return true
-	}
+	// Owners' passkey break-glass arrives as proofs granted at passkey
+	// sign-in, only for orgs whose SSO the passkey was registered under.
 	return s.IDs.SessionSatisfiesOrg(r.Context(), v.Session.IDHash, oc.Org.ID, s.Cfg.Session.Max)
 }
 

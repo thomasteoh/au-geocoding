@@ -531,3 +531,27 @@ themselves out.
   needs GroupMember.Read.All consented). If that fails, the sign-in still
   works and the person's role is left unchanged rather than recomputed from
   an empty list.
+
+## Org-scoped sessions
+
+A session that came only through org connections (no platform connection,
+no passkey, no platform proof) is scoped: it reaches only the orgs whose
+connections it signed in through, never platform admin, and it cannot link
+another sign-in method or register a passkey. An org's IdP admin controls
+what that IdP asserts, so a linked subject must not become a key to the
+person's whole account. Signing in with a platform connection or a passkey
+gives general access; proofs from both are carried as described above.
+
+Further session-proof rules:
+
+- OIDC back-channel logout and SAML IdP-initiated logout also revoke proofs
+  carried into later sessions from the logged-out IdP session.
+- A disabled connection's sessions and proofs end at once, and its proofs
+  never satisfy enforcement.
+- Owner break-glass: a passkey records the org connections of the session
+  it was registered from. A passkey sign-in gets proofs only for those orgs,
+  and only where the person is still an owner. A passkey registered from a
+  platform session never satisfies an org's enforcement.
+- A user's own link and passkey-registration ceremonies replace their
+  unfinished earlier ones, and both start endpoints share the sign-in rate
+  limit.

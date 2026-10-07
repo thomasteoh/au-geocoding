@@ -186,6 +186,9 @@ func (s *Store) ResolveLogin(ctx context.Context, a Assertion, p LoginPolicy) (L
 		return LoginResult{}, err
 	}
 	if err := s.afterLogin(ctx, u, a, p, created); err != nil {
+		// A denied first login must not leave the identity linked, or the
+		// next login would skip every check above as a known identity.
+		s.db.ExecContext(ctx, `DELETE FROM identities WHERE connection_id=? AND subject=?`, c.ID, a.Subject)
 		return LoginResult{}, err
 	}
 	u, err = s.UserByID(ctx, u.ID)

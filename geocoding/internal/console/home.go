@@ -92,7 +92,7 @@ func (s *Server) handleAccount(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	s.render(w, r, http.StatusOK, "account", Page{Title: "Your account", Active: "account", Data: accountData{Sessions: rows, Passkeys: pks,
-		Identities: ids, Linkable: linkable, CanLink: linkFresh(v.Session)}})
+		Identities: ids, Linkable: linkable, CanLink: s.canAddMethod(r, v.Session)}})
 }
 
 func (s *Server) handleAccountProfile(w http.ResponseWriter, r *http.Request) {

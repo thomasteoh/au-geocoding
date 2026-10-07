@@ -276,6 +276,18 @@ func (s *Store) SaveConnection(ctx context.Context, c Connection) (Connection, e
 		if _, err := tx.ExecContext(ctx, `DELETE FROM sessions WHERE connection_id=?`, c.ID); err != nil {
 			return c, err
 		}
+		if _, err := tx.ExecContext(ctx, `DELETE FROM session_proofs WHERE connection_id=?`, c.ID); err != nil {
+			return c, err
+		}
+	}
+	if old.Enabled && !c.Enabled {
+		// A disabled connection grants nothing, now or later.
+		if _, err := tx.ExecContext(ctx, `DELETE FROM sessions WHERE connection_id=?`, c.ID); err != nil {
+			return c, err
+		}
+		if _, err := tx.ExecContext(ctx, `DELETE FROM session_proofs WHERE connection_id=?`, c.ID); err != nil {
+			return c, err
+		}
 	}
 	if err := tx.Commit(); err != nil {
 		return c, err
