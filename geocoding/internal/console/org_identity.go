@@ -773,6 +773,8 @@ func issuerErr(err error) string {
 		return "That issuer and audience are already registered."
 	case errors.Is(err, identity.ErrInvalid):
 		return "Check the fields and try again."
+	case errors.Is(err, identity.ErrTooManyIssuers):
+		return fmt.Sprintf("An organisation can register at most %d issuers. Remove one first.", identity.MaxJWTIssuersPerOrg)
 	}
 	return ""
 }

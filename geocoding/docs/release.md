@@ -70,19 +70,38 @@ docker compose run --rm --entrypoint keygen augeo -app-db /data/app.db -label my
 docker compose up -d places augeo prometheus
 ```
 
+In compose, au-places is not published to the host: it has no
+authentication, and augeo reaches it on the compose network at
+`http://places:8080`. For debugging, publish it on loopback only with a local
+`docker-compose.override.yml` (`ports: ["127.0.0.1:8090:8080"]` under
+`places`). Prometheus is pinned to a release tag and bound to
+`127.0.0.1:9090`.
+
+The image creates `/data` owned by the runtime user (uid 10001) and declares
+it a volume, so a fresh named volume is writable for `app.db`. A bind mount
+must be writable by uid 10001.
+
+Base images are `alpine:3.22` (both services). They are pinned by tag, not
+yet by digest: look the digest up with
+`docker buildx imagetools inspect alpine:3.22` and pin
+`FROM alpine:3.22@sha256:<digest>` (see the TODO in each Dockerfile).
+
 ## Config (D-020)
 
 Precedence: flag > env > file > default. Env prefix `AUGEO_`. Validated at
 boot; a misconfigured server fails fast (exit 1). See `internal/config` for the
-full set. Secrets support the `_FILE` convention (e.g. `AUGEO_LLM_API_KEY_FILE`).
+full set. Secrets support the `_FILE` convention (`LLM_API_KEY_FILE`,
+`CTRL_TOKEN_FILE`, `SECRET_KEY_FILE`, `SMTP_PASSWORD_FILE`); a `_FILE` that is
+set but cannot be read fails boot with an error naming the variable.
 
 | Group | Keys |
 |-------|------|
-| Server | `ADDR`, `READ_TIMEOUT`, `WRITE_TIMEOUT`, `IDLE_TIMEOUT`, `SHUTDOWN_GRACE` |
+| Server | `ADDR`, `READ_TIMEOUT`, `WRITE_TIMEOUT`, `IDLE_TIMEOUT`, `SHUTDOWN_GRACE`, `TRUSTED_PROXY` (comma-separated IPs/CIDRs) |
 | Data | `DATA_DIR`, `GNAF_DB`, `POIS_DB`, `APP_DB`, `STATES` |
 | Limits | `MAX_QUERY_LEN`, `MAX_RESULTS`, `MAX_RADIUS_M`, `MAX_BODY_BYTES`, `REQUEST_TIMEOUT` |
-| Rate | `ANON_RPS`, `ANON_BURST`, `ANON_DAILY`, `KEY_DEFAULT_RPS`, `KEY_DEFAULT_BURST`, `KEY_DEFAULT_DAILY` |
-| Anon LLM | `ANON_LLM_DAILY_PER_IP`, `ANON_LLM_DAILY_GLOBAL` |
+| Rate | `ANON_RPS`, `ANON_BURST`, `ANON_DAILY`, `ANON_DAILY_GLOBAL` (1000; 0 = none), `KEY_DEFAULT_RPS`, `KEY_DEFAULT_BURST`, `KEY_DEFAULT_DAILY` |
+| Anon LLM | `ANON_LLM_DAILY_PER_IP` (10), `ANON_LLM_DAILY_GLOBAL` (1000): anonymous LLM-rung calls; 0 turns anonymous LLM off |
+| Control | `CTRL_TOKEN` / `CTRL_TOKEN_FILE` |
 | LLM | `LLM_BASE_URL`, `LLM_API_KEY`, `LLM_MODEL`, `LLM_TIMEOUT`, `LLM_MAX_TOKENS` |
 | Queue | `QUEUE_DEPTH`, `QUEUE_WORKERS`, `QUEUE_PER_KEY_INFLIGHT`, `BREAKER_THRESHOLD`, `BREAKER_COOLDOWN` |
 | Cache | `CACHE_ENTRIES`, `CACHE_TTL` |
@@ -91,12 +110,20 @@ full set. Secrets support the `_FILE` convention (e.g. `AUGEO_LLM_API_KEY_FILE`)
 | Web | `DEMO_ENABLED`, `DEMO_MAP_ENABLED`, `CORS_ORIGINS` |
 | Log | `LOG_LEVEL`, `LOG_FORMAT` |
 
-The effective config is logged at boot with secrets redacted.
+The effective config is logged at boot with secrets redacted: API key,
+secret key, SMTP password and control token blanked, `STATE_DSN` blanked,
+userinfo and query string stripped from `LLM_BASE_URL`, and bootstrap admin
+emails replaced by a count.
+
+`ANON_LLM_DAILY_GLOBAL` used to double as the anonymous *row* ceiling; that
+is now `ANON_DAILY_GLOBAL` (same default, 1000).
 
 ## Health
 
 - `GET /healthz` — liveness only.
-- `GET /readyz` — readiness: loaded G-NAF/OSM state + dataset version.
+- `GET /readyz` — readiness: loaded G-NAF/OSM state + dataset version. When
+  au-places is unreachable the status is plain `not_ready`; the cause is
+  logged (`readyz_not_ready`), never echoed.
 - `GET /metrics` — Prometheus text format, counters/histograms only (no
   query-derived labels).
 
@@ -123,7 +150,8 @@ the scope `search`.
 via `AUGEO_CTRL_TOKEN` — empty disables the endpoint (fail closed). GET returns
 the config with the API key redacted; POST updates a subset and keeps the rest.
 **The POST body is bounded** (1 MiB) — a misconfigured or oversized body is
-rejected. `AUGEO_CTRL_TOKEN` is a secret — never pass it as a flag.
+rejected. `AUGEO_CTRL_TOKEN` is a secret — never pass it as a flag; mount it
+and set `AUGEO_CTRL_TOKEN_FILE` instead.
 
 ## CI (P9)
 

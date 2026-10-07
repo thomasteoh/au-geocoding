@@ -18,7 +18,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/coreos/go-oidc/v3/oidc"
 	jose "github.com/go-jose/go-jose/v4"
 	"github.com/go-jose/go-jose/v4/jwt"
 
@@ -43,7 +42,12 @@ type Authenticator struct {
 	Issuers     IssuerSource // nil disables bearer tokens
 	KeyLimiter  *publicapi.RateLimiter
 	AnonLimiter *publicapi.RateLimiter
-	ClientIP    func(*http.Request) string
+	// BearerIPLimiter is a per-client-IP bucket taken before a bearer token
+	// is verified, so a flood of forged tokens from one address is refused
+	// before it costs signature checks, DB lookups or JWKS fetches. nil
+	// disables it.
+	BearerIPLimiter *publicapi.RateLimiter
+	ClientIP        func(*http.Request) string
 	// Reject is called with a reason code when a credential is refused.
 	Reject func(reason string)
 	// HTTPClient fetches discovery documents and JWKS. Issuer URLs are
@@ -56,7 +60,7 @@ type Authenticator struct {
 }
 
 type keySet struct {
-	set     *oidc.RemoteKeySet
+	set     *cachedKeySet
 	fetched time.Time
 	failed  bool // discovery failed; retried after failTTL
 }
@@ -69,7 +73,8 @@ const failTTL = time.Minute
 const Leeway = 60 * time.Second
 
 // keySetTTL bounds how long a discovered JWKS URL is reused before discovery
-// runs again (keys themselves refresh on unknown kid).
+// runs again (keys themselves refresh on unknown kid, at most once per
+// JWKSRefetchInterval).
 const keySetTTL = time.Hour
 
 func (a *Authenticator) reject(reason string) error {
@@ -101,6 +106,9 @@ func (a *Authenticator) Authenticate(r *http.Request) (publicapi.Principal, erro
 		}
 		return p, nil
 	case authz != "":
+		if a.BearerIPLimiter != nil && !a.BearerIPLimiter.Allow("bearer:"+a.ClientIP(r)) {
+			return publicapi.Principal{}, publicapi.ErrRateLimited
+		}
 		p, err := a.bearer(r.Context(), authz)
 		if err != nil {
 			return publicapi.Principal{}, err
@@ -288,7 +296,7 @@ func (a *Authenticator) client() *http.Client {
 
 // keySet returns the cached key set for an issuer row, running discovery
 // when no JWKS URL is configured.
-func (a *Authenticator) keySet(ctx context.Context, iss identity.JWTIssuer) (*oidc.RemoteKeySet, error) {
+func (a *Authenticator) keySet(ctx context.Context, iss identity.JWTIssuer) (*cachedKeySet, error) {
 	cacheKey := strconv.FormatInt(iss.ID, 10) + "|" + iss.Issuer + "|" + iss.JWKSURL
 	a.mu.Lock()
 	if a.sets == nil {
@@ -316,7 +324,7 @@ func (a *Authenticator) keySet(ctx context.Context, iss identity.JWTIssuer) (*oi
 			return nil, err
 		}
 	}
-	set := oidc.NewRemoteKeySet(oidc.ClientContext(context.Background(), a.client()), jwksURL)
+	set := newCachedKeySet(jwksURL, a.client())
 	a.mu.Lock()
 	a.sets[cacheKey] = &keySet{set: set, fetched: time.Now()}
 	a.mu.Unlock()

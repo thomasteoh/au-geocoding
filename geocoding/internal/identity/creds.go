@@ -65,15 +65,14 @@ func (s *Store) SaveJWTIssuer(ctx context.Context, j JWTIssuer) (JWTIssuer, erro
 	}
 	subs := strings.Join(j.AllowedSubjects, " ")
 	if j.ID == 0 {
-		res, err := s.db.ExecContext(ctx, `INSERT INTO jwt_issuers(org_id, issuer, audience, jwks_url, scope_prefix, allowed_subjects, enabled, created) VALUES (?,?,?,?,?,?,?,?)`,
-			j.OrgID, j.Issuer, j.Audience, j.JWKSURL, j.ScopePrefix, subs, b2i(j.Enabled), now())
+		id, err := s.insertJWTIssuer(ctx, j, subs)
 		if err != nil {
 			if isUnique(err) {
 				return j, ErrConflict
 			}
 			return j, err
 		}
-		j.ID, _ = res.LastInsertId()
+		j.ID = id
 		return s.OrgJWTIssuer(ctx, j.OrgID, j.ID)
 	}
 	res, err := s.db.ExecContext(ctx, `UPDATE jwt_issuers SET issuer=?, audience=?, jwks_url=?, scope_prefix=?, allowed_subjects=?, enabled=? WHERE id=? AND org_id=?`,
