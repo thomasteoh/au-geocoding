@@ -18,10 +18,18 @@ RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/keygen 
 
 # Runtime stage: minimal, runs as non-root. curl is needed for the compose
 # healthcheck (alpine base image ships no curl).
-FROM alpine:3.20
+# alpine:3.20 is past end of support; 3.22 is a supported release.
+# TODO: pin by digest for reproducible builds. Look the digest up with
+#   docker buildx imagetools inspect alpine:3.22
+# and write FROM alpine:3.22@sha256:<digest>.
+FROM alpine:3.22
 RUN apk add --no-cache curl && addgroup -g 10001 augeo && adduser -D -u 10001 -G augeo augeo
 COPY --from=build /out/augeo /usr/local/bin/augeo
 COPY --from=build /out/keygen /usr/local/bin/keygen
+# /data holds app.db. Create it owned by the runtime user so a fresh named
+# volume (which copies this directory's ownership) is writable by uid 10001.
+RUN mkdir -p /data && chown 10001:10001 /data
+VOLUME /data
 USER augeo
 EXPOSE 8080
 # Split mode is the default deployment: the geocoder calls au-places over the

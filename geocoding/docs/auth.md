@@ -89,9 +89,11 @@ The anonymous sign-in endpoints share a token bucket per client IP
 callback, the SAML ACS and `POST /auth/passkey/login/begin` and `/finish`. A
 full sign-in uses two or three tokens. Over the limit the answer is 429 with
 `Retry-After`: an error page, or JSON for the passkey endpoints. The client
-IP is the TCP peer, or the `X-Forwarded-For` client when the peer is
-`AUGEO_TRUSTED_PROXY` (the same rule as the public API). Buckets live in
-memory, per process.
+IP is the TCP peer or, when the peer is one of `AUGEO_TRUSTED_PROXY`
+(comma-separated IPs or CIDRs), the first untrusted `X-Forwarded-For`
+entry counting from the right; a malformed entry falls back to the peer
+(the same rule as the public API). IPv6 clients are keyed by their /64.
+Buckets live in memory, per process.
 
 `return_to` must be a relative path starting with `/console`; anything else
 becomes `/console`.
@@ -376,6 +378,18 @@ The principal is `jwt:<issuer id>:<sub>`. Rate limits apply per principal;
 the daily row quota is charged to the org at the org's tier. A request with
 both `X-Api-Key` and `Authorization` is a 400.
 
+Cost controls on the bearer path:
+
+- Before a token is parsed, the client IP takes a token from a per-IP
+  bucket (at the keyed default rate), so a flood of forged tokens from one
+  address is refused with 429 before any signature check or lookup.
+- Keys are cached per issuer registration. A token is verified against the
+  cached keys first; the JWKS is fetched again only when the token's `kid`
+  is not in the cache, and at most once per 30 s per key set (a failed
+  fetch counts too). A token with a known `kid` and a bad signature never
+  causes a fetch.
+- An org can register at most 10 issuers.
+
 ## API keys
 
 Keys keep the T6 design: random, `SHA-256(key ‖ pepper)` with a non-secret
@@ -384,6 +398,11 @@ prefix index and constant-time comparison. New:
 - Keys created in the console belong to an org (`org_id`), record their
   creator, take the org's tier and can carry an expiry. Their raw value is
   shown once.
+- When a platform admin moves an org off the batch tier, the batch scope is
+  removed from all of the org's keys in the same transaction. A key whose
+  only scope was `batch` is left with the scope `none` (no endpoint), never
+  the empty set, which would default to `search`. `/batch` also checks the
+  caller's tier on every request.
 - Revocation in the console updates the in-memory index at once.
 - Deleting an org revokes its keys in the same transaction as the org's
   delete, and issuing an org key checks inside its own transaction (after
@@ -512,6 +531,7 @@ labels, never secrets, raw tokens or queries.
 | A13 | Forced org join (an attacker invites a victim, who is joined at sign-in and then cannot be linked by their employer) | Invites accepted only explicitly in the console, except an org connection's own org |
 | A14 | SCIM offboarding leaving access (membership source rewritten, sessions in the org kept) | Deactivation keyed on the `scim_users` link: membership removed whatever its source, the org's sessions and proofs dropped, sign-in through the org denied |
 | A15 | Quota multiplication through many orgs; JWT audience squatting | Per-user org creation cap; per-org `(issuer, audience)` uniqueness with ambiguous pairs refused and flagged in the console |
+| A16 | Forged bearer tokens forcing JWKS fetches | Per-IP bucket before verification; cached keys checked first; refetch only for an unknown `kid`, at most once per 30 s per key set; 10 issuers per org |
 
 ## Invites
 

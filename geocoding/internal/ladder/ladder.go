@@ -504,6 +504,18 @@ func (r *LLMRung) Try(ctx context.Context, q Query) (string, contract.ResolveRes
 	if !r.Breaker.Allow() {
 		return "", contract.ResolveResponse{}, ErrLLMDegraded
 	}
+	// Per-caller admission (Queue.PerKeyInflight) comes before the shared
+	// queue, so one caller cannot hold every queue slot.
+	g := gateFrom(ctx)
+	if g.Enter != nil {
+		leave, err := g.Enter()
+		if err != nil {
+			return "", contract.ResolveResponse{}, err
+		}
+		if leave != nil {
+			defer leave()
+		}
+	}
 	if !r.Admit() {
 		return "", contract.ResolveResponse{}, ErrQueueFull
 	}
@@ -519,6 +531,15 @@ func (r *LLMRung) Try(ctx context.Context, q Query) (string, contract.ResolveRes
 	// Deadline shedding: if the request already timed out, drop it.
 	if ctx.Err() != nil {
 		return "", contract.ResolveResponse{}, ctx.Err()
+	}
+	if r.Provider == nil {
+		return "", contract.ResolveResponse{}, ErrLLMNotImplemented
+	}
+	// Count the call against the caller's LLM budget before spending it.
+	if g.Charge != nil {
+		if err := g.Charge(); err != nil {
+			return "", contract.ResolveResponse{}, err
+		}
 	}
 	resp, err := r.callLLM(ctx, q)
 	if err != nil {

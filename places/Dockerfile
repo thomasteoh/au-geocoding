@@ -19,7 +19,11 @@ RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/auplace
 
 # Runtime stage: minimal, runs as non-root, mounts data read-only.
 # curl is needed for the compose healthcheck (alpine base image ships no curl).
-FROM alpine:3.20
+# alpine:3.20 is past end of support; 3.22 is a supported release.
+# TODO: pin by digest for reproducible builds. Look the digest up with
+#   docker buildx imagetools inspect alpine:3.22
+# and write FROM alpine:3.22@sha256:<digest>.
+FROM alpine:3.22
 RUN apk add --no-cache curl && addgroup -g 10001 auplaces && adduser -D -u 10001 -G auplaces auplaces
 COPY --from=build /out/auplaces-server /usr/local/bin/auplaces-server
 COPY --from=build /out/auplaces-load /usr/local/bin/auplaces-load

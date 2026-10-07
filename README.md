@@ -28,7 +28,7 @@ go build ./shared/... ./geocoding/... ./places/...
 ```sh
 docker compose run --rm loader                     # build the dataset (one-shot)
 docker compose run --rm --entrypoint keygen augeo -app-db /data/app.db -label my-key
-docker compose up -d places augeo prometheus
+docker compose up -d places augeo prometheus     # only augeo (8099) is published
 ```
 
 Images build from the repository root so `shared/` is in the context:

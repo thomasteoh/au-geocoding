@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"net/netip"
 	"net/url"
 	"os"
 	"strconv"
@@ -27,7 +28,11 @@ type Config struct {
 		WriteTimeout  int    `json:"write_timeout"`
 		IdleTimeout   int    `json:"idle_timeout"`
 		ShutdownGrace int    `json:"shutdown_grace"`
-		TrustedProxy  string `json:"trusted_proxy"`
+		// TrustedProxy is a comma-separated list of reverse-proxy addresses or
+		// CIDRs whose X-Forwarded-For entries are trusted.
+		TrustedProxy string `json:"trusted_proxy"`
+		// TrustedProxies is TrustedProxy parsed at Load.
+		TrustedProxies []netip.Prefix `json:"-"`
 	} `json:"server"`
 	Data struct {
 		DataDir string   `json:"data_dir"`
@@ -44,13 +49,18 @@ type Config struct {
 		RequestTimeout int `json:"request_timeout"`
 	} `json:"limits"`
 	Rate struct {
-		AnonRPS         float64 `json:"anon_rps"`
-		AnonBurst       float64 `json:"anon_burst"`
-		AnonDaily       int64   `json:"anon_daily"`
+		AnonRPS   float64 `json:"anon_rps"`
+		AnonBurst float64 `json:"anon_burst"`
+		AnonDaily int64   `json:"anon_daily"`
+		// AnonDailyGlobal caps anonymous result rows per day across all IPs
+		// (per replica). 0 means no global ceiling.
+		AnonDailyGlobal int64   `json:"anon_daily_global"`
 		KeyDefaultRPS   float64 `json:"key_default_rps"`
 		KeyDefaultBurst float64 `json:"key_default_burst"`
 		KeyDefaultDaily int64   `json:"key_default_daily"`
 	} `json:"rate"`
+	// AnonLLM caps anonymous LLM-rung calls per day, per IP and across all
+	// IPs (per replica). 0 turns anonymous LLM access off.
 	AnonLLM struct {
 		DailyPerIP  int64 `json:"daily_per_ip"`
 		DailyGlobal int64 `json:"daily_global"`
@@ -94,6 +104,9 @@ type Config struct {
 		Format string `json:"format"`
 	} `json:"log"`
 	PlacesURL string `json:"places_url"` // split-mode au-places base URL; "" = single-binary
+	// CtrlToken gates /ctrl/llm. Env only (AUGEO_CTRL_TOKEN or
+	// AUGEO_CTRL_TOKEN_FILE); never a flag or file key.
+	CtrlToken string `json:"-"`
 	Auth      Auth   `json:"auth"`
 	SMTP      SMTP   `json:"smtp"`
 }
@@ -165,8 +178,10 @@ func Load(args []string, filePath string) (Config, error) {
 			return cfg, err
 		}
 	}
-	// Env (overrides file).
-	applyEnv(&cfg)
+	// Env (overrides file). A secret _FILE that cannot be read fails boot.
+	if errs := applyEnv(&cfg); len(errs) > 0 {
+		return cfg, fmt.Errorf("invalid config: %s", strings.Join(errs, "; "))
+	}
 
 	// Parse flags LAST: flag > env > file > default (D-020). Flag defaults are
 	// captured at registration — which is after file+env — so an unset flag keeps
@@ -175,7 +190,7 @@ func Load(args []string, filePath string) (Config, error) {
 	var configPath string
 	fs.StringVar(&configPath, "config", "", "config file path")
 	fs.StringVar(&cfg.Server.Addr, "addr", cfg.Server.Addr, "listen address")
-	fs.StringVar(&cfg.Server.TrustedProxy, "trusted-proxy", cfg.Server.TrustedProxy, "IP of a reverse proxy whose X-Forwarded-For is trusted")
+	fs.StringVar(&cfg.Server.TrustedProxy, "trusted-proxy", cfg.Server.TrustedProxy, "comma-separated reverse proxy IPs or CIDRs whose X-Forwarded-For is trusted")
 	fs.StringVar(&cfg.Data.GNAFDB, "gnaf-db", cfg.Data.GNAFDB, "G-NAF database")
 	fs.StringVar(&cfg.Data.POISDB, "pois-db", cfg.Data.POISDB, "POI database")
 	fs.StringVar(&cfg.Data.AppDB, "app-db", cfg.Data.AppDB, "app.db (service state)")
@@ -211,12 +226,47 @@ func Load(args []string, filePath string) (Config, error) {
 	if cfg.Limits.MaxBodyBytes <= 0 {
 		cfg.Limits.MaxBodyBytes = 1 << 20
 	}
+	proxies, err := ParseTrustedProxies(cfg.Server.TrustedProxy)
+	if err != nil {
+		errs = append(errs, err.Error())
+	}
+	cfg.Server.TrustedProxies = proxies
 	errs = append(errs, validateAuth(&cfg.Auth)...)
 	errs = append(errs, validateSMTP(&cfg.SMTP)...)
 	if len(errs) > 0 {
 		return cfg, fmt.Errorf("invalid config: %s", strings.Join(errs, "; "))
 	}
 	return cfg, nil
+}
+
+// ParseTrustedProxies parses a comma-separated list of IPs and CIDRs. A bare
+// IP becomes a single-address prefix. IPv4-mapped IPv6 is unmapped.
+func ParseTrustedProxies(s string) ([]netip.Prefix, error) {
+	var out []netip.Prefix
+	for _, f := range strings.Split(s, ",") {
+		f = strings.TrimSpace(f)
+		if f == "" {
+			continue
+		}
+		if strings.Contains(f, "/") {
+			p, err := netip.ParsePrefix(f)
+			if err != nil {
+				return nil, fmt.Errorf("trusted-proxy: %q is not an IP or CIDR", f)
+			}
+			if p.Addr().Is4In6() {
+				p = netip.PrefixFrom(p.Addr().Unmap(), p.Bits()-96)
+			}
+			out = append(out, p.Masked())
+			continue
+		}
+		a, err := netip.ParseAddr(f)
+		if err != nil {
+			return nil, fmt.Errorf("trusted-proxy: %q is not an IP or CIDR", f)
+		}
+		a = a.Unmap()
+		out = append(out, netip.PrefixFrom(a, a.BitLen()))
+	}
+	return out, nil
 }
 
 func validateAuth(a *Auth) []string {
@@ -329,6 +379,7 @@ func setDefaults(c *Config) {
 	c.Rate.AnonRPS = 2
 	c.Rate.AnonBurst = 5
 	c.Rate.AnonDaily = 100
+	c.Rate.AnonDailyGlobal = 1000
 	c.Rate.KeyDefaultRPS = 20
 	c.Rate.KeyDefaultBurst = 40
 	c.Rate.KeyDefaultDaily = 10000
@@ -371,7 +422,8 @@ func loadFile(path string, c *Config) error {
 	return nil
 }
 
-func applyEnv(c *Config) {
+func applyEnv(c *Config) []string {
+	var errs []string
 	str := func(key string, dst *string) {
 		if v, ok := os.LookupEnv("AUGEO_" + key); ok {
 			*dst = v
@@ -419,6 +471,7 @@ func applyEnv(c *Config) {
 	flt("ANON_RPS", &c.Rate.AnonRPS)
 	flt("ANON_BURST", &c.Rate.AnonBurst)
 	num64("ANON_DAILY", &c.Rate.AnonDaily)
+	num64("ANON_DAILY_GLOBAL", &c.Rate.AnonDailyGlobal)
 	flt("KEY_DEFAULT_RPS", &c.Rate.KeyDefaultRPS)
 	flt("KEY_DEFAULT_BURST", &c.Rate.KeyDefaultBurst)
 	num64("KEY_DEFAULT_DAILY", &c.Rate.KeyDefaultDaily)
@@ -449,16 +502,8 @@ func applyEnv(c *Config) {
 	if v, ok := os.LookupEnv("AUGEO_STATES"); ok {
 		c.Data.States = strings.Split(v, ",")
 	}
-	// LLM_API_KEY via _FILE convention.
-	if v, ok := os.LookupEnv("AUGEO_LLM_API_KEY_FILE"); ok {
-		b, err := os.ReadFile(v)
-		if err == nil {
-			c.LLM.APIKey = strings.TrimSpace(string(b))
-		}
-	}
-	if v, ok := os.LookupEnv("AUGEO_LLM_API_KEY"); ok {
-		c.LLM.APIKey = v
-	}
+	errs = append(errs, secretFromEnv("LLM_API_KEY", &c.LLM.APIKey)...)
+	errs = append(errs, secretFromEnv("CTRL_TOKEN", &c.CtrlToken)...)
 	str("PUBLIC_URL", &c.Auth.PublicURL)
 	str("AUTH_SIGNUP", &c.Auth.Signup)
 	num("AUTH_SESSION_IDLE", &c.Auth.SessionIdle)
@@ -478,28 +523,47 @@ func applyEnv(c *Config) {
 			}
 		}
 	}
-	secretFromEnv("SECRET_KEY", &c.Auth.SecretKey)
+	errs = append(errs, secretFromEnv("SECRET_KEY", &c.Auth.SecretKey)...)
 	str("SMTP_HOST", &c.SMTP.Host)
 	num("SMTP_PORT", &c.SMTP.Port)
 	str("SMTP_USERNAME", &c.SMTP.Username)
 	str("SMTP_FROM", &c.SMTP.From)
 	str("SMTP_TLS", &c.SMTP.TLS)
-	secretFromEnv("SMTP_PASSWORD", &c.SMTP.Password)
+	errs = append(errs, secretFromEnv("SMTP_PASSWORD", &c.SMTP.Password)...)
 
 	// LLM enabled only when BaseURL is set.
 	c.LLM.Enabled = c.LLM.BaseURL != ""
+	return errs
 }
 
-// secretFromEnv reads AUGEO_<key>_FILE, then AUGEO_<key> (which wins).
-func secretFromEnv(key string, dst *string) {
+// secretFromEnv reads AUGEO_<key>_FILE, then AUGEO_<key> (which wins). A
+// _FILE that is set but cannot be read is an error: booting without the
+// secret the operator asked for would silently change behaviour (an empty
+// control token disables /ctrl/llm, an empty LLM key fails every call). The
+// error names the variable, never the file contents.
+func secretFromEnv(key string, dst *string) []string {
+	var errs []string
 	if v, ok := os.LookupEnv("AUGEO_" + key + "_FILE"); ok {
-		if b, err := os.ReadFile(v); err == nil {
+		b, err := os.ReadFile(v)
+		if err != nil {
+			errs = append(errs, fmt.Sprintf("AUGEO_%s_FILE: cannot read %s: %v", key, v, unwrapPathErr(err)))
+		} else {
 			*dst = strings.TrimSpace(string(b))
 		}
 	}
 	if v, ok := os.LookupEnv("AUGEO_" + key); ok {
 		*dst = v
 	}
+	return errs
+}
+
+// unwrapPathErr drops the path from an *os.PathError (it is already in the
+// message) and keeps the cause.
+func unwrapPathErr(err error) error {
+	if pe, ok := err.(*os.PathError); ok {
+		return pe.Err
+	}
+	return err
 }
 
 // Redacted returns a copy of the config safe to log — secrets blanked (runtime.md:
@@ -515,5 +579,36 @@ func (c Config) Redacted() Config {
 	if cp.SMTP.Password != "" {
 		cp.SMTP.Password = "REDACTED"
 	}
+	if cp.CtrlToken != "" {
+		cp.CtrlToken = "REDACTED"
+	}
+	// The cluster DSN usually carries credentials.
+	if cp.Cluster.StateDSN != "" {
+		cp.Cluster.StateDSN = "REDACTED"
+	}
+	cp.LLM.BaseURL = redactURL(cp.LLM.BaseURL)
+	// Admin emails are personal data; log how many, not who.
+	if n := len(cp.Auth.BootstrapAdmins); n > 0 {
+		cp.Auth.BootstrapAdmins = []string{fmt.Sprintf("REDACTED(%d)", n)}
+	}
 	return cp
+}
+
+// redactURL strips userinfo and the query string (where providers put API
+// keys) from a URL. An unparseable URL is replaced outright.
+func redactURL(s string) string {
+	if s == "" {
+		return s
+	}
+	u, err := url.Parse(s)
+	if err != nil {
+		return "REDACTED"
+	}
+	if u.User != nil {
+		u.User = url.User("REDACTED")
+	}
+	if u.RawQuery != "" {
+		u.RawQuery = "REDACTED"
+	}
+	return u.String()
 }
