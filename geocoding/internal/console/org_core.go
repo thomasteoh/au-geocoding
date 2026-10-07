@@ -2,6 +2,7 @@ package console
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"net/http"
@@ -154,7 +155,12 @@ func (s *Server) handleKeyCreate(w http.ResponseWriter, r *http.Request) {
 		expires = &t
 	}
 	k, raw, err := s.Keys.IssueKeyWith(publicapi.IssueOptions{Label: label, Tier: publicapi.QuotaTier(oc.Org.Tier), Scopes: scopes,
-		OrgID: oc.Org.ID, CreatedBy: v.User.ID, Expires: expires})
+		OrgID: oc.Org.ID, CreatedBy: v.User.ID, Expires: expires,
+		Guard: func(tx *sql.Tx) error { return identity.OrgExistsTx(r.Context(), tx, oc.Org.ID) }})
+	if errors.Is(err, identity.ErrNotFound) {
+		s.notFound(w, r)
+		return
+	}
 	if err != nil {
 		s.serverError(w, r, err)
 		return
@@ -379,8 +385,17 @@ func (s *Server) handleInviteCreate(w http.ResponseWriter, r *http.Request) {
 		s.renderError(w, r, http.StatusForbidden, "Only owners can invite owners.")
 		return
 	}
+	// Re-inviting replaces the pending invite's role, so changing an owner
+	// invite is an owner's call too.
+	if cur, ok, err := s.pendingInvite(r, func(in identity.Invite) bool { return in.Email == email }); err != nil {
+		s.serverError(w, r, err)
+		return
+	} else if ok && !canManage(oc.Role, cur.Role) {
+		s.renderError(w, r, http.StatusForbidden, "Only owners can change an owner invitation.")
+		return
+	}
 	// Existing accounts get a pending invite like anyone else: they accept it
-	// by signing in, so nobody is added to an org without acting, and the
+	// in the console, so nobody is added to an org without acting, and the
 	// response never reveals whether an account exists.
 	if u, err := s.IDs.UserByEmail(r.Context(), email); err == nil {
 		if cur, err := s.IDs.Role(r.Context(), oc.Org.ID, u.ID); err == nil && cur != identity.RoleNone {
@@ -397,12 +412,12 @@ func (s *Server) handleInviteCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.audit(r, oc.Org.ID, "invite.create", email, "role="+role.String())
-	msg := "Invited " + email + ". They join as " + role.String() + " when they next sign in."
+	msg := "Invited " + email + " as " + role.String() + ". They join when they accept the invitation in their console after signing in."
 	switch s.queueInviteEmail(r, oc.Org, v.User, email, role, time.Now().Add(inviteTTL)) {
 	case inviteMailQueued:
 		msg += " We are emailing them a sign-in link."
 	case inviteMailLimited:
-		msg += " No email was sent: too many invitation emails went to this address or from this organisation recently. Send them " +
+		msg += " No email was sent: too many invitation emails went to this address, from this organisation or from you recently. Send them " +
 			s.abs("/auth/login") + " yourself."
 	case inviteMailFailed:
 		msg += " The invitation email could not be sent; send them " + s.abs("/auth/login") + " yourself."
@@ -417,17 +432,16 @@ func (s *Server) handleInviteDelete(w http.ResponseWriter, r *http.Request) {
 		s.notFound(w, r)
 		return
 	}
-	var email string
-	invites, err := s.IDs.Invites(r.Context(), oc.Org.ID)
+	in, ok, err := s.pendingInvite(r, func(in identity.Invite) bool { return in.ID == id })
 	if err != nil {
 		s.serverError(w, r, err)
 		return
 	}
-	for _, in := range invites {
-		if in.ID == id {
-			email = in.Email
-		}
+	if ok && !canManage(oc.Role, in.Role) {
+		s.renderError(w, r, http.StatusForbidden, "Only owners can delete an owner invitation.")
+		return
 	}
+	email := in.Email
 	err = s.IDs.DeleteInvite(r.Context(), oc.Org.ID, id)
 	if errors.Is(err, identity.ErrNotFound) {
 		s.notFound(w, r)
@@ -439,6 +453,20 @@ func (s *Server) handleInviteDelete(w http.ResponseWriter, r *http.Request) {
 	}
 	s.audit(r, oc.Org.ID, "invite.delete", email, "")
 	redirectFlash(w, r, orgPath(oc, "members"), "Invite deleted.")
+}
+
+// pendingInvite finds an unexpired invite of the context org.
+func (s *Server) pendingInvite(r *http.Request, match func(identity.Invite) bool) (identity.Invite, bool, error) {
+	invites, err := s.IDs.Invites(r.Context(), orgFrom(r.Context()).Org.ID)
+	if err != nil {
+		return identity.Invite{}, false, err
+	}
+	for _, in := range invites {
+		if match(in) {
+			return in, true, nil
+		}
+	}
+	return identity.Invite{}, false, nil
 }
 
 // --- domains ---
@@ -647,13 +675,13 @@ func (s *Server) handleOrgDelete(w http.ResponseWriter, r *http.Request) {
 	}
 	// Audit rows have no foreign key, so this one outlives the org.
 	s.audit(r, oc.Org.ID, "org.delete", oc.Org.Slug, "")
-	if err := s.Keys.RevokeOrgKeys(oc.Org.ID); err != nil {
+	// Keys are revoked in the delete's own transaction; a key being issued
+	// at the same moment is either revoked here or refused by its org check.
+	err := s.IDs.DeleteOrgWith(r.Context(), oc.Org.ID, func(tx *sql.Tx) error { return s.Keys.RevokeOrgKeysTx(tx, oc.Org.ID) })
+	if err != nil {
 		s.serverError(w, r, err)
 		return
 	}
-	if err := s.IDs.DeleteOrg(r.Context(), oc.Org.ID); err != nil {
-		s.serverError(w, r, err)
-		return
-	}
+	s.Keys.ForgetOrgKeys(oc.Org.ID)
 	redirectFlash(w, r, "/console", "Deleted "+oc.Org.Name+".")
 }

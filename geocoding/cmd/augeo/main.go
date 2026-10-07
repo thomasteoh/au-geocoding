@@ -95,6 +95,7 @@ func main() {
 		log.Error("boot_failed", "reason", "identity_db", "error", err.Error())
 		os.Exit(1)
 	}
+	ids.DefaultOrgTier = cfg.Auth.DefaultOrgTier
 	// Admin-controlled URLs (discovery, JWKS, SAML metadata) are fetched
 	// through a client that refuses private addresses (SSRF).
 	fetch := safehttp.Client(10*time.Second, cfg.Auth.AllowPrivateFetch)
@@ -132,9 +133,10 @@ func main() {
 		}
 		rp := &oidcrp.RP{CallbackURL: cfg.Auth.PublicURL + "/auth/oidc/callback", HTTP: fetch}
 		con, err = console.New(console.Config{
-			PublicURL: cfg.Auth.PublicURL,
-			Session:   identity.SessionPolicy{Idle: time.Duration(cfg.Auth.SessionIdle) * time.Second, Max: time.Duration(cfg.Auth.SessionMax) * time.Second},
-			Login:     identity.LoginPolicy{SignupOpen: cfg.Auth.Signup == "open", BootstrapAdmins: cfg.Auth.BootstrapAdmins},
+			PublicURL:      cfg.Auth.PublicURL,
+			Session:        identity.SessionPolicy{Idle: time.Duration(cfg.Auth.SessionIdle) * time.Second, Max: time.Duration(cfg.Auth.SessionMax) * time.Second},
+			Login:          identity.LoginPolicy{SignupOpen: cfg.Auth.Signup == "open", BootstrapAdmins: cfg.Auth.BootstrapAdmins},
+			MaxOrgsPerUser: cfg.Auth.MaxOrgsPerUser,
 		}, ids, store, rp, log, fetch)
 		if err != nil {
 			log.Error("boot_failed", "reason", "console", "error", err.Error())

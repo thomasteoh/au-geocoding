@@ -2,6 +2,9 @@
 <h1>OAuth tokens</h1>
 <p class="muted">Machine clients can call the API with an access token from your own identity provider instead of an API key. Register the issuer here, then have the client use the client-credentials grant at your IdP.</p>
 
+{{if $d.Shared}}
+<p class="error" role="alert">Another organisation has registered the same issuer and audience as an issuer marked "shared" below. Tokens for that pair are refused for both organisations, because they could belong to either. Use an audience specific to this organisation (for example its own app registration's application ID URI).</p>
+{{end}}
 {{if $d.Issuers}}
 <table>
   <thead><tr><th>Issuer</th><th>Audience</th><th>Scope prefix</th><th>Subjects</th><th>Status</th><th></th></tr></thead>
@@ -10,7 +13,7 @@
     <td><a href="{{$base}}/{{.ID}}">{{.Issuer}}</a></td><td><code>{{.Audience}}</code></td>
     <td>{{if .ScopePrefix}}<code>{{.ScopePrefix}}</code>{{else}}<span class="muted">none</span>{{end}}</td>
     <td>{{if .AllowedSubjects}}{{len .AllowedSubjects}} allowed{{else}}any{{end}}</td>
-    <td>{{if .Enabled}}Enabled{{else}}<span class="muted">Disabled</span>{{end}}</td>
+    <td>{{if .Enabled}}Enabled{{else}}<span class="muted">Disabled</span>{{end}}{{if index $d.Shared .ID}} <strong>(shared: tokens refused)</strong>{{end}}</td>
     <td><form method="post" action="{{$base}}/{{.ID}}/delete" class="inline"><input type="hidden" name="csrf" value="{{$.CSRF}}"><button type="submit" class="danger" aria-label="Remove issuer {{.Issuer}}">Remove</button></form></td>
   </tr>{{end}}
   </tbody>
@@ -27,7 +30,7 @@
   <p id="issuer-help" class="note">Must match the token's <code>iss</code> exactly.</p>
   <label for="audience">Audience</label>
   <input id="audience" name="audience" required maxlength="512" value="{{$f.Audience}}" placeholder="api://au-geocoder" aria-describedby="aud-help">
-  <p id="aud-help" class="note">Tokens must list this value in <code>aud</code>.</p>
+  <p id="aud-help" class="note">Tokens must list this value in <code>aud</code>. Use an audience only your organisation's clients receive: if another organisation registers the same issuer and audience, tokens for it are refused for both.</p>
   <label for="jwks_url">JWKS URL (optional)</label>
   <input id="jwks_url" name="jwks_url" type="url" pattern="https://.*" value="{{$f.JWKSURL}}" aria-describedby="jwks-help">
   <p id="jwks-help" class="note">Leave blank to find the keys through the issuer's OpenID discovery document.</p>

@@ -23,6 +23,10 @@ var (
 	// MailRecipientGlobalPerDay bounds emails to one address from all orgs
 	// together, so many throwaway orgs cannot flood a mailbox.
 	MailRecipientGlobalPerDay = 20
+	// MailSenderPerDay bounds invite emails one inviting user may queue,
+	// across all their orgs, so the platform's mail cannot be turned into
+	// one person's mailing list.
+	MailSenderPerDay = 20
 )
 
 // MailRetention is how long finished outbox rows (without recipient or body)
@@ -66,6 +70,13 @@ func (s *Store) recipientHash(to string) []byte {
 // MailRecipientPerDay in the last day. The check and the insert run under
 // one write lock, so concurrent invites cannot both slip under a limit.
 func (s *Store) EnqueueInviteMail(ctx context.Context, orgID int64, to, subject, body string) error {
+	return s.EnqueueInviteMailFrom(ctx, orgID, 0, to, subject, body)
+}
+
+// EnqueueInviteMailFrom is EnqueueInviteMail with the inviting user
+// recorded; that user may queue at most MailSenderPerDay invite emails a
+// day across all their orgs.
+func (s *Store) EnqueueInviteMailFrom(ctx context.Context, orgID, senderID int64, to, subject, body string) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -78,18 +89,20 @@ func (s *Store) EnqueueInviteMail(ctx context.Context, orgID int64, to, subject,
 	}
 	rh := s.recipientHash(to)
 	day := ts(t.Add(-24 * time.Hour))
-	var nOrg, nRcpt, nGlobal int
+	var nOrg, nRcpt, nGlobal, nSender int
 	if err := tx.QueryRowContext(ctx, `SELECT (SELECT COUNT(*) FROM mail_outbox WHERE org_id=? AND created>?),
 		(SELECT COUNT(*) FROM mail_outbox WHERE recipient_hash=? AND org_id IS ? AND created>?),
-		(SELECT COUNT(*) FROM mail_outbox WHERE recipient_hash=? AND created>?)`,
-		orgID, ts(t.Add(-time.Hour)), rh, nullID(orgID), day, rh, day).Scan(&nOrg, &nRcpt, &nGlobal); err != nil {
+		(SELECT COUNT(*) FROM mail_outbox WHERE recipient_hash=? AND created>?),
+		(SELECT COUNT(*) FROM mail_outbox WHERE sender_id=? AND created>?)`,
+		orgID, ts(t.Add(-time.Hour)), rh, nullID(orgID), day, rh, day, senderID, day).Scan(&nOrg, &nRcpt, &nGlobal, &nSender); err != nil {
 		return err
 	}
-	if nOrg >= MailOrgPerHour || nRcpt >= MailRecipientPerDay || nGlobal >= MailRecipientGlobalPerDay {
+	if nOrg >= MailOrgPerHour || nRcpt >= MailRecipientPerDay || nGlobal >= MailRecipientGlobalPerDay ||
+		senderID != 0 && nSender >= MailSenderPerDay {
 		return ErrMailRateLimited
 	}
-	if _, err := tx.ExecContext(ctx, `INSERT INTO mail_outbox(org_id, kind, recipient, recipient_hash, subject, body, next_attempt, created, updated)
-		VALUES (?,?,?,?,?,?,?,?,?)`, nullID(orgID), "invite", to, rh, subject, body, ts(t), ts(t), ts(t)); err != nil {
+	if _, err := tx.ExecContext(ctx, `INSERT INTO mail_outbox(org_id, kind, recipient, recipient_hash, subject, body, next_attempt, created, updated, sender_id)
+		VALUES (?,?,?,?,?,?,?,?,?,?)`, nullID(orgID), "invite", to, rh, subject, body, ts(t), ts(t), ts(t), nullID(senderID)); err != nil {
 		return err
 	}
 	return tx.Commit()

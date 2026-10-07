@@ -418,6 +418,11 @@ type IssueOptions struct {
 	OrgID     int64
 	CreatedBy int64
 	Expires   *time.Time
+	// Guard, if set, runs in the insert's transaction after the insert
+	// (which holds SQLite's write lock); an error aborts the issue. The
+	// console passes an org-exists check, so a key cannot outlive an org
+	// deleted concurrently (see DeleteOrgWith / RevokeOrgKeysTx).
+	Guard func(*sql.Tx) error
 }
 
 // IssueKeyWith creates a key with an optional org, creator and expiry. The
@@ -441,13 +446,26 @@ func (s *Store) IssueKeyWith(o IssueOptions) (Key, string, error) {
 	if o.Expires != nil {
 		expires = o.Expires.UTC().Format(time.RFC3339)
 	}
-	res, err := s.db.Exec(`INSERT INTO api_keys(prefix, hash, label, quota_tier, enabled, scopes, created, org_id, created_by, expires)
+	tx, err := s.db.Begin()
+	if err != nil {
+		return Key{}, "", err
+	}
+	defer tx.Rollback()
+	res, err := tx.Exec(`INSERT INTO api_keys(prefix, hash, label, quota_tier, enabled, scopes, created, org_id, created_by, expires)
 		VALUES (?, ?, ?, ?, 1, ?, ?, ?, ?, ?)`,
 		prefix, hash[:], o.Label, tierName(o.Tier), strings.Join(o.Scopes, " "), created.Format(time.RFC3339), nullInt(o.OrgID), nullInt(o.CreatedBy), expires)
 	if err != nil {
 		return Key{}, "", err
 	}
 	id, _ := res.LastInsertId()
+	if o.Guard != nil {
+		if err := o.Guard(tx); err != nil {
+			return Key{}, "", err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return Key{}, "", err
+	}
 	k := Key{ID: id, Prefix: prefix, Hash: hash, Label: o.Label, Tier: o.Tier, Enabled: true, Scopes: o.Scopes, Created: created,
 		OrgID: o.OrgID, CreatedBy: o.CreatedBy, Expires: o.Expires}
 	s.keys[prefix] = k
@@ -505,6 +523,30 @@ func (s *Store) RevokeOrgKeys(orgID int64) error {
 		}
 	}
 	return nil
+}
+
+// RevokeOrgKeysTx revokes every live key of an org inside tx (org
+// deletion, with the org's delete in the same transaction). Call
+// ForgetOrgKeys after the commit to update the in-memory index.
+func (s *Store) RevokeOrgKeysTx(tx *sql.Tx, orgID int64) error {
+	_, err := tx.Exec(`UPDATE api_keys SET enabled=0, revoked=? WHERE org_id=? AND revoked IS NULL`,
+		time.Now().UTC().Format(time.RFC3339), orgID)
+	return err
+}
+
+// ForgetOrgKeys marks every key of an org revoked in the in-memory index,
+// so they stop authenticating at once (after RevokeOrgKeysTx committed).
+func (s *Store) ForgetOrgKeys(orgID int64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	t := time.Now().UTC()
+	for p, k := range s.keys {
+		if k.OrgID == orgID && k.Revoked == nil {
+			k.Enabled = false
+			k.Revoked = &t
+			s.keys[p] = k
+		}
+	}
 }
 
 // SetOrgTier moves every live key of an org to a new tier, in the table and

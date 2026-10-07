@@ -1,6 +1,6 @@
 {{define "content"}}
 <h1>Members</h1>
-{{$slug := .Org.Org.Slug}}{{$csrf := .CSRF}}{{$admin := atLeast .Org.Role "admin"}}
+{{$slug := .Org.Org.Slug}}{{$csrf := .CSRF}}{{$admin := atLeast .Org.Role "admin"}}{{$owner := atLeast .Org.Role "owner"}}
 {{with .Data}}{{$grant := .Grantable}}
 <table>
   <thead><tr><th>Email</th><th>Name</th><th>Role</th><th>Source</th><th>Last sign-in</th>{{if $admin}}<th></th>{{end}}</tr></thead>
@@ -30,14 +30,14 @@
     <thead><tr><th>Email</th><th>Role</th><th>Invited</th><th>Expires</th><th></th></tr></thead>
     <tbody>
     {{range .}}<tr><td>{{.Email}}</td><td>{{.Role}}</td><td>{{when .Created}}</td><td>{{when .Expires}}</td>
-      <td><form method="post" action="/console/orgs/{{$slug}}/invites/{{.ID}}/delete" class="inline">
+      <td>{{if or $owner (ne .Role.String "owner")}}<form method="post" action="/console/orgs/{{$slug}}/invites/{{.ID}}/delete" class="inline">
         <input type="hidden" name="csrf" value="{{$csrf}}">
-        <button type="submit" class="danger" aria-label="Delete invite for {{.Email}}">Delete</button></form></td></tr>{{end}}
+        <button type="submit" class="danger" aria-label="Delete invite for {{.Email}}">Delete</button></form>{{end}}</td></tr>{{end}}
     </tbody>
   </table>
   {{else}}<p>No pending invites.</p>{{end}}
   <h2>Invite someone</h2>
-  <p class="muted">Invites last 14 days. The person joins with the chosen role the first time they sign in. Someone who already has an account is added straight away.</p>
+  <p class="muted">Invites last 14 days. The person joins with the chosen role when they accept the invitation in their console after signing in, whether or not they already have an account.</p>
   <form method="post" action="/console/orgs/{{$slug}}/invites">
     <input type="hidden" name="csrf" value="{{$csrf}}">
     <label for="invite-email">Email</label>
