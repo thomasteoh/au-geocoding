@@ -106,7 +106,7 @@ func main() {
 		if *limit > 0 && i >= *limit {
 			break
 		}
-		rel, score, fields := normalise.Tokenise(q.text, 32, localitySet)
+		rel, score, fields := normalise.Tokenise(q.text, 32, localitySet, fs.NearestLocality)
 		qm := match.Query{Reliable: rel, Score: score, Fields: fields}
 		start := time.Now()
 		cands, err := match.Generate(ctx, db, qm, fs, *capN)

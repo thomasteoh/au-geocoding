@@ -4,6 +4,18 @@ package normalise
 // Per INV-7: untrusted text never influences query structure; operator chars
 // are discarded, whitelisted tokens only, token count capped.
 //
+// An Australian address is read by position, not token shape:
+//
+//	[unit /] number  street-name  street-type  locality  [state] [postcode]
+//
+// Shape alone gets the common cases wrong. "1440" is a street number before the
+// street and a postcode after it; "ST" is Saint at the start of a name ("ST
+// KILDA RD") and Street after one ("FITZROY ST"); localities run to several
+// words (BOX HILL NORTH). Parse finds the locality first (the longest known
+// name at the end of the text), then the street type is the first type word
+// after the start of the street name, and everything else follows from where
+// it sits.
+//
 // Street-type expansion is shared with the geocoder (ausystem/shared/streettype)
 // so a new street type is added once. The locality typo aliases below are
 // places-specific and stay here.
@@ -15,100 +27,278 @@ import (
 	"ausystem/shared/streettype"
 )
 
-// Alias map: common Australian locality/street abbreviations.
-// The design resolves LOCALITY_ALIAS at interpretation; the spike's normaliser
-// carries the same idea for the common cases the corpus uses.
-// Street-type abbreviations (st/rd/ave/...) expand via streettype.Expand;
-// locality typos (melb, collns, steet, melborne) are handled here.
+// Alias map: common Australian locality/street abbreviations and typos,
+// applied per word to street names and localities. G-NAF spells Saint as ST
+// and Mount in full, so both are normalised to the dataset's form.
 var Alias = map[string]string{
-	"melb":     "MELBOURNE",
-	"collins":  "COLLINS", // exact match already
-	"collns":   "COLLINS", // typo alias — the T4 case
-	"steet":    "STREET",  // typo alias — T4
-	"melborne": "MELBOURNE",
+	"MELB":     "MELBOURNE",
+	"COLLNS":   "COLLINS", // typo alias — the T4 case
+	"STEET":    "STREET",  // typo alias — T4
+	"MELBORNE": "MELBOURNE",
+	"SAINT":    "ST",
+	"MT":       "MOUNT",
 }
 
-// Reliable tokens are locality/state/postcode/street-number — the anchors.
-// The contract: Generate = reliable, Score = everything.
-// REAL-DATA FINDING (2026-09-14): street_name must ALSO be a generation
-// anchor. With only locality+state+number as anchors, generation is too broad
-// at real scale (10K+ candidates for locality+state alone), and the cap
-// truncates the true match. Street name is the strongest discriminator —
-// generation narrows by street+locality, then scoring picks the number.
-var reliableSet = map[string]bool{
-	"locality_name": true,
-	"state":         true,
-	"postcode":      true,
-	"street_number": true,
-	"street_name":   true,
+// unitWords introduce a unit, flat, shop or level number ("UNIT 3", "LVL 2").
+// G-NAF scores street addresses here, so the unit is recognised and dropped.
+var unitWords = map[string]bool{
+	"UNIT": true, "U": true, "FLAT": true, "F": true, "APARTMENT": true,
+	"APT": true, "SUITE": true, "SHOP": true, "LEVEL": true, "LVL": true,
+	"L": true,
 }
 
-// Tokenise splits text into normalised tokens. Discards operator chars,
-// uppercases, collapses whitespace, resolves aliases.
-// localitySet is the known locality names from the DB (the caller supplies it);
-// when a token matches, it becomes a reliable anchor.
-// Returns reliable tokens, score tokens, and a per-token field tag so the
-// scorer can match street-to-street, locality-to-locality (the fix the spike
-// found: without field tags, scoring conflates fields and match rate drops).
-func Tokenise(input string, maxTokens int, localitySet map[string]bool) (reliable []string, score []string, fields []string) {
-	// Strip anything that isn't a letter, digit, or apostrophe — INV-7.
-	// Operator characters (AND, OR, *, quotes) never survive.
-	clean := regexp.MustCompile(`[^A-Za-z0-9'\s]`).ReplaceAllString(input, " ")
-	raw := strings.Fields(strings.ToUpper(clean))
+var (
+	stripRe    = regexp.MustCompile(`[^A-Z0-9'/\-\s]`)
+	numberRe   = regexp.MustCompile(`^([0-9]+)[A-Z]?$`)
+	unitWordRe = regexp.MustCompile(`^(UNIT|APT|SHOP|LVL|U|F|L)([0-9]+)[A-Z]?$`)
+)
 
-	// Cap token count.
-	if maxTokens > 0 && len(raw) > maxTokens {
-		raw = raw[:maxTokens]
-	}
+// Parsed is a free-text address split into its parts.
+type Parsed struct {
+	Unit       string
+	Number     string
+	Street     string // street name, words joined with single spaces
+	StreetType string // canonical full form (STREET, ROAD, ...)
+	Locality   string
+	State      string
+	Postcode   string
+	Rest       []string // words that fit no slot
 
-	// Classify each token to a field, resolve aliases, split reliable/score.
-	var rel, sc, fl []string
-	for _, f := range raw {
-		// Alias resolution (typo/abbrev → canonical). Locality typos come from
-		// the local Alias map; street-type abbreviations expand via the shared
-		// streettype vocabulary (st → STREET, rd → ROAD, ave → AVENUE, ...).
-		if canon, ok := Alias[f]; ok {
-			f = canon
-		} else if streettype.IsStreetType(f) {
-			f = streettype.Expand(f)
-		}
-		field := fieldOf(f, localitySet)
-		// Reliable if it's an anchor kind (state, postcode, locality, number)
-		// OR a street name — street_name is a generation anchor (real-data
-		// finding: locality+state alone is too broad at 15.9M scale).
-		if isState(f) || isPostcode(f) || localitySet[f] || isNumber(f) || field == "street_name" {
-			rel = append(rel, f)
-		}
-		sc = append(sc, f)
-		fl = append(fl, field)
-	}
-	// Dedupe reliable.
-	seen := map[string]bool{}
-	var relOut []string
-	for _, t := range rel {
-		if !seen[t] {
-			seen[t] = true
-			relOut = append(relOut, t)
-		}
-	}
-	return relOut, sc, fl
+	// uncertain is set when neither a street type nor a locality was found,
+	// so the split between street and locality is unknown. Tokens then
+	// anchors each word separately and lets generation sort it out.
+	uncertain bool
 }
 
-// fieldOf classifies a token to a field: locality, state, postcode,
-// street_number, or street_name. The normaliser needs the locality set.
-func fieldOf(f string, localitySet map[string]bool) string {
-	switch {
-	case isState(f):
-		return "state"
-	case isPostcode(f):
-		return "postcode"
-	case localitySet[f]:
-		return "locality"
-	case isNumber(f):
-		return "street_number"
-	default:
-		return "street_name"
+// NearestLocality returns the known locality closest to a (possibly
+// misspelt) name and its similarity in [0,1].
+type NearestLocality func(name string) (string, float64)
+
+// Similarity thresholds for fuzzy locality recognition. Extending an exact
+// match leftwards ("NOTRH MELBOURNE" for NORTH MELBOURNE) needs a closer match
+// than finding one from nothing, because the exact match already stands.
+const (
+	nearFind   = 0.75
+	nearExtend = 0.8
+)
+
+// Parse splits free text into address parts. localitySet is the known
+// locality names (upper case); with it, multi-word localities are recognised
+// and a locality is told apart from a street. Without it, the words after the
+// street type are taken as the locality. nearest, when not nil, recognises
+// misspelt localities; the canonical name replaces the misspelling.
+func Parse(input string, maxTokens int, localitySet map[string]bool, nearest NearestLocality) Parsed {
+	clean := stripRe.ReplaceAllString(strings.ToUpper(input), " ")
+	clean = strings.NewReplacer("/", " / ", "-", " - ").Replace(clean)
+	toks := strings.Fields(clean)
+	if maxTokens > 0 && len(toks) > maxTokens {
+		toks = toks[:maxTokens]
 	}
+
+	var p Parsed
+	i := 0
+	// Unit and street number. Accepts "UNIT 3 15", "U3 15", "3/15", "15-17"
+	// (a range: the first number is G-NAF's number_first) and "15A".
+	for i < len(toks) {
+		t := toks[i]
+		if unitWords[t] && i+1 < len(toks) && numberRe.MatchString(toks[i+1]) {
+			p.Unit = numberRe.FindStringSubmatch(toks[i+1])[1]
+			i += 2
+			continue
+		}
+		if m := unitWordRe.FindStringSubmatch(t); m != nil {
+			p.Unit = m[2]
+			i++
+			continue
+		}
+		m := numberRe.FindStringSubmatch(t)
+		if m == nil || p.Number != "" {
+			break
+		}
+		if i+2 < len(toks) && toks[i+1] == "/" && numberRe.MatchString(toks[i+2]) {
+			p.Unit = m[1]
+			p.Number = numberRe.FindStringSubmatch(toks[i+2])[1]
+			i += 3
+		} else {
+			p.Number = m[1]
+			i++
+			if i+1 < len(toks) && toks[i] == "-" && numberRe.MatchString(toks[i+1]) {
+				i += 2
+			}
+		}
+	}
+
+	// The remaining words, without separators, aliases applied.
+	var words []string
+	for _, t := range toks[i:] {
+		if t == "/" || t == "-" {
+			continue
+		}
+		if canon, ok := Alias[t]; ok {
+			t = canon
+		}
+		words = append(words, t)
+	}
+	if len(words) == 0 {
+		return p
+	}
+
+	// Postcode and state come last, in either order.
+	for len(words) > 0 {
+		last := words[len(words)-1]
+		switch {
+		case p.Postcode == "" && isPostcode(last) && (len(words) > 1 || p.Number != ""):
+			p.Postcode = last
+		case p.State == "" && isState(last) && len(words) > 1:
+			p.State = last
+		case last == "AUSTRALIA" && len(words) > 1:
+		default:
+			goto located
+		}
+		words = words[:len(words)-1]
+	}
+located:
+
+	// Locality: the longest known name ending as late as possible, leaving at
+	// least one word for the street. A bare locality ("BOX HILL NORTH") is
+	// allowed when it is the whole text.
+	locStart, locEnd := -1, -1
+	for end := len(words); end > 0 && locStart < 0; end-- {
+		for n := min(4, end); n >= 1; n-- {
+			start := end - n
+			if start == 0 && end != len(words) {
+				continue
+			}
+			if localitySet[strings.Join(words[start:end], " ")] {
+				locStart, locEnd = start, end
+				break
+			}
+		}
+	}
+	if nearest != nil {
+		locStart, locEnd = fuzzyLocality(words, locStart, locEnd, nearest, &p)
+	}
+	street := words
+	var trailing []string
+	if locStart >= 0 && p.Locality == "" {
+		p.Locality = strings.Join(words[locStart:locEnd], " ")
+	}
+	if locStart >= 0 {
+		street = words[:locStart]
+		trailing = words[locEnd:]
+	}
+
+	// Street type: the first type word after the first word of the name. A
+	// type word at the start is part of the name (ST GEORGES, PARADE ...).
+	typeAt := -1
+	for j := 1; j < len(street); j++ {
+		if streettype.IsStreetType(street[j]) {
+			typeAt = j
+			break
+		}
+	}
+	if typeAt < 0 {
+		p.Street = strings.Join(street, " ")
+	} else {
+		p.Street = strings.Join(street[:typeAt], " ")
+		p.StreetType = streettype.Expand(street[typeAt])
+		after := street[typeAt+1:]
+		if locStart < 0 && len(after) > 0 {
+			// No known locality: the words after the street type are it.
+			p.Locality = strings.Join(after, " ")
+		} else {
+			trailing = append(after, trailing...)
+		}
+		// "THE ESPLANADE": the type word is the name. G-NAF stores some of
+		// these as ESPLANADE and some as THE BOULEVARD; the name word alone
+		// generates both, and scoring sorts out the rest.
+		if p.Street == "THE" {
+			p.Street = p.StreetType
+			p.StreetType = ""
+		}
+	}
+	p.uncertain = locStart < 0 && typeAt < 0
+	p.Rest = trailing
+	return p
+}
+
+// fuzzyLocality improves the exact locality match [start,end) with nearest.
+// An exact match is extended leftwards when the longer span is a misspelt
+// longer locality (WRECKYN NOTRH MELBOURNE is NORTH MELBOURNE, not MELBOURNE).
+// With no exact match and no street type to split on, the best near match
+// among the trailing spans is taken. A found name is written to p.Locality.
+func fuzzyLocality(words []string, start, end int, nearest NearestLocality, p *Parsed) (int, int) {
+	if start >= 0 {
+		for k := 2; k >= 1; k-- {
+			s := start - k
+			if s < 1 {
+				continue
+			}
+			name, sim := nearest(strings.Join(words[s:end], " "))
+			if sim >= nearExtend && len(strings.Fields(name)) == end-s {
+				p.Locality = name
+				return s, end
+			}
+		}
+		return start, end
+	}
+	for j := 1; j < len(words); j++ {
+		if streettype.IsStreetType(words[j]) {
+			return -1, -1 // the street type splits street from locality
+		}
+	}
+	best, bestSim, bestStart := "", 0.0, -1
+	for s := len(words) - 1; s >= 1 && s >= len(words)-3; s-- {
+		name, sim := nearest(strings.Join(words[s:], " "))
+		if sim >= nearFind && sim >= bestSim {
+			best, bestSim, bestStart = name, sim, s
+		}
+	}
+	if bestStart < 0 {
+		return -1, -1
+	}
+	p.Locality = best
+	return bestStart, len(words)
+}
+
+// Tokenise parses text and returns the matcher's inputs: reliable tokens
+// (generation anchors, most important first), score tokens, and a field tag
+// per score token. Anchor order matters: when the full set generates nothing,
+// generation drops anchors from the end, so the number and postcode go before
+// the locality, and the street name is kept longest.
+func Tokenise(input string, maxTokens int, localitySet map[string]bool, nearest NearestLocality) (reliable []string, score []string, fields []string) {
+	return Parse(input, maxTokens, localitySet, nearest).Tokens()
+}
+
+// Tokens converts a parsed address into the matcher's inputs (see Tokenise).
+func (p Parsed) Tokens() (reliable []string, score []string, fields []string) {
+	add := func(v, field string, anchor bool) {
+		if v == "" {
+			return
+		}
+		score = append(score, v)
+		fields = append(fields, field)
+		if anchor {
+			reliable = append(reliable, v)
+		}
+	}
+	if p.uncertain {
+		// Street and locality are run together: anchor each word.
+		for _, w := range strings.Fields(p.Street) {
+			add(w, "street_name", true)
+		}
+	} else {
+		add(p.Street, "street_name", true)
+	}
+	add(p.Locality, "locality_name", true)
+	add(p.Postcode, "postcode", true)
+	add(p.Number, "street_number", true)
+	add(p.StreetType, "street_type", false)
+	add(p.State, "state", false)
+	for _, r := range p.Rest {
+		add(r, "", false)
+	}
+	return reliable, score, fields
 }
 
 func isState(f string) bool {
@@ -121,18 +311,6 @@ func isState(f string) bool {
 
 func isPostcode(f string) bool {
 	if len(f) != 4 {
-		return false
-	}
-	for _, c := range f {
-		if c < '0' || c > '9' {
-			return false
-		}
-	}
-	return true
-}
-
-func isNumber(f string) bool {
-	if f == "" {
 		return false
 	}
 	for _, c := range f {

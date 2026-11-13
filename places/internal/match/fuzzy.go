@@ -65,6 +65,26 @@ func LoadFuzzySet(ctx context.Context, db *sql.DB) (*FuzzySet, error) {
 	return fs, rows.Err()
 }
 
+// Localities returns the known locality names (upper case). The map is shared,
+// not copied: callers must not modify it.
+func (fs *FuzzySet) Localities() map[string]bool { return fs.localities }
+
+// NearestLocality returns the known locality closest to name by edit distance,
+// and its similarity. It scans the locality names (a few thousand per state).
+func (fs *FuzzySet) NearestLocality(name string) (string, float64) {
+	up := strings.ToUpper(name)
+	if fs.localities[up] {
+		return up, 1
+	}
+	best, bestSim := "", 0.0
+	for loc := range fs.localities {
+		if s := levenshteinSim(up, loc); s > bestSim {
+			best, bestSim = loc, s
+		}
+	}
+	return best, bestSim
+}
+
 // Resolve finds the canonical form of a possibly-typo'd token. If the token is
 // already in the set, it returns it unchanged. Otherwise it finds the best
 // edit-distance near-match in the set, PREFERRING streets that exist in the
@@ -117,11 +137,16 @@ func (q Query) fuzzyGenerate(ctx context.Context, db *sql.DB, fs *FuzzySet, cap 
 		}
 	}
 	var phrases []string
+	seen := map[string]bool{}
 	for _, t := range q.Reliable {
 		if t == "" || len(t) < 3 {
 			continue
 		}
 		resolved := fs.Resolve(t, queryLoc, 0.75)
+		if seen[resolved] {
+			continue
+		}
+		seen[resolved] = true
 		phrases = append(phrases, `"`+strings.ReplaceAll(resolved, `"`, `""`)+`"`)
 	}
 	if len(phrases) == 0 {
@@ -129,7 +154,7 @@ func (q Query) fuzzyGenerate(ctx context.Context, db *sql.DB, fs *FuzzySet, cap 
 	}
 	// Try full AND with resolved anchors.
 	match := strings.Join(phrases, " AND ")
-	cands, err := generateMatch(ctx, db, match, cap)
+	cands, err := generateMatch(ctx, db, q, match, cap)
 	if err != nil {
 		return nil, err
 	}
@@ -139,7 +164,7 @@ func (q Query) fuzzyGenerate(ctx context.Context, db *sql.DB, fs *FuzzySet, cap 
 	// Still zero: drop one anchor at a time (resolved).
 	for i := len(phrases) - 1; i > 0; i-- {
 		relaxed := strings.Join(phrases[:i], " AND ")
-		cands, err := generateMatch(ctx, db, relaxed, cap)
+		cands, err := generateMatch(ctx, db, q, relaxed, cap)
 		if err != nil {
 			return nil, err
 		}

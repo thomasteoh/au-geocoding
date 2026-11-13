@@ -40,6 +40,25 @@ go build -o auplaces-load ./cmd/buildaddr
 The server is a single static binary (CGO-free, `modernc.org/sqlite`). It embeds
 the demo UI and docs.
 
+## Accuracy checks
+
+Two checks need a real dataset, so CI does not run them. Run both before
+changing the parser, generation or scoring:
+
+```
+# 57 real Victorian addresses as people type them (units, "St" as Saint,
+# 4-digit street numbers, multi-word localities), through /search and /resolve
+AUPLACES_GOLDEN_DB=/path/to/vic.db go test ./internal/api -run Golden -v
+
+# 500 misspelt addresses; reports the match rate
+go run ./cmd/gen -real -db /path/to/vic.db -corpus testdata/corpus_real.tsv -cap 200
+```
+
+The golden test opens the dataset read-only. A dataset built before
+`idx_addr_pid` was added to `buildaddr` needs
+`CREATE UNIQUE INDEX idx_addr_pid ON address(gnaf_pid)`, or every address query
+scans the whole table.
+
 ## Run (self-host)
 
 ```

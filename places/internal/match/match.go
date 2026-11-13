@@ -51,10 +51,12 @@ func Generate(ctx context.Context, db *sql.DB, q Query, fs *FuzzySet, cap int) (
 	// the score set instead. This is the design-relevant finding: street
 	// numbers are not trigram anchors.
 	var phrases []string
+	seen := map[string]bool{}
 	for _, t := range q.Reliable {
-		if t == "" || len(t) < 3 {
+		if t == "" || len(t) < 3 || seen[t] {
 			continue
 		}
+		seen[t] = true
 		// Escape double quotes for FTS5 phrase syntax.
 		phrases = append(phrases, `"`+strings.ReplaceAll(t, `"`, `""`)+`"`)
 	}
@@ -74,7 +76,7 @@ func Generate(ctx context.Context, db *sql.DB, q Query, fs *FuzzySet, cap int) (
 	match := strings.Join(phrases, " AND ")
 
 	// Try full AND first.
-	cands, err := generateMatch(ctx, db, match, cap)
+	cands, err := generateMatch(ctx, db, q, match, cap)
 	if err != nil {
 		return nil, err
 	}
@@ -92,7 +94,7 @@ func Generate(ctx context.Context, db *sql.DB, q Query, fs *FuzzySet, cap int) (
 	// No fuzzy set: fall back to dropping anchors (old behaviour).
 	for i := len(phrases) - 1; i > 0; i-- {
 		relaxed := strings.Join(phrases[:i], " AND ")
-		cands, err := generateMatch(ctx, db, relaxed, cap)
+		cands, err := generateMatch(ctx, db, q, relaxed, cap)
 		if err != nil {
 			return nil, err
 		}
@@ -103,21 +105,32 @@ func Generate(ctx context.Context, db *sql.DB, q Query, fs *FuzzySet, cap int) (
 	return nil, nil
 }
 
-func generateMatch(ctx context.Context, db *sql.DB, match string, cap int) ([]Candidate, error) {
-	// cap <= 0 means uncapped (legacy behaviour). The design's INV-8 wants a
-	// bounded generation set; a cap makes cost tractable at 15.9M-row scale.
+// innerCap bounds the trigram match set read before ordering, so a very broad
+// anchor (a locality on its own) cannot pull the whole table into one query.
+// It is far above any single street-in-locality: Collins St, Melbourne, the
+// largest, is about 10K rows.
+const innerCap = 50000
+
+// generateMatch runs one trigram MATCH and returns up to cap rows, best first.
+// The order matters because the cap truncates: rows at the query's street
+// number come first, then rows whose street and locality match exactly. Without
+// it the cap kept whatever rows SQLite produced first, and on a long street the
+// asked-for number was usually not among them.
+func generateMatch(ctx context.Context, db *sql.DB, q Query, match string, cap int) ([]Candidate, error) {
 	limit := ""
 	if cap > 0 {
 		limit = fmt.Sprintf(" LIMIT %d", cap)
 	}
+	number, street, locality := q.field("street_number"), q.field("street_name"), q.field("locality_name")
 	rows, err := db.QueryContext(ctx, `
 		SELECT gnaf_pid, street_number, street_name, street_type,
 		       locality_name, state, postcode, latitude, longitude, confidence, geocode_rel
 		FROM address a
 		WHERE a.gnaf_pid IN (
-			SELECT gnaf_pid FROM addr_trgm WHERE addr_trgm MATCH ?`+limit+`
+			SELECT gnaf_pid FROM addr_trgm WHERE addr_trgm MATCH ? LIMIT `+fmt.Sprint(innerCap)+`
 		)
-	`, match)
+		ORDER BY CAST(a.street_number AS TEXT) = ? DESC, a.street_name = ? DESC, a.locality_name = ? DESC, a.rowid`+limit,
+		match, number, street, locality)
 	if err != nil {
 		return nil, err
 	}
@@ -133,6 +146,17 @@ func generateMatch(ctx context.Context, db *sql.DB, match string, cap int) ([]Ca
 		out = append(out, c)
 	}
 	return out, rows.Err()
+}
+
+// field returns the first score token tagged with field, or nil when there is
+// none (so an SQL equality against it never matches).
+func (q Query) field(name string) any {
+	for i, f := range q.Fields {
+		if f == name && i < len(q.Score) {
+			return q.Score[i]
+		}
+	}
+	return nil
 }
 
 // Score computes edit-distance similarity between a query token and a row token.
@@ -216,6 +240,9 @@ func bestAcrossFields(qt string, row Candidate) float64 {
 
 // levenshteinSim is normalised edit-distance similarity in [0,1].
 // 1.0 when equal; falls off with distance. Case-insensitive, already normalised.
+// The distance is optimal string alignment: Levenshtein plus adjacent
+// transposition as one edit, so "WINSDOR" is one edit from WINDSOR, not two.
+// Swapped letters are among the commonest typing errors.
 func levenshteinSim(a, b string) float64 {
 	if a == b {
 		return 1.0
@@ -224,7 +251,8 @@ func levenshteinSim(a, b string) float64 {
 	if la == 0 || lb == 0 {
 		return 0
 	}
-	// Levenshtein distance (DP, O(la*lb)).
+	// OSA distance (DP over three rows, O(la*lb)).
+	prev2 := make([]int, lb+1)
 	prev := make([]int, lb+1)
 	cur := make([]int, lb+1)
 	for j := 0; j <= lb; j++ {
@@ -244,9 +272,14 @@ func levenshteinSim(a, b string) float64 {
 			if v := cur[j-1] + 1; v < m {
 				m = v
 			}
+			if i > 1 && j > 1 && a[i-1] == b[j-2] && a[i-2] == b[j-1] {
+				if v := prev2[j-2] + 1; v < m {
+					m = v
+				}
+			}
 			cur[j] = m
 		}
-		prev, cur = cur, prev
+		prev2, prev, cur = prev, cur, prev2
 	}
 	dist := prev[lb]
 	// Normalise: similarity = 1 - dist/maxLen, clamped.

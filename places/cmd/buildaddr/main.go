@@ -81,6 +81,10 @@ func main() {
 
 	// Indexes.
 	for _, s := range []string{
+		// Generation looks rows up by PID (gnaf_pid IN (trigram match)), and
+		// CREATE TABLE AS carries no key: without this index every address
+		// query scans all 4M rows.
+		`CREATE UNIQUE INDEX IF NOT EXISTS idx_addr_pid ON address(gnaf_pid)`,
 		`CREATE INDEX IF NOT EXISTS idx_addr_locality ON address(locality_name)`,
 		`CREATE INDEX IF NOT EXISTS idx_addr_state     ON address(state)`,
 		`CREATE INDEX IF NOT EXISTS idx_addr_postcode ON address(postcode)`,

@@ -116,7 +116,9 @@ func main() {
 	// ready; /readyz reports loading until the warmup completes.
 	locSetReady := make(chan struct{})
 	go func() {
-		_ = api.LocalitySet(ctx, db)
+		if err := api.WarmSets(db); err != nil {
+			logger.Error("warm_sets_failed", "error", err.Error())
+		}
 		close(locSetReady)
 	}()
 
@@ -247,9 +249,17 @@ func main() {
 			writeJSONError(w, http.StatusInternalServerError, "activate failed")
 			return
 		}
+		// Build the new dataset's lookup sets before it takes traffic, so the
+		// first requests after the swap don't each wait on a full-table scan.
+		if err := api.WarmSets(newDB); err != nil {
+			newDB.Close()
+			writeJSONError(w, http.StatusInternalServerError, "activate failed")
+			return
+		}
 		// Swap: old handle is returned for draining/closing after in-flight
 		// requests finish (INV-5).
 		oldDB := provider.Swap(newDB, req.Version)
+		api.ForgetSets(oldDB)
 		_ = oldDB // caller drains then closes; we retain the old file for rollback
 		_, _ = w.Write([]byte(fmt.Sprintf(`{"status":"activated","version":%s,"addresses":%d}`, quote(req.Version), n)))
 	})

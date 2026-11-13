@@ -1,0 +1,74 @@
+# Golden address set: real Victorian addresses as people type them.
+# query<TAB>expected street address (number|street_name|street_type|locality)
+# The expected key is the street address, not a PID: G-NAF holds one PID per
+# unit, so any PID at the right street address is a correct answer.
+# Run against a real dataset: AUPLACES_GOLDEN_DB=/path/to/vic.db go test ./internal/api -run Golden
+#
+# plain addresses, abbreviated types
+31 Acland St St Kilda	31|ACLAND|STREET|ST KILDA
+104 Barkly Street, St Kilda VIC 3182	104|BARKLY|STREET|ST KILDA
+350 Bay St Port Melbourne	350|BAY|STREET|PORT MELBOURNE
+95 Bell St Coburg 3058	95|BELL|STREET|COBURG
+69 Blackburn Rd Doncaster East	69|BLACKBURN|ROAD|DONCASTER EAST
+634 Bridge Rd Richmond VIC 3121	634|BRIDGE|ROAD|RICHMOND
+17 Burwood Ave Hawthorn East	17|BURWOOD|AVENUE|HAWTHORN EAST
+737 Burwood Road Hawthorn East	737|BURWOOD|ROAD|HAWTHORN EAST
+665 Chapel St South Yarra	665|CHAPEL|STREET|SOUTH YARRA
+434 Church St Richmond	434|CHURCH|STREET|RICHMOND
+36 Collins St Melbourne VIC 3000	36|COLLINS|STREET|MELBOURNE
+600 Doncaster Rd Doncaster	600|DONCASTER|ROAD|DONCASTER
+202 Elgar Rd Box Hill South	202|ELGAR|ROAD|BOX HILL SOUTH
+298 Glenferrie Rd Malvern	298|GLENFERRIE|ROAD|MALVERN
+570 Lygon St Carlton	570|LYGON|STREET|CARLTON
+223 Malop St Geelong	223|MALOP|STREET|GEELONG
+86 Maroondah Hwy Ringwood	86|MAROONDAH|HIGHWAY|RINGWOOD
+311 Moorabool St Geelong VIC 3220	311|MOORABOOL|STREET|GEELONG
+836 Moorooduc Hwy Mornington	836|MOOROODUC|HIGHWAY|MORNINGTON
+599 Nepean Hwy Brighton East	599|NEPEAN|HIGHWAY|BRIGHTON EAST
+545 Nicholson St Carlton North	545|NICHOLSON|STREET|CARLTON NORTH
+2 Princes St Port Melbourne	2|PRINCES|STREET|PORT MELBOURNE
+883 Station St Box Hill North	883|STATION|STREET|BOX HILL NORTH
+173 Swan St Richmond	173|SWAN|STREET|RICHMOND
+313 Sydney Rd Brunswick	313|SYDNEY|ROAD|BRUNSWICK
+441 Sydney Road Coburg	441|SYDNEY|ROAD|COBURG
+14 Toorak Ave Toorak	14|TOORAK|AVENUE|TOORAK
+647 Toorak Rd Toorak	647|TOORAK|ROAD|TOORAK
+77 Victoria Pde Fitzroy	77|VICTORIA|PARADE|FITZROY
+118 Victoria St Fitzroy	118|VICTORIA|STREET|FITZROY
+350 Warrigal Rd Oakleigh South	350|WARRIGAL|ROAD|OAKLEIGH SOUTH
+851 Whitehorse Rd Box Hill	851|WHITEHORSE|ROAD|BOX HILL
+#
+# short street numbers on long streets (generation cap truncation)
+5 High St Northcote	5|HIGH|STREET|NORTHCOTE
+93 High St Preston	93|HIGH|STREET|PRESTON
+63 Main Rd St Albans	63|MAIN|ROAD|ST ALBANS
+#
+# 4-digit street numbers (not postcodes)
+1440 Hume Hwy Craigieburn	1440|HUME|HIGHWAY|CRAIGIEBURN
+1351 Nepean Highway Mount Eliza	1351|NEPEAN|HIGHWAY|MOUNT ELIZA
+1251 Plenty Rd Bundoora	1251|PLENTY|ROAD|BUNDOORA
+1322 Sturt St Ballarat Central	1322|STURT|STREET|BALLARAT CENTRAL
+#
+# "St" meaning Saint, in street names and localities
+157 Fitzroy St St Kilda	157|FITZROY|STREET|ST KILDA
+370 St Georges Rd Fitzroy North	370|ST GEORGES|ROAD|FITZROY NORTH
+23 St Georges Rd Toorak	23|ST GEORGES|ROAD|TOORAK
+9 St Georges Ct Toorak	9|ST GEORGES|COURT|TOORAK
+469 St Kilda Rd Melbourne VIC 3004	469|ST KILDA|ROAD|MELBOURNE
+3 St Kilda Rd St Kilda	3|ST KILDA|ROAD|ST KILDA
+#
+# street types outside the common set, and "The ..." streets
+12 Collins Way Melbourne	12|COLLINS|WAY|MELBOURNE
+920 Hume Fwy Craigieburn	920|HUME|FREEWAY|CRAIGIEBURN
+1 Chapel Mews South Yarra	1|CHAPEL|MEWS|SOUTH YARRA
+35 Lygon Lane Carlton	35|LYGON|LANE|CARLTON
+3 Princes Pl Port Melbourne	3|PRINCES|PLACE|PORT MELBOURNE
+13 The Esplanade St Kilda	13|ESPLANADE||ST KILDA
+64 The Boulevard Ivanhoe	64|THE BOULEVARD||IVANHOE
+#
+# units, case, typos
+2/36 Collins St Melbourne	36|COLLINS|STREET|MELBOURNE
+Unit 3, 157 Fitzroy St, St Kilda	157|FITZROY|STREET|ST KILDA
+3/313 Sydney Rd Brunswick VIC 3056	313|SYDNEY|ROAD|BRUNSWICK
+5 high street northcote	5|HIGH|STREET|NORTHCOTE
+93 Hgih St Preston	93|HIGH|STREET|PRESTON

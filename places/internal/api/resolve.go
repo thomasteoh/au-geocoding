@@ -27,6 +27,7 @@ import (
 	"strings"
 
 	"auplaces/internal/match"
+	"auplaces/internal/normalise"
 	"ausystem/shared/contract"
 )
 
@@ -52,6 +53,9 @@ const (
 	maxResults = 20
 	maxRadiusM = 5000
 	maxTokens  = 32
+
+	// generateCap bounds how many address candidates are scored per query.
+	generateCap = 200
 )
 
 // ResolveHandler is the /resolve HTTP handler. p provides the active serving DB.
@@ -141,7 +145,10 @@ func (e *resolveError) Error() string { return e.msg }
 // resolveAddress resolves a structured address request (rung 2). Generate on
 // the reliable tokens, score on the full set, expose G-NAF quality.
 func resolveAddress(ctx context.Context, db *sql.DB, req contract.ResolveRequest) (contract.ResolveResponse, error) {
-	locSet := LocalitySet(ctx, db)
+	sets, err := setsFor(db)
+	if err != nil {
+		return contract.ResolveResponse{}, err
+	}
 	var rel, score, fields []string
 	if req.Components != nil {
 		// The caller labelled every value, so no inference is needed or wanted.
@@ -151,11 +158,10 @@ func resolveAddress(ctx context.Context, db *sql.DB, req contract.ResolveRequest
 		// input exists precisely to remove that guess.
 		rel, score, fields = componentTokens(*req.Components)
 	} else {
-		rel, score, fields = contractTokens(req.Generate, req.Score, locSet)
+		rel, score, fields = contractTokens(req.Generate, req.Score, sets)
 	}
 	qm := match.Query{Reliable: rel, Score: score, Fields: fields}
-	fs, _ := match.LoadFuzzySet(ctx, db)
-	cands, _ := match.Generate(ctx, db, qm, fs, 200)
+	cands, _ := match.Generate(ctx, db, qm, sets.fuzzy, generateCap)
 
 	resp := contract.ResolveResponse{GeneratedCount: len(cands)}
 	if len(cands) == 0 {
@@ -369,10 +375,6 @@ func loadQuality(ctx context.Context, db *sql.DB, sc []scoredCandidate) map[stri
 	return out
 }
 
-// contractTokens maps the contract's Generate/Score token sets into the
-// matcher's Query. The contract's Score is the full normalised set; the
-// matcher needs per-token field tags for field-aware scoring. We re-derive
-// fields from token text (state/postcode/number/locality/street).
 // componentTokens builds the match inputs from labelled components. Each value
 // carries its own field tag, so the scorer compares like with like without any
 // token-shape heuristic.
@@ -380,9 +382,11 @@ func loadQuality(ctx context.Context, db *sql.DB, sc []scoredCandidate) map[stri
 // Generation anchors are the street name and locality only: the trigram index
 // does not cover tokens under three characters, so a street number cannot
 // anchor generation and is carried as a scoring signal instead — the same rule
-// the free-text path follows.
+// the free-text path follows. Values are upper-cased to match the dataset; the
+// geocoder folds them to lower case.
 func componentTokens(c contract.AddressComponents) (reliable, sc, fields []string) {
 	add := func(v, field string) {
+		v = strings.ToUpper(v)
 		if v == "" {
 			return
 		}
@@ -398,6 +402,7 @@ func componentTokens(c contract.AddressComponents) (reliable, sc, fields []strin
 
 	seen := map[string]bool{}
 	for _, t := range []string{c.StreetName, c.Locality} {
+		t = strings.ToUpper(t)
 		if len(t) >= 3 && !seen[t] {
 			seen[t] = true
 			reliable = append(reliable, t)
@@ -406,72 +411,16 @@ func componentTokens(c contract.AddressComponents) (reliable, sc, fields []strin
 	return reliable, sc, fields
 }
 
-func contractTokens(gen, score []string, locSet map[string]bool) (reliable, sc, fields []string) {
-	rel := append([]string(nil), gen...)
-	sc = append([]string(nil), score...)
-	if len(sc) == 0 {
-		sc = append([]string(nil), gen...)
+// contractTokens maps the contract's free-text token sets into the matcher's
+// Query. Score is the geocoder's full normalised token list, in query order;
+// the parts of an address are known by position, so the tokens are parsed as
+// a sequence with the same parser as /search, not classified one at a time.
+func contractTokens(gen, score []string, sets *matchSets) (reliable, sc, fields []string) {
+	toks := score
+	if len(toks) == 0 {
+		toks = gen
 	}
-	fields = make([]string, len(sc))
-	for i, t := range sc {
-		fields[i] = fieldOfToken(t, locSet)
-	}
-	seen := map[string]bool{}
-	var relOut []string
-	for _, t := range rel {
-		if !seen[t] {
-			seen[t] = true
-			relOut = append(relOut, t)
-		}
-	}
-	return relOut, sc, fields
-}
-
-func fieldOfToken(t string, locSet map[string]bool) string {
-	switch {
-	case isStateToken(t):
-		return "state"
-	case isPostcodeToken(t):
-		return "postcode"
-	case locSet[t]:
-		return "locality"
-	case isNumberToken(t):
-		return "street_number"
-	default:
-		return "street_name"
-	}
-}
-
-func isStateToken(t string) bool {
-	switch t {
-	case "VIC", "NSW", "QLD", "SA", "WA", "TAS", "NT", "ACT":
-		return true
-	}
-	return false
-}
-
-func isPostcodeToken(t string) bool {
-	if len(t) != 4 {
-		return false
-	}
-	for _, c := range t {
-		if c < '0' || c > '9' {
-			return false
-		}
-	}
-	return true
-}
-
-func isNumberToken(t string) bool {
-	if t == "" {
-		return false
-	}
-	for _, c := range t {
-		if c < '0' || c > '9' {
-			return false
-		}
-	}
-	return true
+	return normalise.Tokenise(strings.Join(toks, " "), maxTokens, sets.localities, sets.fuzzy.NearestLocality)
 }
 
 // formatCandidateText builds the display address text for a candidate.

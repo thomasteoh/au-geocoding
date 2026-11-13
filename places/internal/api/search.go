@@ -145,7 +145,7 @@ func Search(ctx context.Context, db *sql.DB, req SearchRequest) SearchResponse {
 	case strategy.StrategyCoord:
 		return searchCoord(ctx, db, plan.Query)
 	case strategy.StrategyAddress:
-		return searchAddress(ctx, db, plan.Query, req.State, limit)
+		return searchAddress(ctx, db, plan.Query)
 	case strategy.StrategyPOIAnchor:
 		return searchPOIAnchor(ctx, db, plan.Query, plan.Anchors, req.State, limit)
 	case strategy.StrategyPOI:
@@ -168,16 +168,19 @@ func searchCoord(ctx context.Context, db *sql.DB, coord string) SearchResponse {
 }
 
 // searchAddress resolves a full address (rung 2).
-func searchAddress(ctx context.Context, db *sql.DB, query string, state string, limit int) SearchResponse {
-	locSet := LocalitySet(ctx, db)
-	rel, score, fields := normalise.Tokenise(query, 32, locSet)
-	qm := match.Query{Reliable: rel, Score: score, Fields: fields}
-	fs, _ := match.LoadFuzzySet(ctx, db)
-	// Generate returns candidates up to the caller's cap; the address path is
-	// a best-match (single candidate), so the cap only bounds the scoring scan.
-	cands, _ := match.Generate(ctx, db, qm, fs, limit)
-
+func searchAddress(ctx context.Context, db *sql.DB, query string) SearchResponse {
 	resp := SearchResponse{Strategy: "address", Version: datasetVersion(ctx, db)}
+	sets, err := setsFor(db)
+	if err != nil {
+		return resp
+	}
+	rel, score, fields := normalise.Tokenise(query, 32, sets.localities, sets.fuzzy.NearestLocality)
+	qm := match.Query{Reliable: rel, Score: score, Fields: fields}
+	// The generation cap bounds the scoring scan, not the response: the
+	// address path returns one best match, so it uses the same cap as
+	// /resolve rather than the caller's response limit.
+	cands, _ := match.Generate(ctx, db, qm, sets.fuzzy, generateCap)
+
 	best := ""
 	var bestC match.Candidate
 	bestScore := -1.0
@@ -273,25 +276,6 @@ func searchPOI(ctx context.Context, db *sql.DB, poi string, limit int) SearchRes
 	resp.Generated = len(cands)
 	resp.Total = len(cands)
 	return resp
-}
-
-// LocalitySet loads the distinct locality names (for normalisation). This is
-// the known-localities set the normaliser uses to classify tokens; it's
-// warmed once at server start (the per-request load of 4M rows is too slow).
-func LocalitySet(ctx context.Context, db *sql.DB) map[string]bool {
-	set := map[string]bool{}
-	rows, err := db.QueryContext(ctx, `SELECT DISTINCT locality_name FROM address`)
-	if err != nil {
-		return set
-	}
-	defer rows.Close()
-	for rows.Next() {
-		var l string
-		if err := rows.Scan(&l); err == nil {
-			set[l] = true
-		}
-	}
-	return set
 }
 
 // extractLocality extracts a locality name from an anchor fragment. For
