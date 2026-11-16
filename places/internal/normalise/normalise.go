@@ -140,6 +140,10 @@ func Parse(input string, maxTokens int, localitySet map[string]bool, nearest Nea
 		words = append(words, t)
 	}
 	if len(words) == 0 {
+		// A lone four-digit number is a postcode, not a street number.
+		if p.Unit == "" && isPostcode(p.Number) {
+			p.Postcode, p.Number = p.Number, ""
+		}
 		return p
 	}
 

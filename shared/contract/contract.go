@@ -49,6 +49,11 @@ type Candidate struct {
 	Source string      `json:"source"` // "gnaf" | "osm"
 	Text   string      `json:"text"`   // full address or POI name — what the caller scores against
 
+	// Precision says what Point locates: a single address, or the centre of a
+	// street, locality or postcode when the query named nothing finer. Empty
+	// for POIs and from resolvers that predate the field.
+	Precision Precision `json:"precision,omitempty"`
+
 	// G-NAF only — distinct quality axes, never collapsed
 	GnafPID            string `json:"gnaf_pid,omitempty"`
 	GnafConfidence     int8   `json:"gnaf_confidence,omitempty"`     // -1..2, how many authorities contributed
@@ -67,6 +72,16 @@ type Candidate struct {
 	LocalityID LocalityID `json:"locality_id,omitempty"`
 	DistanceM  *float64   `json:"distance_m,omitempty"` // set when Anchor was supplied
 }
+
+// Precision is how specific a candidate's point is.
+type Precision string
+
+const (
+	PrecisionAddress  Precision = "address"  // one G-NAF address
+	PrecisionStreet   Precision = "street"   // centre of a street within a locality
+	PrecisionLocality Precision = "locality" // centre of a locality's addresses
+	PrecisionPostcode Precision = "postcode" // centre of a postcode's addresses
+)
 
 // Locality is a resolved locality name.
 type Locality struct {

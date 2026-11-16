@@ -1,8 +1,14 @@
 # Golden address set: real Victorian addresses as people type them.
-# query<TAB>expected street address (number|street_name|street_type|locality)
-# The expected key is the street address, not a PID: G-NAF holds one PID per
-# unit, so any PID at the right street address is a correct answer.
-# Run against a real dataset: AUPLACES_GOLDEN_DB=/path/to/vic.db go test ./internal/api -run Golden
+# query<TAB>expected
+# Expected is the street address (number|street_name|street_type|locality), not
+# a PID: G-NAF holds one PID per unit, so any PID at the right street address
+# is a correct answer. Coarser answers are the candidate ID (street:...,
+# locality:..., postcode:...), and (none) means /resolve must decline so the
+# ladder moves on to POI search. Coarse and (none) rows are /resolve only.
+#
+# CI runs this against testdata/golden_fixture.tsv.gz (built by
+# cmd/goldenfixture). For the full dataset:
+#   AUPLACES_GOLDEN_DB=/path/to/vic.db go test ./internal/api -run Golden
 #
 # plain addresses, abbreviated types
 31 Acland St St Kilda	31|ACLAND|STREET|ST KILDA
@@ -72,3 +78,20 @@ Unit 3, 157 Fitzroy St, St Kilda	157|FITZROY|STREET|ST KILDA
 3/313 Sydney Rd Brunswick VIC 3056	313|SYDNEY|ROAD|BRUNSWICK
 5 high street northcote	5|HIGH|STREET|NORTHCOTE
 93 Hgih St Preston	93|HIGH|STREET|PRESTON
+93 High St Prestn	93|HIGH|STREET|PRESTON
+36 Colins Street Melborne	36|COLLINS|STREET|MELBOURNE
+#
+# no street number, or no street: answered at street, locality or postcode
+# precision through /resolve
+High St Preston	street:HIGH STREET|PRESTON
+Collins St Melbourne	street:COLLINS STREET|MELBOURNE
+St Kilda Rd St Kilda	street:ST KILDA ROAD|ST KILDA
+Box Hill North	locality:BOX HILL NORTH|VIC
+St Kilda VIC 3182	locality:ST KILDA|VIC
+133 Warragul VIC	locality:WARRAGUL|VIC
+3000	postcode:3000
+#
+# not addresses: /resolve declines and the ladder moves on
+Melbourne Central	(none)
+Flinders St Station	(none)
+woolworths near doncaster	(none)

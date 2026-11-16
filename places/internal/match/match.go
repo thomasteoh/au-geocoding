@@ -84,6 +84,17 @@ func Generate(ctx context.Context, db *sql.DB, q Query, fs *FuzzySet, cap int) (
 		return cands, nil
 	}
 
+	// Zero rows with a known locality: the street is misspelt or in the wrong
+	// place. Try the nearest street that exists in that locality before any
+	// global correction, which would keep a misspelling that happens to be a
+	// real street elsewhere and then drop the locality to find it.
+	street, locality := q.Field("street_name"), q.Field("locality_name")
+	if fs != nil && street != "" && locality != "" {
+		if near, sim := fs.NearestStreetIn(street, locality); near != "" && near != street && sim >= nearStreetInLocality {
+			return Generate(ctx, db, q.withStreet(street, near), fs, cap)
+		}
+	}
+
 	// Zero rows: try fuzzy generation — resolve each reliable token to its
 	// near-match via the fuzzy set, then AND. This keeps the anchor narrow
 	// (a typo'd locality becomes its real locality, not dropped).
@@ -151,13 +162,44 @@ func generateMatch(ctx context.Context, db *sql.DB, q Query, match string, cap i
 // field returns the first score token tagged with field, or nil when there is
 // none (so an SQL equality against it never matches).
 func (q Query) field(name string) any {
+	if v := q.Field(name); v != "" {
+		return v
+	}
+	return nil
+}
+
+// Field returns the first score token tagged with name, or "".
+func (q Query) Field(name string) string {
 	for i, f := range q.Fields {
 		if f == name && i < len(q.Score) {
 			return q.Score[i]
 		}
 	}
-	return nil
+	return ""
 }
+
+// withStreet returns a copy of q with its street name replaced everywhere it
+// appears (anchors and scoring tokens).
+func (q Query) withStreet(from, to string) Query {
+	out := Query{Fields: q.Fields}
+	for _, t := range q.Reliable {
+		if t == from {
+			t = to
+		}
+		out.Reliable = append(out.Reliable, t)
+	}
+	for i, t := range q.Score {
+		if t == from && i < len(q.Fields) && q.Fields[i] == "street_name" {
+			t = to
+		}
+		out.Score = append(out.Score, t)
+	}
+	return out
+}
+
+// nearStreetInLocality is how close a misspelt street must be to a street in
+// the query's locality to be corrected to it.
+const nearStreetInLocality = 0.75
 
 // Score computes edit-distance similarity between a query token and a row token.
 // The design scores against the full query, not just the reliable set.
@@ -296,3 +338,7 @@ func max(a, b int) int {
 	}
 	return b
 }
+
+// Similarity is the normalised edit-distance similarity used for scoring and
+// fuzzy correction, in [0,1].
+func Similarity(a, b string) float64 { return levenshteinSim(a, b) }

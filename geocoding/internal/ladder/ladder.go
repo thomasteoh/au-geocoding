@@ -188,7 +188,11 @@ type addressRung struct {
 func (addressRung) Kind() string { return "address" }
 
 func (r addressRung) Try(ctx context.Context, q Query) (string, contract.ResolveResponse, error) {
-	if !q.Normal.HadStreet || !q.Normal.HadNumbers {
+	// Places decides how specific an answer the text supports: an address, the
+	// centre of a street, locality or postcode (Candidate.Precision), or none,
+	// in which case the walk moves on to the POI rungs. A street with no number
+	// or a bare locality is not a POI query just because it has no number.
+	if len(q.Normal.Tokens) == 0 {
 		return "", contract.ResolveResponse{}, ErrNoRung
 	}
 	req := contract.ResolveRequest{

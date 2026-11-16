@@ -161,6 +161,15 @@ func resolveAddress(ctx context.Context, db *sql.DB, req contract.ResolveRequest
 		rel, score, fields = contractTokens(req.Generate, req.Score, sets)
 	}
 	qm := match.Query{Reliable: rel, Score: score, Fields: fields}
+	limit := req.Limit
+	if limit <= 0 {
+		limit = 20
+	}
+	// No street number, or no street: answer at street, locality or postcode
+	// precision, or not at all.
+	if qm.Field("street_number") == "" || qm.Field("street_name") == "" {
+		return resolveCoarse(ctx, db, sets, qm, limit)
+	}
 	cands, _ := match.Generate(ctx, db, qm, sets.fuzzy, generateCap)
 
 	resp := contract.ResolveResponse{GeneratedCount: len(cands)}
@@ -175,10 +184,6 @@ func resolveAddress(ctx context.Context, db *sql.DB, req contract.ResolveRequest
 		scored = append(scored, scoredCandidate{c: c, s: sc})
 	}
 	sortScored(scored)
-	limit := req.Limit
-	if limit <= 0 {
-		limit = 20
-	}
 	if len(scored) > limit {
 		resp.Truncated = true
 		scored = scored[:limit]
@@ -194,6 +199,7 @@ func resolveAddress(ctx context.Context, db *sql.DB, req contract.ResolveRequest
 		resp.Candidates = append(resp.Candidates, contract.Candidate{
 			ID:                 contract.CandidateID{Source: "gnaf", PID: c.PID},
 			Kind:               contract.KindAddress,
+			Precision:          contract.PrecisionAddress,
 			Point:              contract.Point{Lat: c.Lat, Lon: c.Lon},
 			Source:             "gnaf",
 			Text:               formatCandidateText(c),
@@ -282,6 +288,7 @@ func resolveReverse(ctx context.Context, db *sql.DB, req contract.ResolveRequest
 		resp.Candidates = append(resp.Candidates, contract.Candidate{
 			ID:        contract.CandidateID{Source: "gnaf", PID: c.PID},
 			Kind:      contract.KindAddress,
+			Precision: contract.PrecisionAddress,
 			Point:     contract.Point{Lat: c.Lat, Lon: c.Lon},
 			Source:    "gnaf",
 			Text:      formatAddress(c),

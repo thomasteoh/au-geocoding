@@ -74,3 +74,40 @@ func TestWalkKindConstrainsRungs(t *testing.T) {
 		t.Fatalf("reverse kind returned address strategy: %s", res.Strategy)
 	}
 }
+
+// declineResolver answers addresses only for streets it knows and declines
+// everything else, the way places declines text it cannot place.
+type declineResolver struct{ mockResolver }
+
+func (declineResolver) Resolve(ctx context.Context, req contract.ResolveRequest) (contract.ResolveResponse, error) {
+	if req.Kind == contract.KindAddress {
+		for _, t := range req.Score {
+			if t == "kilda" || t == "north" {
+				return contract.ResolveResponse{Candidates: []contract.Candidate{{Source: "gnaf", Precision: contract.PrecisionLocality}}}, nil
+			}
+		}
+		return contract.ResolveResponse{}, contract.ErrNoCandidates
+	}
+	return contract.ResolveResponse{Candidates: []contract.Candidate{{Source: "osm", Name: "poi"}}}, nil
+}
+
+func TestAddressRungAsksPlacesWithoutNumber(t *testing.T) {
+	full := &Ladder{Rungs: []Rung{NewAddressRung(declineResolver{}), NewPOIRung(declineResolver{})}}
+	walk := func(q string) Result {
+		res, err := full.Walk(context.Background(), Query{Raw: q, Normal: normalise.Normalise(q)})
+		if err != nil {
+			t.Fatalf("%q: %v", q, err)
+		}
+		return res
+	}
+	// A street or locality with no number goes to places first...
+	for _, q := range []string{"St Kilda Rd St Kilda", "Box Hill North"} {
+		if res := walk(q); res.Strategy != StrategyAddress {
+			t.Errorf("%q: strategy %s, want address", q, res.Strategy)
+		}
+	}
+	// ...and when places declines, the walk moves on to POI search.
+	if res := walk("woolworths"); res.Strategy != StrategyPOI {
+		t.Errorf("woolworths: strategy %s, want poi", res.Strategy)
+	}
+}

@@ -24,6 +24,7 @@ type FuzzySet struct {
 	localities map[string]bool            // canonical locality names (upper)
 	streets    map[string]bool            // canonical street names (upper)
 	streetLocs map[string]map[string]bool // street -> set of localities it appears in
+	locStreets map[string][]string        // locality -> streets in it
 }
 
 // LoadFuzzySet builds the fuzzy set from the real address table.
@@ -34,6 +35,7 @@ func LoadFuzzySet(ctx context.Context, db *sql.DB) (*FuzzySet, error) {
 		localities: map[string]bool{},
 		streets:    map[string]bool{},
 		streetLocs: map[string]map[string]bool{},
+		locStreets: map[string][]string{},
 	}
 	rows, err := db.QueryContext(ctx, `SELECT locality_name, street_name FROM address`)
 	if err != nil {
@@ -58,7 +60,11 @@ func LoadFuzzySet(ctx context.Context, db *sql.DB) (*FuzzySet, error) {
 					locs = map[string]bool{}
 					fs.streetLocs[up] = locs
 				}
-				locs[strings.ToUpper(loc)] = true
+				ul := strings.ToUpper(loc)
+				if !locs[ul] {
+					locs[ul] = true
+					fs.locStreets[ul] = append(fs.locStreets[ul], up)
+				}
 			}
 		}
 	}
@@ -80,6 +86,27 @@ func (fs *FuzzySet) NearestLocality(name string) (string, float64) {
 	for loc := range fs.localities {
 		if s := levenshteinSim(up, loc); s > bestSim {
 			best, bestSim = loc, s
+		}
+	}
+	return best, bestSim
+}
+
+// NearestStreetIn returns the street in locality closest to name by edit
+// distance, and its similarity. An exact street in the locality scores 1. It
+// returns "", 0 when the locality is unknown.
+//
+// This is the locality-first correction: "COLINS" is a real street (in
+// Leongatha), so global resolution keeps it, but in MELBOURNE the street meant
+// is COLLINS.
+func (fs *FuzzySet) NearestStreetIn(name, locality string) (string, float64) {
+	up, loc := strings.ToUpper(name), strings.ToUpper(locality)
+	best, bestSim := "", 0.0
+	for _, st := range fs.locStreets[loc] {
+		if st == up {
+			return st, 1
+		}
+		if s := levenshteinSim(up, st); s > bestSim {
+			best, bestSim = st, s
 		}
 	}
 	return best, bestSim

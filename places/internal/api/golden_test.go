@@ -2,60 +2,72 @@ package api
 
 import (
 	"bufio"
+	"compress/gzip"
 	"context"
 	"database/sql"
+	"encoding/csv"
+	"io"
 	"os"
 	"strings"
 	"testing"
 
 	_ "modernc.org/sqlite"
 
+	"auplaces/internal/schema"
 	"ausystem/shared/contract"
 	"ausystem/shared/normalise"
 )
 
-// TestGolden runs testdata/golden.tsv against a real G-NAF dataset through both
-// entry points: /search's free-text path, and /resolve fed the tokens the
-// geocoder's normaliser produces (the production path). It needs the real
-// dataset, so it only runs when AUPLACES_GOLDEN_DB names one; the dataset is
-// opened read-only.
+// TestGolden runs testdata/golden.tsv through both entry points: /search's
+// free-text path, and /resolve fed the tokens the geocoder's normaliser
+// produces (the production path). By default it runs against
+// testdata/golden_fixture.tsv.gz, a few thousand real rows around the golden
+// addresses; AUPLACES_GOLDEN_DB names a full dataset instead, opened read-only.
 func TestGolden(t *testing.T) {
-	path := os.Getenv("AUPLACES_GOLDEN_DB")
-	if path == "" {
-		t.Skip("AUPLACES_GOLDEN_DB not set")
+	var db *sql.DB
+	if path := os.Getenv("AUPLACES_GOLDEN_DB"); path != "" {
+		var err error
+		if db, err = sql.Open("sqlite", "file:"+path+"?mode=ro"); err != nil {
+			t.Fatal(err)
+		}
+		defer db.Close()
+	} else {
+		db = fixtureDB(t, "../../testdata/golden_fixture.tsv.gz")
 	}
-	db, err := sql.Open("sqlite", "file:"+path+"?mode=ro")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer db.Close()
 	ctx := context.Background()
 
 	cases := loadGolden(t, "../../testdata/golden.tsv")
-	var searchOK, resolveOK int
+	var searchOK, searchN, resolveOK int
 	for _, c := range cases {
-		got := ""
-		if resp := Search(ctx, db, SearchRequest{Query: c.query}); len(resp.Candidates) > 0 {
-			got = streetKey(t, db, resp.Candidates[0].ID)
-		}
-		if got == c.want {
-			searchOK++
-		} else {
-			t.Errorf("search  %-40q got %-45q want %q", c.query, got, c.want)
+		coarse := c.want == "(none)" || strings.Contains(c.want, ":")
+		if !coarse {
+			searchN++
+			got := ""
+			if resp := Search(ctx, db, SearchRequest{Query: c.query}); len(resp.Candidates) > 0 {
+				got = streetKey(t, db, resp.Candidates[0].ID)
+			}
+			if got == c.want {
+				searchOK++
+			} else {
+				t.Errorf("search  %-40q got %-45q want %q", c.query, got, c.want)
+			}
 		}
 
-		got = ""
+		got := "(none)"
 		n := normalise.Normalise(c.query)
-		if n.HadStreet && n.HadNumbers { // the ladder's address-rung gate
+		if len(n.Tokens) > 0 { // the ladder's address-rung gate
 			resp, err := Resolve(ctx, db, contract.ResolveRequest{
 				Kind: contract.KindAddress, Generate: n.Generate, Score: n.Tokens,
 				State: n.State, Postcode: n.Postcode, Limit: 20,
 			})
 			if err == nil && len(resp.Candidates) > 0 {
-				got = streetKey(t, db, resp.Candidates[0].GnafPID)
+				top := resp.Candidates[0]
+				if top.Precision == contract.PrecisionAddress {
+					got = streetKey(t, db, top.GnafPID)
+				} else {
+					got = top.ID.PID
+				}
 			}
-		} else {
-			got = "(address rung skipped)"
 		}
 		if got == c.want {
 			resolveOK++
@@ -63,7 +75,7 @@ func TestGolden(t *testing.T) {
 			t.Errorf("resolve %-40q got %-45q want %q", c.query, got, c.want)
 		}
 	}
-	t.Logf("search %d/%d, resolve %d/%d", searchOK, len(cases), resolveOK, len(cases))
+	t.Logf("search %d/%d, resolve %d/%d", searchOK, searchN, resolveOK, len(cases))
 }
 
 type goldenCase struct{ query, want string }
@@ -102,3 +114,69 @@ func streetKey(t *testing.T, db *sql.DB, pid string) string {
 	}
 	return num.String + "|" + name.String + "|" + typ.String + "|" + loc.String
 }
+
+// fixtureDB loads a golden fixture (gzipped TSV of address rows, in the
+// column order of fixtureColumns) into an in-memory dataset with the same
+// schema and indexes the loader builds.
+func fixtureDB(t *testing.T, path string) *sql.DB {
+	t.Helper()
+	f, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	zr, err := gzip.NewReader(f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	db, err := sql.Open("sqlite", ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	db.SetMaxOpenConns(1)
+	t.Cleanup(func() { db.Close() })
+	if _, err := db.Exec(schema.SchemaSQL); err != nil {
+		t.Fatal(err)
+	}
+	tx, err := db.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	stmt, err := tx.Prepare(`INSERT INTO address (` + fixtureColumns + `)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := csv.NewReader(zr)
+	r.Comma = '\t'
+	r.FieldsPerRecord = 11
+	for {
+		rec, err := r.Read()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		args := make([]any, len(rec))
+		for i, v := range rec {
+			args[i] = v
+		}
+		if _, err := stmt.Exec(args...); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := tx.Exec(`INSERT INTO addr_trgm (gnaf_pid, street_number, street_name, locality_name, state, postcode)
+		SELECT gnaf_pid, street_number, street_name, locality_name, state, postcode FROM address`); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	return db
+}
+
+// fixtureColumns is the address column order in the golden fixture; it must
+// match cmd/goldenfixture.
+const fixtureColumns = `gnaf_pid, street_number, street_name, street_type, locality_name,
+	state, postcode, latitude, longitude, confidence, geocode_rel`

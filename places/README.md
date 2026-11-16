@@ -42,19 +42,28 @@ the demo UI and docs.
 
 ## Accuracy checks
 
-Two checks need a real dataset, so CI does not run them. Run both before
-changing the parser, generation or scoring:
+`testdata/golden.tsv` holds real Victorian addresses as people type them
+(units, "St" as Saint, 4-digit street numbers, multi-word localities,
+misspellings), streets and localities with no number, and text /resolve must
+decline. `go test ./...` runs it in CI against `testdata/golden_fixture.tsv.gz`,
+about 25K real rows around those addresses. Before changing the parser,
+generation or scoring, also run it against a full dataset:
 
 ```
-# 57 real Victorian addresses as people type them (units, "St" as Saint,
-# 4-digit street numbers, multi-word localities), through /search and /resolve
+# golden set through /search and /resolve
 AUPLACES_GOLDEN_DB=/path/to/vic.db go test ./internal/api -run Golden -v
 
 # 500 misspelt addresses; reports the match rate
 go run ./cmd/gen -real -db /path/to/vic.db -corpus testdata/corpus_real.tsv -cap 200
+
+# both services end to end, golden set through augeo's /geocode
+../scripts/smoke-real.sh /path/to/vic.db
 ```
 
-The golden test opens the dataset read-only. A dataset built before
+After adding a street or locality to the golden set, rebuild the fixture:
+`go run ./cmd/goldenfixture -db /path/to/vic.db`.
+
+Full-dataset checks open the dataset read-only. A dataset built before
 `idx_addr_pid` was added to `buildaddr` needs
 `CREATE UNIQUE INDEX idx_addr_pid ON address(gnaf_pid)`, or every address query
 scans the whole table.
