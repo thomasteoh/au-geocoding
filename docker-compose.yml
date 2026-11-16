@@ -37,7 +37,7 @@ services:
       - AUGEO_ADDR=:8080
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "curl", "-fsS", "http://localhost:8080/readyz"]
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8080/readyz"]
       interval: 30s
       timeout: 5s
       retries: 3
@@ -73,22 +73,26 @@ services:
       - AUGEO_APP_DB=/data/app.db
       - AUGEO_PLACES_URL=http://places:8080
       - AUGEO_CTRL_TOKEN=${AUGEO_CTRL_TOKEN:-}
+      # Unauthenticated metrics listener for Prometheus on the compose network.
+      # Port 9100 is deliberately not published; /metrics on the published
+      # port requires the ctrl token.
+      - AUGEO_METRICS_ADDR=:9100
       # Or mount a secret and set AUGEO_CTRL_TOKEN_FILE=/run/secrets/ctrl_token.
     depends_on:
       places:
         condition: service_healthy
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "curl", "-fsS", "http://localhost:8080/readyz"]
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8080/readyz"]
       interval: 30s
       timeout: 5s
       retries: 3
       start_period: 60s
 
   prometheus:
-    # Pinned release; bump deliberately. TODO: pin by digest too
-    # (docker buildx imagetools inspect prom/prometheus:v3.5.0).
-    image: prom/prometheus:v3.5.0
+    # Pinned release and multi-arch index digest; bump both deliberately
+    # (docker buildx imagetools inspect prom/prometheus:<tag>).
+    image: prom/prometheus:v3.5.0@sha256:63805ebb8d2b3920190daf1cb14a60871b16fd38bed42b857a3182bc621f4996
     ports:
       - "127.0.0.1:9090:9090"
     volumes:

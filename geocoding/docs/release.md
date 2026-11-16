@@ -153,6 +153,12 @@ the config with the API key redacted; POST updates a subset and keeps the rest.
 rejected. `AUGEO_CTRL_TOKEN` is a secret — never pass it as a flag; mount it
 and set `AUGEO_CTRL_TOKEN_FILE` instead.
 
+`/metrics` on the public listener is gated by the same token
+(`X-Augeo-Ctrl-Token` or `Authorization: Bearer`); empty disables it. For an
+unauthenticated Prometheus scrape, set `AUGEO_METRICS_ADDR` (e.g. `:9100`) to a
+listen address that is not published. That listener serves `/metrics` only.
+The compose stack does this and scrapes `augeo:9100` on the compose network.
+
 ## CI (P9)
 
 Tag-triggered (`v*`), fixture-only (never downloads real data), smoke test
