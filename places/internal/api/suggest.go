@@ -130,7 +130,10 @@ func Suggest(ctx context.Context, db *sql.DB, req SuggestRequest) SuggestRespons
 			continue
 		}
 		// Prefix phrase: the index has prefix='2 3 4', so "ST*" matches STATION.
-		phrases = append(phrases, `"`+f+`"*`)
+		// A '"' inside an FTS5 string is written as '""'; left bare it ends the
+		// phrase early and the rest of the token is parsed as query syntax,
+		// which either errors or matches something the caller did not type.
+		phrases = append(phrases, `"`+strings.ReplaceAll(f, `"`, `""`)+`"*`)
 	}
 	if len(phrases) == 0 {
 		return SuggestResponse{}
