@@ -8,7 +8,10 @@
 // statewide (the misspelling distractors), one row per street in each golden
 // locality, and one row per locality statewide (so locality recognition sees
 // the full set of names). A lot is kept like a number; units need nothing
-// more, since every unit row at a golden number is kept. Run it again when golden.tsv gains a street:
+// more, since every unit row at a golden number is kept. For an intersection
+// it keeps every distinct point of both streets in the locality and around
+// it, which is what the meeting point is computed from. Run it again when
+// golden.tsv gains a street:
 //
 //	go run ./cmd/goldenfixture -db /path/to/vic.db
 package main
@@ -56,6 +59,8 @@ func main() {
 
 	type pair struct{ street, locality, number, lot string }
 	var pairs []pair
+	type cross struct{ a, b, locality string }
+	var crosses []cross
 	localities, postcodes, streets := map[string]bool{}, map[string]bool{}, map[string]bool{}
 	f, err := os.Open(*golden)
 	if err != nil {
@@ -73,6 +78,10 @@ func main() {
 			want = place
 		}
 		switch {
+		case strings.HasPrefix(want, "intersection:"):
+			p := strings.Split(strings.TrimPrefix(want, "intersection:"), "|")
+			crosses = append(crosses, cross{streettype.StripSuffix(p[0]), streettype.StripSuffix(p[1]), p[2]})
+			localities[p[2]] = true
 		case strings.HasPrefix(want, "street:"):
 			name, loc, _ := strings.Cut(strings.TrimPrefix(want, "street:"), "|")
 			pairs = append(pairs, pair{streettype.StripSuffix(name), loc, "", ""})
@@ -142,6 +151,23 @@ func main() {
 	for s := range streets {
 		add(`street_name = ? GROUP BY locality_name LIMIT 60`, s)
 	}
+	// Both streets of an intersection, one row per distinct point, in the
+	// locality and within about 300 m of their stretch of it (the margin
+	// match.StreetsMeet searches).
+	for _, c := range crosses {
+		var latMin, latMax, lonMin, lonMax float64
+		if err := db.QueryRow(`SELECT MIN(latitude), MAX(latitude), MIN(longitude), MAX(longitude)
+			FROM address WHERE street_name IN (?, ?) AND locality_name = ?`, c.a, c.b, c.locality).
+			Scan(&latMin, &latMax, &lonMin, &lonMax); err != nil {
+			log.Fatalf("intersection %v: %v", c, err)
+		}
+		const margin = 0.003
+		for _, st := range []string{c.a, c.b} {
+			add(`street_name = ? AND latitude BETWEEN ? AND ? AND longitude BETWEEN ? AND ?
+				GROUP BY locality_name, street_type, latitude, longitude`,
+				st, latMin-margin, latMax+margin, lonMin-margin, lonMax+margin)
+		}
+	}
 	// Near-miss street names statewide: what a misspelling might resolve to.
 	names, err := db.Query(`SELECT DISTINCT street_name FROM address`)
 	if err != nil {
@@ -201,7 +227,7 @@ func main() {
 	if err := o.Close(); err != nil {
 		log.Fatal(err)
 	}
-	fmt.Printf("%d rows (%d golden streets, %d near-miss names, %d localities) -> %s\n",
-		len(pids), len(streets), len(near), len(localities), *out)
+	fmt.Printf("%d rows (%d golden streets, %d intersections, %d near-miss names, %d localities) -> %s\n",
+		len(pids), len(streets), len(crosses), len(near), len(localities), *out)
 	writeExtra(db, *extraOut, localities, postcodes)
 }
