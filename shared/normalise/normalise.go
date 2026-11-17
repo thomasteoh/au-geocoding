@@ -116,7 +116,8 @@ var (
 // addresses, and a level ("level 2", "l2") is skipped. A postal delivery point
 // ("PO Box 123", "GPO Box", "Locked Bag") is recognised only at the start.
 // A positional descriptor ("ground floor", "g/f", "rear") before the number is
-// dropped.
+// dropped. "&" and a "/" between two words ("smith st/johnston st") become
+// "and", so places can read an intersection.
 func Normalise(raw string) Result {
 	s := strings.ToLower(raw)
 	// Strip punctuation, keep alphanumerics and spaces (T3: no operator chars
@@ -127,6 +128,8 @@ func Normalise(raw string) Result {
 		switch {
 		case unicode.IsLetter(r), unicode.IsDigit(r):
 			b.WriteRune(r)
+		case r == '&':
+			b.WriteString(" and ")
 		case r == '/', r == '-':
 			b.WriteByte(' ')
 			b.WriteRune(r)
@@ -193,7 +196,13 @@ func Normalise(raw string) Result {
 	}
 
 	var words []string
-	for _, t := range toks[i:] {
+	rest := toks[i:]
+	for j, t := range rest {
+		if t == "/" && j > 0 && j+1 < len(rest) && isWord(rest[j-1]) && isWord(rest[j+1]) {
+			// "smith st/johnston st": the slash joins two streets.
+			words = append(words, "and")
+			continue
+		}
 		if t != "/" && t != "-" {
 			words = append(words, t)
 		}
@@ -276,6 +285,11 @@ func isPostcode(t string) bool {
 		}
 	}
 	return true
+}
+
+// isWord reports a token with no digit in it.
+func isWord(t string) bool {
+	return t != "/" && t != "-" && strings.IndexFunc(t, unicode.IsDigit) < 0
 }
 
 func isNumber(t string) bool {

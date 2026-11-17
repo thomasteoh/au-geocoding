@@ -36,6 +36,9 @@ func TestNormalise(t *testing.T) {
 		{"12 Upper Heidelberg Rd", []string{"12", "upper", "heidelberg", "road"}, "", "", true, true},
 		{"Front St Mornington", []string{"front", "street", "mornington"}, "", "", false, true},
 		{"Lower Plenty Rd", []string{"lower", "plenty", "road"}, "", "", false, true},
+		// "&" and a slash between streets read as "and" (intersections).
+		{"Cnr Bourke St & Swanston St Melbourne", []string{"cnr", "bourke", "street", "and", "swanston", "st", "melbourne"}, "", "", false, true},
+		{"cnr Smith St/Johnston St Fitzroy", []string{"cnr", "smith", "street", "and", "johnston", "st", "fitzroy"}, "", "", false, true},
 		{"3000", []string{"3000"}, "", "3000", false, false},
 		{"woolworths", []string{"woolworths"}, "", "", false, false},
 	}

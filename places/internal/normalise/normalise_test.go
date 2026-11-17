@@ -150,3 +150,40 @@ func has(score, fields []string, v, field string) bool {
 	return false
 }
 
+func TestParseIntersection(t *testing.T) {
+	cases := []struct {
+		in   string
+		want Intersection
+		ok   bool
+	}{
+		{"Cnr Bourke St & Swanston St Melbourne", Intersection{A: CrossStreet{"BOURKE", "STREET"}, B: CrossStreet{"SWANSTON", "STREET"}, Locality: "MELBOURNE"}, true},
+		{"Corner of Flinders and Elizabeth Streets Melbourne", Intersection{A: CrossStreet{"FLINDERS", "STREET"}, B: CrossStreet{"ELIZABETH", "STREET"}, Locality: "MELBOURNE"}, true},
+		{"Bourke St and Swanston St, Melbourne VIC 3000", Intersection{A: CrossStreet{"BOURKE", "STREET"}, B: CrossStreet{"SWANSTON", "STREET"}, Locality: "MELBOURNE", State: "VIC", Postcode: "3000"}, true},
+		{"cnr Smith St/Johnston St Fitzroy", Intersection{A: CrossStreet{"SMITH", "STREET"}, B: CrossStreet{"JOHNSTON", "STREET"}, Locality: "FITZROY"}, true},
+		{"The corner of Swan St and Church St Richmond", Intersection{A: CrossStreet{"SWAN", "STREET"}, B: CrossStreet{"CHURCH", "STREET"}, Locality: "RICHMOND"}, true},
+		{"cnr Flinders & Elizabeth St Melbourne", Intersection{A: CrossStreet{"FLINDERS", ""}, B: CrossStreet{"ELIZABETH", "STREET"}, Locality: "MELBOURNE"}, true},
+		{"cnr bourke st & swanston st", Intersection{A: CrossStreet{"BOURKE", "STREET"}, B: CrossStreet{"SWANSTON", "STREET"}}, true},
+		// The geocoder's tokens: "&" and the slash already read as AND.
+		{"cnr smith street and johnston st fitzroy", Intersection{A: CrossStreet{"SMITH", "STREET"}, B: CrossStreet{"JOHNSTON", "STREET"}, Locality: "FITZROY"}, true},
+		// Not intersections.
+		{"36 Collins St Melbourne", Intersection{}, false},
+		{"Bourke and Swanston Melbourne", Intersection{}, false}, // no corner word, no types
+		{"doncaster and blackburn road", Intersection{}, false},
+		{"cnr Bourke and Swanston", Intersection{}, false}, // nothing to place either street by
+		{"1 Bourke St and 2 Swanston St Melbourne", Intersection{}, false},
+		{"Cnr Bourke St & 12 Swanston St Melbourne", Intersection{}, false},
+	}
+	for _, c := range cases {
+		got, ok := ParseIntersection(c.in, 32, testLocalities, nearest)
+		if ok != c.ok || ok && !reflect.DeepEqual(got, c.want) {
+			t.Errorf("ParseIntersection(%q) = %+v, %v; want %+v, %v", c.in, got, ok, c.want, c.ok)
+		}
+	}
+	// Shapes the parser accepts but whose first "street" holds other words:
+	// the resolver finds no such street and declines.
+	for _, in := range []string{"woolworths near doncaster and blackburn roads", "coles corner of bourke and swanston streets melbourne"} {
+		if got, ok := ParseIntersection(in, 32, testLocalities, nearest); ok && (got.A.Name == "DONCASTER" || got.A.Name == "BOURKE") {
+			t.Errorf("ParseIntersection(%q) = %+v: the leading words were dropped", in, got)
+		}
+	}
+}

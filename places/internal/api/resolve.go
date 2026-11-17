@@ -151,6 +151,7 @@ func resolveAddress(ctx context.Context, db *sql.DB, req contract.ResolveRequest
 		return contract.ResolveResponse{}, err
 	}
 	var rel, score, fields []string
+	var text string // the free text, for the intersection reading
 	if req.Components != nil {
 		// The caller labelled every value, so no inference is needed or wanted.
 		// fieldOfToken has to guess from token shape and gets genuinely
@@ -159,7 +160,7 @@ func resolveAddress(ctx context.Context, db *sql.DB, req contract.ResolveRequest
 		// input exists precisely to remove that guess.
 		rel, score, fields = componentTokens(*req.Components)
 	} else {
-		text := contractText(req.Generate, req.Score)
+		text = contractText(req.Generate, req.Score)
 		rel, score, fields = normalise.Tokenise(text, maxTokens, sets.localities, sets.fuzzy.NearestLocality)
 	}
 	qm := match.Query{Reliable: rel, Score: score, Fields: fields}
@@ -187,6 +188,16 @@ func resolveAddress(ctx context.Context, db *sql.DB, req contract.ResolveRequest
 	}
 	if box := qm.Field("postal_delivery"); box != "" && number == "" {
 		return resolvePostal(ctx, db, sets, qm, box, limit)
+	}
+	// Two streets that meet ("cnr Bourke St & Swanston St Melbourne"). Text
+	// that only looks like one falls through to the readings below.
+	if number == "" && text != "" {
+		if ix, ok := normalise.ParseIntersection(text, maxTokens, sets.localities, sets.fuzzy.NearestLocality); ok {
+			resp, err := resolveIntersection(ctx, db, sets, ix, limit)
+			if err != nil || len(resp.Candidates) > 0 {
+				return resp, err
+			}
+		}
 	}
 	// No street number, or no street: answer at street, locality or postcode
 	// precision, or not at all.

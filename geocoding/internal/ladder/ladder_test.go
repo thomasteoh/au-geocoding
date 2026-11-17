@@ -190,7 +190,8 @@ func TestPostalBoxIsNotAPOI(t *testing.T) {
 }
 
 // scopeResolver stands in for places over a VIC-only dataset: an address
-// request naming NSW and a NSW postcode is refused as out of scope, and
+// request naming NSW and a NSW postcode is refused as out of scope, an
+// intersection ("... and ...") answers at intersection precision, and
 // everything else has no candidates.
 type scopeResolver struct{ recordingResolver }
 
@@ -205,8 +206,14 @@ func (r *scopeResolver) Resolve(ctx context.Context, req contract.ResolveRequest
 	for _, t := range req.Score {
 		has[t] = true
 	}
-	if has["nsw"] && has["2000"] {
+	switch {
+	case has["nsw"] && has["2000"]:
 		return contract.ResolveResponse{}, contract.ErrOutOfScope
+	case has["and"]:
+		return contract.ResolveResponse{Candidates: []contract.Candidate{{
+			Source: "gnaf", Precision: contract.PrecisionIntersection, MatchScore: 1,
+			ID: contract.CandidateID{Source: "gnaf", PID: "intersection:BOURKE STREET|SWANSTON STREET|MELBOURNE"},
+		}}}, nil
 	}
 	return contract.ResolveResponse{}, contract.ErrNoCandidates
 }
@@ -228,6 +235,36 @@ func TestGeocodeOutOfScopeState(t *testing.T) {
 		}
 		if len(res.reqs) != 1 || res.reqs[0].Kind != contract.KindAddress {
 			t.Errorf("%s: resolver requests %+v, want the one address request", kind, res.reqs)
+		}
+	}
+}
+
+// Intersections reach places through the address rung, with the joining
+// "&", "/" or "and" kept as "and" between the two streets.
+func TestIntersectionReachesPlaces(t *testing.T) {
+	for _, q := range []string{
+		"Cnr Bourke St & Swanston St Melbourne",
+		"Corner of Flinders and Elizabeth Streets Melbourne",
+		"Bourke St and Swanston St, Melbourne",
+		"cnr Smith St/Johnston St Fitzroy",
+	} {
+		res := &scopeResolver{}
+		got, err := fullLadder(res).WalkKind(context.Background(), Query{Raw: q, Normal: normalise.Normalise(q)}, "geocode")
+		if err != nil {
+			t.Fatalf("%q: %v", q, err)
+		}
+		if got.Strategy != StrategyAddress || got.Response.Candidates[0].Precision != contract.PrecisionIntersection {
+			t.Errorf("%q: strategy %s, %+v", q, got.Strategy, got.Response.Candidates)
+		}
+		req := res.reqs[0]
+		and := -1
+		for i, tok := range req.Score {
+			if tok == "and" {
+				and = i
+			}
+		}
+		if req.Kind != contract.KindAddress || and < 1 || and == len(req.Score)-1 {
+			t.Errorf("%q: address request Score %v, want two streets joined by \"and\"", q, req.Score)
 		}
 	}
 }

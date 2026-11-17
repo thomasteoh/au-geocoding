@@ -44,7 +44,9 @@ the demo UI and docs.
 
 `testdata/golden.tsv` holds real Victorian addresses as people type them
 (units, "St" as Saint, 4-digit street numbers, multi-word localities,
-misspellings), streets and localities with no number, and text /resolve must
+misspellings, "Ground Floor" and other positional descriptors), streets and
+localities with no number, street intersections, addresses in states the
+dataset does not cover (refused as out of scope), and text /resolve must
 decline. `go test ./...` runs it in CI against `testdata/golden_fixture.tsv.gz`,
 about 25K real rows around those addresses. Before changing the parser,
 generation or scoring, also run it against a full dataset:

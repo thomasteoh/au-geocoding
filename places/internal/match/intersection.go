@@ -249,3 +249,367 @@ func fmin(a, b float64) float64 {
 	}
 	return b
 }
+
+// StreetRef names one street of an intersection. Type is the canonical street
+// type (STREET, ROAD, ...), or "" when the text gave none.
+type StreetRef struct{ Name, Type string }
+
+// Meeting is where two streets in a locality meet.
+type Meeting struct {
+	Lat, Lon     float64
+	TypeA, TypeB string // the street types the meeting was found for
+	State        string // of the address row nearest the meeting point
+	Postcode     string
+	Rows         int // the two streets' address rows in the locality
+}
+
+// Limits on StreetsMeet. Addresses sit back from the street, deep lots by
+// fifty metres or more, and a corner building often carries an address on
+// each street, so neither the nearest pair of addresses nor a shared point
+// says where two streets meet. Their fitted lines do; the addresses then
+// confirm that both streets reach the crossing.
+const (
+	meetFitRadiusM = 300   // addresses within this of the estimate refine each line
+	meetOffLineM   = 50    // a street's addresses sit within this of its line
+	meetReachM     = 80    // each street must have an address this close to the crossing
+	meetMinAngle   = 0.5   // sin of the smallest angle between the streets (30 degrees)
+	meetMinSpreadM = 15    // a fit needs addresses spread at least this far along it
+	meetMarginDeg  = 0.003 // about 300 m: the neighbourhood searched around the locality's stretch
+	meetRefine     = 3
+)
+
+// StreetsMeet finds where streets a and b meet in locality, or nil when they do
+// not: either street missing from the locality, or the two never meet
+// (parallel streets, or the same names in different places). An empty Type
+// takes the other street's type when the locality has a street of that name
+// and type ("cnr Flinders and Elizabeth Sts"), else the locality's most common
+// one.
+//
+// Each street's addresses in the locality are fitted with a line and the two
+// lines crossed; the estimate is then refined from the addresses around it
+// (from any locality: a street on a locality boundary has its other side in
+// the neighbour), which straightens out long or curved streets. Unlike
+// ResolveIntersection, which fits whole streets statewide, this stays within
+// one place, so a name repeated across the state cannot pull the answer away.
+func StreetsMeet(ctx context.Context, sc *StreetCache, a, b StreetRef, locality string) (*Meeting, error) {
+	allA, err := sc.rows(ctx, a.Name)
+	if err != nil {
+		return nil, err
+	}
+	allB, err := sc.rows(ctx, b.Name)
+	if err != nil {
+		return nil, err
+	}
+	ra, rb := inLocality(allA, locality), inLocality(allB, locality)
+	if len(ra) == 0 || len(rb) == 0 {
+		return nil, nil
+	}
+	ta := pickType(ra, a.Type, b.Type)
+	tb := pickType(rb, b.Type, ta)
+	if (ta == "" && a.Type != "") || (tb == "" && b.Type != "") {
+		return nil, nil // the asked-for type is not in the locality
+	}
+	if a.Name == b.Name && ta == tb {
+		return nil, nil
+	}
+	ra, rb = ofType(ra, ta), ofType(rb, tb)
+	if len(ra) == 0 || len(rb) == 0 {
+		return nil, nil
+	}
+	box := bounds(append(append([]streetRow(nil), ra...), rb...))
+	pa, pb := pointsIn(allA, ta, box), pointsIn(allB, tb, box)
+
+	// Work in metres on a local plane: degrees of longitude are shorter than
+	// degrees of latitude, which would skew the fitted directions.
+	pr := newPlane(ra[0].Point)
+	la, oka := fitTrimmed(pr.projectRows(ra))
+	lb, okb := fitTrimmed(pr.projectRows(rb))
+	if !oka || !okb {
+		return nil, nil
+	}
+	at, ok := crossing(la, lb)
+	if !ok {
+		return nil, nil // parallel
+	}
+	xa, xb := pr.project(pa), pr.project(pb)
+	for range meetRefine {
+		if l, ok := fitTrimmed(within(xa, at, meetFitRadiusM)); ok {
+			la = l
+		}
+		if l, ok := fitTrimmed(within(xb, at, meetFitRadiusM)); ok {
+			lb = l
+		}
+		if at, ok = crossing(la, lb); !ok {
+			return nil, nil
+		}
+	}
+	if nearest(xa, at) > meetReachM || nearest(xb, at) > meetReachM {
+		return nil, nil // the lines cross where one street does not go
+	}
+
+	lat, lon := pr.unproject(at)
+	m := &Meeting{Lat: lat, Lon: lon, TypeA: ta, TypeB: tb, Rows: len(ra) + len(rb)}
+	best := -1.0
+	for _, r := range append(ra, rb...) {
+		if dd := pr.at(r.Point).dist(at); best < 0 || dd < best {
+			best, m.State, m.Postcode = dd, r.State, r.Postcode
+		}
+	}
+	return m, nil
+}
+
+type streetRow struct {
+	Point
+	Type, Locality, State, Postcode string
+}
+
+// StreetCache holds the address rows of the streets one query names, so
+// trying several localities reads each street once. It is not safe for
+// concurrent use; make one per query.
+type StreetCache struct {
+	db  *sql.DB
+	got map[string][]streetRow
+}
+
+// NewStreetCache returns an empty cache over db.
+func NewStreetCache(db *sql.DB) *StreetCache {
+	return &StreetCache{db: db, got: map[string][]streetRow{}}
+}
+
+// rows returns every address row of a street name, statewide (idx_addr_street).
+func (sc *StreetCache) rows(ctx context.Context, name string) ([]streetRow, error) {
+	if r, ok := sc.got[name]; ok {
+		return r, nil
+	}
+	rows, err := sc.db.QueryContext(ctx, `
+		SELECT COALESCE(street_type, ''), locality_name, state, COALESCE(postcode, ''), latitude, longitude
+		FROM address WHERE street_name = ?`, name)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []streetRow
+	for rows.Next() {
+		var r streetRow
+		if err := rows.Scan(&r.Type, &r.Locality, &r.State, &r.Postcode, &r.Lat, &r.Lon); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	sc.got[name] = out
+	return out, nil
+}
+
+func inLocality(rows []streetRow, locality string) []streetRow {
+	var out []streetRow
+	for _, r := range rows {
+		if r.Locality == locality {
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
+// pickType is want when the rows have it ("" when they do not); with no want,
+// pref when the rows have it, else the most common type.
+func pickType(rows []streetRow, want, pref string) string {
+	n := map[string]int{}
+	for _, r := range rows {
+		n[r.Type]++
+	}
+	if want != "" {
+		if n[want] > 0 {
+			return want
+		}
+		return ""
+	}
+	if pref != "" && n[pref] > 0 {
+		return pref
+	}
+	best := ""
+	for t, c := range n {
+		if c > n[best] || c == n[best] && t < best {
+			best = t
+		}
+	}
+	return best
+}
+
+func ofType(rows []streetRow, typ string) []streetRow {
+	var out []streetRow
+	for _, r := range rows {
+		if r.Type == typ {
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
+type box struct{ latMin, latMax, lonMin, lonMax float64 }
+
+func bounds(rows []streetRow) box {
+	b := box{math.MaxFloat64, -math.MaxFloat64, math.MaxFloat64, -math.MaxFloat64}
+	for _, r := range rows {
+		b.latMin, b.latMax = fmin(b.latMin, r.Lat), fmax(b.latMax, r.Lat)
+		b.lonMin, b.lonMax = fmin(b.lonMin, r.Lon), fmax(b.lonMax, r.Lon)
+	}
+	b.latMin -= meetMarginDeg
+	b.latMax += meetMarginDeg
+	b.lonMin -= meetMarginDeg
+	b.lonMax += meetMarginDeg
+	return b
+}
+
+// pointsIn returns the distinct points of the rows of one type within b.
+// Units share their building's point, so de-duplicating keeps the fits from
+// weighting a tower by its unit count.
+func pointsIn(rows []streetRow, typ string, b box) []Point {
+	seen := map[Point]bool{}
+	var out []Point
+	for _, r := range rows {
+		if r.Type != typ || seen[r.Point] ||
+			r.Lat < b.latMin || r.Lat > b.latMax || r.Lon < b.lonMin || r.Lon > b.lonMax {
+			continue
+		}
+		seen[r.Point] = true
+		out = append(out, r.Point)
+	}
+	return out
+}
+
+// vec is a point or direction on a local plane, in metres.
+type vec struct{ x, y float64 }
+
+func (v vec) dist(w vec) float64 { return math.Hypot(v.x-w.x, v.y-w.y) }
+
+// plane is an equirectangular projection around an origin: accurate to well
+// under a metre over the few hundred metres an intersection spans.
+type plane struct{ lat0, lon0, kx, ky float64 }
+
+func newPlane(o Point) plane {
+	const mPerDeg = 111320.0
+	return plane{o.Lat, o.Lon, mPerDeg * math.Cos(o.Lat*math.Pi/180), mPerDeg}
+}
+
+func (p plane) at(q Point) vec { return vec{(q.Lon - p.lon0) * p.kx, (q.Lat - p.lat0) * p.ky} }
+
+// projectRows projects the distinct points of rs: the units of a tower share
+// one point and must not outweigh the rest of the street.
+func (p plane) projectRows(rs []streetRow) []vec {
+	seen := map[Point]bool{}
+	var out []vec
+	for _, r := range rs {
+		if !seen[r.Point] {
+			seen[r.Point] = true
+			out = append(out, p.at(r.Point))
+		}
+	}
+	return out
+}
+
+func (p plane) project(ps []Point) []vec {
+	out := make([]vec, len(ps))
+	for i, q := range ps {
+		out[i] = p.at(q)
+	}
+	return out
+}
+
+func (p plane) unproject(v vec) (lat, lon float64) {
+	return p.lat0 + v.y/p.ky, p.lon0 + v.x/p.kx
+}
+
+// within returns the points no further than r from c.
+func within(ps []vec, c vec, r float64) []vec {
+	var out []vec
+	for _, p := range ps {
+		if p.dist(c) <= r {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// nearest is the distance from c to the closest of ps.
+func nearest(ps []vec, c vec) float64 {
+	best := math.MaxFloat64
+	for _, p := range ps {
+		best = math.Min(best, p.dist(c))
+	}
+	return best
+}
+
+// vline is a fitted line: a point on it and a unit direction.
+type vline struct{ c, d vec }
+
+// fitTrimmed fits a line through ps, then fits again without the points far
+// off the first line: a building with a second address on another street, or
+// a side branch, would otherwise swing the direction.
+func fitTrimmed(ps []vec) (vline, bool) {
+	l, ok := fitAxis(ps)
+	if !ok {
+		return l, false
+	}
+	var on []vec
+	for _, p := range ps {
+		if l.off(p) <= meetOffLineM {
+			on = append(on, p)
+		}
+	}
+	return fitAxis(on)
+}
+
+// off is the perpendicular distance from p to the line.
+func (l vline) off(p vec) float64 {
+	return math.Abs((p.x-l.c.x)*l.d.y - (p.y-l.c.y)*l.d.x)
+}
+
+// fitAxis fits a line through ps by principal axis (orientation-free, unlike
+// a regression of y on x). It fails with fewer than three points or too little
+// spread to give a direction.
+func fitAxis(near []vec) (vline, bool) {
+	if len(near) < 3 {
+		return vline{}, false
+	}
+	var c vec
+	for _, p := range near {
+		c.x += p.x
+		c.y += p.y
+	}
+	n := float64(len(near))
+	c.x /= n
+	c.y /= n
+	var sxx, syy, sxy float64
+	for _, p := range near {
+		dx, dy := p.x-c.x, p.y-c.y
+		sxx += dx * dx
+		syy += dy * dy
+		sxy += dx * dy
+	}
+	theta := 0.5 * math.Atan2(2*sxy, sxx-syy)
+	d := vec{math.Cos(theta), math.Sin(theta)}
+	var spread float64
+	for _, p := range near {
+		t := (p.x-c.x)*d.x + (p.y-c.y)*d.y
+		spread = fmax(spread, math.Abs(t))
+	}
+	if spread < meetMinSpreadM {
+		return vline{}, false
+	}
+	return vline{c, d}, true
+}
+
+// crossing intersects two lines; false when they are within meetMinAngle of
+// parallel.
+func crossing(a, b vline) (vec, bool) {
+	den := a.d.x*b.d.y - a.d.y*b.d.x // sin of the angle between unit directions
+	if math.Abs(den) < meetMinAngle {
+		return vec{}, false
+	}
+	wx, wy := b.c.x-a.c.x, b.c.y-a.c.y
+	t := (wx*b.d.y - wy*b.d.x) / den
+	return vec{a.c.x + t*a.d.x, a.c.y + t*a.d.y}, true
+}
