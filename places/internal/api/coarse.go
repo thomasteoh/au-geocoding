@@ -84,6 +84,9 @@ func resolvePostal(ctx context.Context, db *sql.DB, sets *matchSets, q match.Que
 	switch {
 	case sets.localities[locality]:
 		cands, err = localityLevel(ctx, db, locality, postcode)
+	case poboxLocality(sets, postcode) != "":
+		// A PO box postcode (3001): the locality it is delivered at.
+		cands, err = localityLevel(ctx, db, poboxLocality(sets, postcode), "")
 	case postcode != "":
 		cands, err = postcodeLevel(ctx, db, postcode)
 	}
@@ -163,9 +166,9 @@ func localityLevel(ctx context.Context, db *sql.DB, locality, postcode string) (
 	return placeCentre(ctx, db, contract.PrecisionLocality, `locality_name = ?`, locality)
 }
 
-// postcodeLevel returns the centre of a postcode's addresses.
+// postcodeLevel returns the centre of a postcode (see postcodeCentre).
 func postcodeLevel(ctx context.Context, db *sql.DB, postcode string) ([]contract.Candidate, error) {
-	return placeCentre(ctx, db, contract.PrecisionPostcode, `postcode = ?`, postcode)
+	return postcodeCentre(ctx, db, postcode)
 }
 
 // placeCentre averages the address points matching where. Localities are
