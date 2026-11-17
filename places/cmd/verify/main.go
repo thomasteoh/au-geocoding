@@ -80,14 +80,16 @@ func main() {
 	}
 
 	// 3. Row counts within tolerance of source published counts.
-	// Expected counts (Victoria AUG 2026): address ~4.18M, poi ~59.7k,
-	// boundary ~2.98k. We check the built tables are present and non-degenerate,
+	// Expected counts (Victoria AUG 2026): address ~4.18M, poi ~71.9k,
+	// boundary ~2.98k. The POI count is the served dataset's (poi_meta: OSM
+	// replication sequence 4967, 2026-11-12); the earlier figure, 59,720, is
+	// more than 5% below it and failed every current dataset. We check the built tables are present and non-degenerate,
 	// and record actual counts; tolerance is a soft check (the source counts
 	// are the published G-NAF numbers, which the build may legitimately differ
 	// from by the locality filter).
 	counts := map[string]int64{
 		"address":  4184145,
-		"poi":      59720,
+		"poi":      71854,
 		"boundary": 2979,
 	}
 	for tbl, want := range counts {
@@ -104,6 +106,19 @@ func main() {
 		if !ok {
 			report.OK = false
 		}
+	}
+
+	// Optional tables (aliases from buildaddr, postal areas from
+	// loadpostcode): the server answers without them (buildaddr leaves the
+	// alias tables empty when G-NAF's were not loaded), so their row counts
+	// are recorded but do not decide the gate.
+	for _, tbl := range []string{"alias_locality", "alias_street", "postcode"} {
+		var n int64
+		if err := db.QueryRow(`SELECT count(*) FROM ` + tbl).Scan(&n); err != nil {
+			report.add("optional_"+tbl, true, "absent (not loaded)")
+			continue
+		}
+		report.add("optional_"+tbl, true, fmt.Sprintf("rows=%d", n))
 	}
 
 	// 4. Checksum of the published artifact.

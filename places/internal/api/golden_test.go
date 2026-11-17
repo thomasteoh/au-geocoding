@@ -108,13 +108,13 @@ func loadGolden(t *testing.T, path string) []goldenCase {
 
 // addressKey is the key for a PID in the form want uses. The street address
 // is number|street|type|locality, and any row there will do; a fifth part
-// names the row: "unit N", "lot N" for a lot with no street number, or empty
-// for the base address (no unit).
+// names the row: "unit N", "lot N" for a lot with no street number, "level N"
+// for a level with no unit, or empty for the base address (no unit).
 func addressKey(t *testing.T, db *sql.DB, pid, want string) string {
 	t.Helper()
-	var num, flat, lot, name, typ, loc sql.NullString
-	err := db.QueryRow(`SELECT street_number, flat_number, lot_number, street_name, street_type, locality_name
-		FROM address WHERE gnaf_pid = ?`, pid).Scan(&num, &flat, &lot, &name, &typ, &loc)
+	var num, flat, lot, name, typ, loc, level sql.NullString
+	err := db.QueryRow(`SELECT street_number, flat_number, lot_number, street_name, street_type, locality_name, `+
+		levelKeyColumn(db)+` FROM address WHERE gnaf_pid = ?`, pid).Scan(&num, &flat, &lot, &name, &typ, &loc, &level)
 	if err != nil {
 		return "(lookup " + pid + ": " + err.Error() + ")"
 	}
@@ -127,6 +127,8 @@ func addressKey(t *testing.T, db *sql.DB, pid, want string) string {
 		return key + "|unit " + flat.String
 	case lot.String != "" && num.String == "":
 		return key + "|lot " + lot.String
+	case level.String != "":
+		return key + "|level " + level.String
 	}
 	return key + "|"
 }
@@ -189,6 +191,7 @@ func fixtureDB(t *testing.T, path string) *sql.DB {
 	if err := tx.Commit(); err != nil {
 		t.Fatal(err)
 	}
+	loadFixtureExtra(t, db, strings.TrimSuffix(path, ".tsv.gz")+"_extra.sql.gz")
 	return db
 }
 
@@ -196,6 +199,6 @@ func fixtureDB(t *testing.T, path string) *sql.DB {
 // match cmd/goldenfixture.
 const fixtureColumns = `gnaf_pid, street_number, street_name, street_type, locality_name,
 	state, postcode, latitude, longitude, confidence, geocode_rel,
-	flat_number, lot_number, primary_sec`
+	flat_number, lot_number, primary_sec, level_number`
 
-const fixtureColumnCount = 14
+const fixtureColumnCount = 15

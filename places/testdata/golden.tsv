@@ -127,3 +127,41 @@ St Kilda VIC 3182	locality:ST KILDA|VIC
 Melbourne Central	(none)
 Flinders St Station	(none)
 woolworths near doncaster	(none)
+#
+# ---- aliases, levels and postcodes (feat/aliases-levels-postcodes) ----
+#
+# G-NAF locality and street aliases answer as the official name. There is no
+# MELBOURNE CBD alias in G-NAF (August 2026); JOLIMONT, BALLARAT and MORELAND
+# are real ones.
+Jolimont VIC	locality:EAST MELBOURNE|VIC
+211 Wellington Pde Jolimont	211|WELLINGTON|PARADE|EAST MELBOURNE
+Ballarat VIC	locality:BALLARAT CENTRAL|VIC
+Moreland VIC	locality:COBURG|VIC
+Little Latrobe St Melbourne	street:LITTLE LA TROBE STREET|MELBOURNE
+Westgate Fwy Port Melbourne	street:WEST GATE FREEWAY|PORT MELBOURNE
+Tavistock St Werribee	street:VALDA WAY|WERRIBEE
+4 Lonergan Ave Werribee	4|QUEBEC|AVENUE|WERRIBEE
+687 Latrobe St Docklands	687|LA TROBE|STREET|DOCKLANDS
+1 O'Connell St North Melbourne	1|OCONNELL|STREET|NORTH MELBOURNE
+#
+# levels pick the level's own row ("level N": a level with no unit); without a
+# level, the base address as before
+Level 7, 140 Bourke St Melbourne	140|BOURKE|STREET|MELBOURNE|level 7
+L3 111 Bourke St Melbourne VIC 3000	111|BOURKE|STREET|MELBOURNE|level 3
+Lvl 2 59 Bourke St Melbourne	59|BOURKE|STREET|MELBOURNE|level 2
+Floor 4, 180 Bourke St Melbourne	180|BOURKE|STREET|MELBOURNE|level 4
+1st Floor, 88 Acland St, St Kilda	88|ACLAND|STREET|ST KILDA|level 1
+140 Bourke St Melbourne	140|BOURKE|STREET|MELBOURNE|
+#
+# postcodes: a PO box postcode with no address or postal area answers at the
+# locality internal/postbox maps it to; an unmapped one (3050 ROYAL MELBOURNE
+# HOSPITAL, 8003 COLLINS STREET EAST) declines. 3551's address average lies
+# outside its postal area, so its answer is the area's representative point.
+PO Box 9 3001	PO BOX 9@locality:MELBOURNE|VIC
+GPO Box 1234 3001	GPO BOX 1234@locality:MELBOURNE|VIC
+PO Box 77 8002	PO BOX 77@locality:EAST MELBOURNE|VIC
+Locked Bag 5 8012	LOCKED BAG 5@locality:DOCKLANDS|VIC
+PO Box 5 3050	(none)
+PO Box 5 8003	(none)
+3001	postcode:3001
+3551	postcode:3551
