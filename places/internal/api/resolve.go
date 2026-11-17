@@ -161,6 +161,7 @@ func resolveAddress(ctx context.Context, db *sql.DB, req contract.ResolveRequest
 	} else {
 		rel, score, fields = contractTokens(req.Generate, req.Score, sets)
 	}
+	rel, score, fields = sets.fuzzy.CanonicalTokens(rel, score, fields) // aliases -> official names
 	qm := match.Query{Reliable: rel, Score: score, Fields: fields}
 	limit := req.Limit
 	if limit <= 0 {

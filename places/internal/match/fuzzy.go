@@ -25,6 +25,7 @@ type FuzzySet struct {
 	streets    map[string]bool            // canonical street names (upper)
 	streetLocs map[string]map[string]bool // street -> set of localities it appears in
 	locStreets map[string][]string        // locality -> streets in it
+	aliases                               // G-NAF locality and street aliases (alias.go)
 }
 
 // LoadFuzzySet builds the fuzzy set from the real address table.
@@ -68,22 +69,28 @@ func LoadFuzzySet(ctx context.Context, db *sql.DB) (*FuzzySet, error) {
 			}
 		}
 	}
-	return fs, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return fs, fs.loadAliases(ctx, db)
 }
 
-// Localities returns the known locality names (upper case). The map is shared,
-// not copied: callers must not modify it.
-func (fs *FuzzySet) Localities() map[string]bool { return fs.localities }
+// Localities returns the known locality names (upper case), aliases included:
+// the parser recognises an alias as a locality, and CanonicalLocality then
+// names the official locality. The map is shared, not copied: callers must
+// not modify it.
+func (fs *FuzzySet) Localities() map[string]bool { return fs.known() }
 
 // NearestLocality returns the known locality closest to name by edit distance,
 // and its similarity. It scans the locality names (a few thousand per state).
 func (fs *FuzzySet) NearestLocality(name string) (string, float64) {
 	up := strings.ToUpper(name)
-	if fs.localities[up] {
+	known := fs.known()
+	if known[up] {
 		return up, 1
 	}
 	best, bestSim := "", 0.0
-	for loc := range fs.localities {
+	for loc := range known {
 		if s := levenshteinSim(up, loc); s > bestSim {
 			best, bestSim = loc, s
 		}
