@@ -97,6 +97,15 @@ Level 2, 12 Collins St Melbourne	12|COLLINS|STREET|MELBOURNE|
 95 Bell St Coburg VIC 3058	95|BELL|STREET|COBURG|
 570 Lygon St Carlton	570|LYGON|STREET|CARLTON|
 #
+# positional descriptors before the number are not street words
+Ground Floor 36 Collins St Melbourne	36|COLLINS|STREET|MELBOURNE
+Rear 36 Collins St Melbourne	36|COLLINS|STREET|MELBOURNE
+G/F 104 Barkly St St Kilda	104|BARKLY|STREET|ST KILDA|
+Basement, 469 St Kilda Rd Melbourne VIC 3004	469|ST KILDA|ROAD|MELBOURNE
+Upper Ground Floor, 12 Collins St Melbourne	12|COLLINS|STREET|MELBOURNE|
+Front 95 Bell St Coburg	95|BELL|STREET|COBURG
+Mezzanine 570 Lygon St Carlton	570|LYGON|STREET|CARLTON
+#
 # lots with no street number (2 Wellington St, Wallan is also a street number)
 Lot 14 Old Sydney Rd Wallan	|OLD SYDNEY|ROAD|WALLAN|lot 14
 Lot 2 Wellington St Wallan VIC 3756	|WELLINGTON|STREET|WALLAN|lot 2

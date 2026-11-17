@@ -60,6 +60,17 @@ func TestParse(t *testing.T) {
 		{"11 Cross Dartmouht VIC", Parsed{Number: "11", Street: "CROSS", Locality: "DARTMOUTH", State: "VIC"}},
 		{"24 Wreckyn Notrh Melbourne", Parsed{Number: "24", Street: "WRECKYN", Locality: "NORTH MELBOURNE"}},
 		{"Box Hill North", Parsed{Locality: "BOX HILL NORTH"}},
+		// Positional descriptors before the number are skipped...
+		{"Ground Floor 36 Collins St Melbourne", Parsed{Number: "36", Street: "COLLINS", StreetType: "STREET", Locality: "MELBOURNE"}},
+		{"G/F, 36 Collins St Melbourne", Parsed{Number: "36", Street: "COLLINS", StreetType: "STREET", Locality: "MELBOURNE"}},
+		{"Rear 36 Collins St Melbourne", Parsed{Number: "36", Street: "COLLINS", StreetType: "STREET", Locality: "MELBOURNE"}},
+		{"Front, 2/36 Collins St Melbourne", Parsed{Unit: "2", Number: "36", Street: "COLLINS", StreetType: "STREET", Locality: "MELBOURNE"}},
+		{"Upper Ground Shop 4 36 Collins St Melbourne", Parsed{Unit: "4", Number: "36", Street: "COLLINS", StreetType: "STREET", Locality: "MELBOURNE"}},
+		{"Lower Ground Floor 36 Collins St Melbourne", Parsed{Number: "36", Street: "COLLINS", StreetType: "STREET", Locality: "MELBOURNE"}},
+		{"Basement Lot 5 Richmond Rd Toorak", Parsed{Lot: "5", Street: "RICHMOND", StreetType: "ROAD", Locality: "TOORAK"}},
+		// ...but name the street when no number follows them.
+		{"12 Upper Heidelberg Rd", Parsed{Number: "12", Street: "UPPER HEIDELBERG", StreetType: "ROAD"}},
+		{"Front St Richmond", Parsed{Street: "FRONT", StreetType: "STREET", Locality: "RICHMOND"}},
 	}
 	for _, c := range cases {
 		got := Parse(c.in, 32, testLocalities, nearest)
@@ -138,3 +149,4 @@ func has(score, fields []string, v, field string) bool {
 	}
 	return false
 }
+

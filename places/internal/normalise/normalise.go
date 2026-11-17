@@ -52,6 +52,44 @@ var unitWords = map[string]bool{
 // only so that it is not taken for the unit, and dropped.
 var levelWords = map[string]bool{"LEVEL": true, "LVL": true, "L": true}
 
+// descriptorWords say where in a building or on a property the address is
+// ("GROUND FLOOR", "REAR", "BASEMENT"). They carry no number, G-NAF has no
+// column for them, and they are not street words: left in, "REAR 36 COLLINS
+// ST" reads as a street named REAR. A descriptor is skipped only before the
+// street number (or a unit, lot, level or another descriptor), so "UPPER
+// HEIDELBERG RD" and "FRONT ST" keep their names. The geocoder's normaliser
+// (ausystem/shared/normalise) drops the same words.
+var descriptorWords = map[string]bool{
+	"GROUND": true, "GF": true, "FRONT": true, "REAR": true, "UPPER": true,
+	"LOWER": true, "BASEMENT": true, "MEZZANINE": true,
+}
+
+// descriptorAt returns how many tokens a descriptor at toks[i] spans: "G / F"
+// (G/F after '/' is split out), "GROUND FLOOR", or one descriptor word. 0
+// means none starts there.
+func descriptorAt(toks []string, i int) int {
+	switch {
+	case i+2 < len(toks) && toks[i] == "G" && toks[i+1] == "/" && toks[i+2] == "F":
+		return 3
+	case toks[i] == "GROUND" && i+1 < len(toks) && (toks[i+1] == "FLOOR" || toks[i+1] == "FLR"):
+		return 2
+	case descriptorWords[toks[i]]:
+		return 1
+	}
+	return 0
+}
+
+// opensAddress reports whether toks[i] can begin the numbered part of an
+// address: a number, a unit, lot or level, or another descriptor.
+func opensAddress(toks []string, i int) bool {
+	if i >= len(toks) {
+		return false
+	}
+	t := toks[i]
+	return numberRe.MatchString(t) || unitWords[t] || levelWords[t] || t == "LOT" ||
+		unitWordRe.MatchString(t) || levelWordRe.MatchString(t) || descriptorAt(toks, i) > 0
+}
+
 var (
 	stripRe     = regexp.MustCompile(`[^A-Z0-9'/\-\s]`)
 	numberRe    = regexp.MustCompile(`^([0-9]+)[A-Z]?$`)
@@ -113,9 +151,14 @@ func Parse(input string, maxTokens int, localitySet map[string]bool, nearest Nea
 	}
 	// Unit and street number. Accepts "UNIT 3 15", "U3 15", "3/15", "15-17"
 	// (a range: the first number is G-NAF's number_first) and "15A", plus
-	// "LOT 5" and a level, which is skipped.
+	// "LOT 5"; a level and a positional descriptor ("GROUND FLOOR", "REAR")
+	// are skipped.
 	for i < len(toks) {
 		t := toks[i]
+		if n := descriptorAt(toks, i); n > 0 && p.Number == "" && opensAddress(toks, i+n) {
+			i += n
+			continue
+		}
 		next := i+1 < len(toks) && numberRe.MatchString(toks[i+1])
 		if t == "LOT" && next {
 			p.Lot = numberRe.FindStringSubmatch(toks[i+1])[1]
@@ -373,3 +416,4 @@ func isPostcode(f string) bool {
 	}
 	return true
 }
+
