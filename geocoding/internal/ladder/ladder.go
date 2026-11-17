@@ -13,7 +13,6 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"augeocoding/internal/ranking"
@@ -49,7 +48,23 @@ type Query struct {
 	POIName string
 	Anchor  *contract.Point
 	Within  contract.LocalityID
+	// Limit caps the candidates a rung asks for (Limits.MaxResults, or less
+	// when the caller's remaining quota is smaller). 0 means the rung default.
+	Limit int
 }
+
+// limit returns q.Limit, or def when the caller set none. def also caps it:
+// each rung has a ceiling of its own that a larger Limit must not lift.
+func (q Query) limit(def int) int {
+	if q.Limit > 0 && q.Limit < def {
+		return q.Limit
+	}
+	return def
+}
+
+// defaultLimit is the candidate cap a forward rung asks places for when the
+// caller set none; it matches places' own maxResults clamp.
+const defaultLimit = 20
 
 // Result is the outcome of walking the ladder.
 type Result struct {
@@ -97,14 +112,17 @@ func (l *Ladder) walk(ctx context.Context, q Query, kind string) (Result, error)
 			return Result{}, err
 		}
 	}
-	if l.LLM != nil {
+	// /reverse is coordinates in, addresses out: there is nothing for a model
+	// to interpret, and a coordinate the reverse rung could not place must not
+	// become a paid LLM call.
+	if l.LLM != nil && kind != "reverse" {
 		strategy, resp, err := l.LLM.Try(ctx, q)
 		if err == nil {
 			return Result{Strategy: strategy, Response: resp}, nil
 		}
 		if errors.Is(err, ErrLLMDegraded) {
 			// LLM breaker open — fall back to the best deterministic rung.
-			return l.bestDeterministic(ctx, q)
+			return l.bestDeterministic(ctx, q, kind)
 		}
 		if errors.Is(err, ErrLLMNotImplemented) {
 			// The LLM rung is configured but not wired. This is a server-side
@@ -120,11 +138,18 @@ func (l *Ladder) walk(ctx context.Context, q Query, kind string) (Result, error)
 }
 
 // bestDeterministic reruns the deterministic rungs and returns the best result,
-// marked degraded. This is the circuit-breaker fallback (runtime.md).
-func (l *Ladder) bestDeterministic(ctx context.Context, q Query) (Result, error) {
+// marked degraded. This is the circuit-breaker fallback (runtime.md). It is
+// bound by the endpoint kind like the walk itself: /geocode must not come back
+// with a POI because the LLM happened to be down. With nothing to offer, the
+// caller hears the LLM is unavailable (ErrLLMDegraded), not that its input was
+// unparseable.
+func (l *Ladder) bestDeterministic(ctx context.Context, q Query, kind string) (Result, error) {
 	var best Result
 	var bestScore float64
 	for _, r := range l.Rungs {
+		if kind != "search" && !rungServes(r, kind) {
+			continue
+		}
 		strategy, resp, err := r.Try(ctx, q)
 		if err != nil {
 			continue
@@ -136,7 +161,7 @@ func (l *Ladder) bestDeterministic(ctx context.Context, q Query) (Result, error)
 		}
 	}
 	if best.Strategy == "" {
-		return Result{}, ErrNoRung
+		return Result{}, ErrLLMDegraded
 	}
 	return best, nil
 }
@@ -201,7 +226,7 @@ func (r addressRung) Try(ctx context.Context, q Query) (string, contract.Resolve
 		Score:    q.Normal.Tokens,
 		State:    q.Normal.State,
 		Postcode: q.Normal.Postcode,
-		Limit:    20,
+		Limit:    q.limit(defaultLimit),
 	}
 	resp, err := r.res.Resolve(ctx, req)
 	if err != nil {
@@ -252,7 +277,7 @@ func (r poiAnchorRung) Try(ctx context.Context, q Query) (string, contract.Resol
 		Kind:     contract.KindAddress,
 		Generate: normalise.Normalise(right).Generate,
 		Score:    normalise.Normalise(right).Tokens,
-		Limit:    20,
+		Limit:    defaultLimit,
 	}
 	anchorResp, err := r.res.Resolve(ctx, anchorReq)
 	if err != nil {
@@ -272,7 +297,7 @@ func (r poiAnchorRung) Try(ctx context.Context, q Query) (string, contract.Resol
 		Generate: normalise.Normalise(left).Generate,
 		Score:    normalise.Normalise(left).Tokens,
 		Anchor:   &anchor,
-		Limit:    20,
+		Limit:    q.limit(defaultLimit),
 	}
 	poiResp, err := r.res.Resolve(ctx, poiReq)
 	if err != nil {
@@ -303,7 +328,7 @@ func (r poiRung) Try(ctx context.Context, q Query) (string, contract.ResolveResp
 		Kind:     contract.KindPOI,
 		Generate: q.Normal.Generate,
 		Score:    q.Normal.Tokens,
-		Limit:    20,
+		Limit:    q.limit(defaultLimit),
 	}
 	resp, err := r.res.Resolve(ctx, req)
 	if err != nil {
@@ -348,10 +373,10 @@ func rungServes(r Rung, kind string) bool {
 	case "geocode":
 		return k == "coord" || k == "address"
 	case "reverse":
-		// /reverse is served by the reverse rung (real RTree nearest) OR the
-		// coord rung (a bare coordinate echo). Both accept a coordinate; the
-		// reverse rung returns actual nearest addresses, the coord rung echoes.
-		return k == "reverse" || k == "coord"
+		// /reverse is served by the reverse rung alone. The coord rung would
+		// also accept "lat, lon" text, and since it runs first it would echo
+		// the input point back instead of the nearest addresses.
+		return k == "reverse"
 	case "poi":
 		return k == "poi"
 	case "parse":
@@ -386,7 +411,7 @@ func (r reverseRung) Try(ctx context.Context, q Query) (string, contract.Resolve
 	req := contract.ResolveRequest{
 		Kind:       contract.KindReverse,
 		Anchor:     &anchor,
-		Limit:      5,
+		Limit:      q.limit(5),
 		MaxRadiusM: 10000, // widen up to 10km if the tight bbox is empty
 	}
 	resp, err := r.res.Resolve(ctx, req)
@@ -435,214 +460,3 @@ func reverseCoord(raw string) (lat, lon float64, ok bool) {
 
 // NewReverseRung returns rung 2r (coordinate → nearest addresses).
 func NewReverseRung(res contract.Resolver) Rung { return reverseRung{res: res} }
-
-// LLMRung is rung 5. It is present only when configured (runtime.md: "the LLM
-// only sees genuinely messy input"). It carries the two-class concurrency:
-// admission, singleflight, deadline shedding, per-key in-flight cap, breaker.
-type LLMRung struct {
-	// Configured is set by the caller; if false, the rung is absent.
-	Configured bool
-	// Admit is the bounded queue admission control. Returns false when full.
-	Admit func() bool
-	// Release is called exactly once after Admit admitted a request, on both
-	// success and error paths, to return the queue slot (adversarial review M2).
-	Release func()
-	// Singleflight collapses identical in-flight queries.
-	Singleflight *sync.Map
-	// Breaker is the circuit breaker state.
-	Breaker *Breaker
-	// Provider is the LLM provider client (OpenAI-compatible). When nil the
-	// rung reports ErrLLMNotImplemented — configured but not wired.
-	Provider interface {
-		Complete(ctx context.Context, query string) (string, error)
-	}
-}
-
-// Breaker is a simple circuit breaker.
-type Breaker struct {
-	mu     sync.Mutex
-	failed int
-	open   bool
-	opened time.Time
-	// Threshold opens after this many consecutive failures.
-	Threshold int
-	// Cooldown is how long the breaker stays open.
-	Cooldown time.Duration
-}
-
-func (b *Breaker) Allow() bool {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	if b.open {
-		if time.Since(b.opened) >= b.Cooldown {
-			b.open = false
-			b.failed = 0
-			return true // half-open probe
-		}
-		return false
-	}
-	return true
-}
-
-func (b *Breaker) Success() {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	b.failed = 0
-	b.open = false
-}
-
-func (b *Breaker) Failure() {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	b.failed++
-	if b.failed >= b.Threshold {
-		b.open = true
-		b.opened = time.Now()
-	}
-}
-
-func (r *LLMRung) Try(ctx context.Context, q Query) (string, contract.ResolveResponse, error) {
-	if !r.Configured {
-		return "", contract.ResolveResponse{}, ErrNoRung
-	}
-	if !r.Breaker.Allow() {
-		return "", contract.ResolveResponse{}, ErrLLMDegraded
-	}
-	// Per-caller admission (Queue.PerKeyInflight) comes before the shared
-	// queue, so one caller cannot hold every queue slot.
-	g := gateFrom(ctx)
-	if g.Enter != nil {
-		leave, err := g.Enter()
-		if err != nil {
-			return "", contract.ResolveResponse{}, err
-		}
-		if leave != nil {
-			defer leave()
-		}
-	}
-	if !r.Admit() {
-		return "", contract.ResolveResponse{}, ErrQueueFull
-	}
-	// Release the queue slot exactly once, on every path after Admit admitted.
-	if r.Release != nil {
-		defer r.Release()
-	}
-	// Singleflight: collapse identical in-flight queries.
-	key := hashQuery(q.Raw)
-	if v, ok := r.Singleflight.Load(key); ok {
-		return StrategyLLM, v.(contract.ResolveResponse), nil
-	}
-	// Deadline shedding: if the request already timed out, drop it.
-	if ctx.Err() != nil {
-		return "", contract.ResolveResponse{}, ctx.Err()
-	}
-	if r.Provider == nil {
-		return "", contract.ResolveResponse{}, ErrLLMNotImplemented
-	}
-	// Count the call against the caller's LLM budget before spending it.
-	if g.Charge != nil {
-		if err := g.Charge(); err != nil {
-			return "", contract.ResolveResponse{}, err
-		}
-	}
-	resp, err := r.callLLM(ctx, q)
-	if err != nil {
-		r.Breaker.Failure()
-		return "", contract.ResolveResponse{}, err
-	}
-	r.Breaker.Success()
-	r.Singleflight.Store(key, resp)
-	// Evict the dedupe entry after serving so the map cannot grow unbounded
-	// with distinct query hashes (adversarial review M1). Concurrent requests
-	// for the same key still collapse: they Load before this Store and read the
-	// in-flight entry; only subsequent requests re-compute.
-	r.Singleflight.Delete(key)
-	return StrategyLLM, resp, nil
-}
-
-// callLLM is the seam — the real LLM call. When Provider is nil the rung
-// reports ErrLLMNotImplemented (configured but not wired); callers map that to
-// 501. With a provider the query is sent to the OpenAI-compatible endpoint and
-// the model's JSON output is parsed into a ResolveResponse.
-func (r *LLMRung) callLLM(ctx context.Context, q Query) (contract.ResolveResponse, error) {
-	if r.Provider == nil {
-		return contract.ResolveResponse{}, ErrLLMNotImplemented
-	}
-	raw, err := r.Provider.Complete(ctx, q.Raw)
-	if err != nil {
-		return contract.ResolveResponse{}, err
-	}
-	var resp contract.ResolveResponse
-	if err := json.Unmarshal([]byte(raw), &resp); err != nil {
-		return contract.ResolveResponse{}, fmt.Errorf("%w: model output not JSON: %v", ErrLLMNotImplemented, err)
-	}
-	// The model output is untrusted (adversarial review C2): a prompt-injection
-	// into the model can yield arbitrary text/name/brand and out-of-bounds
-	// coordinates. Sanitize every candidate before it reaches the caller:
-	// clamp coordinates to the AU bbox, drop candidates the model invents
-	// outside scope, and strip markup from free-text fields so a downstream
-	// consumer rendering them as HTML is not XSS-vulnerable.
-	sanitizeLLMCandidates(&resp)
-	return resp, nil
-}
-
-// sanitizeLLMCandidates strips untrusted model output down to safe values.
-// The model is not a trusted data source — a prompt-injection can make it
-// emit arbitrary free text, invented identifiers, or out-of-scope coordinates.
-// We clamp to the AU bbox, drop out-of-scope candidates, and remove markup
-// from free-text fields (text/name/brand/operator) so downstream consumers
-// that render them as HTML are not XSS-vulnerable.
-func sanitizeLLMCandidates(resp *contract.ResolveResponse) {
-	out := resp.Candidates[:0]
-	for _, c := range resp.Candidates {
-		// Clamp coordinates to the AU bbox (mirrors the coord rung's T4 check).
-		if c.Point.Lat < -60 || c.Point.Lat > -9 || c.Point.Lon < 110 || c.Point.Lon > 160 {
-			continue // drop out-of-scope candidate
-		}
-		c.Text = stripMarkup(c.Text)
-		c.Name = stripMarkup(c.Name)
-		c.Brand = stripMarkup(c.Brand)
-		c.Operator = stripMarkup(c.Operator)
-		out = append(out, c)
-	}
-	resp.Candidates = out
-}
-
-// stripMarkup removes HTML/script markup from a free-text field. It is not a
-// full HTML sanitizer — it neutralizes the breakout characters that make a
-// string dangerous when rendered as HTML (adversarial review C2).
-func stripMarkup(s string) string {
-	if !strings.ContainsAny(s, "<>") {
-		return s
-	}
-	var b strings.Builder
-	for _, r := range s {
-		switch r {
-		case '<', '>':
-			// Drop angle brackets entirely; keep the rest of the text.
-		default:
-			b.WriteRune(r)
-		}
-	}
-	return strings.TrimSpace(b.String())
-}
-
-// ErrLLMNotImplemented is returned when the LLM rung is configured but the LLM
-// provider client is not wired. It is distinct from ErrNoRung (no rung applies
-// to this input) and from ErrLLMDegraded (breaker open) — it means the rung
-// exists but cannot run.
-var ErrLLMNotImplemented = errors.New("llm not implemented")
-
-// ErrQueueFull is returned when the LLM queue is at capacity.
-var ErrQueueFull = errors.New("llm queue full")
-
-func hashQuery(raw string) string {
-	// SHA-256 of the raw query, in-memory only (D-015: never persisted/logged).
-	// The hash is a dedupe key, not a retention mechanism.
-	var h uint64 = 14695981039346656037
-	for _, c := range raw {
-		h ^= uint64(c)
-		h *= 1099511628211
-	}
-	return strconv.FormatUint(h, 16)
-}

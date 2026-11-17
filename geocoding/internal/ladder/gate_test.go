@@ -3,7 +3,6 @@ package ladder
 import (
 	"context"
 	"errors"
-	"sync"
 	"testing"
 	"time"
 )
@@ -18,7 +17,7 @@ func (p *countingProvider) Complete(ctx context.Context, q string) (string, erro
 func newTestLLMRung(p *countingProvider) *LLMRung {
 	return &LLMRung{
 		Configured: true, Admit: func() bool { return true }, Release: func() {},
-		Singleflight: &sync.Map{}, Breaker: NewBreaker(5, time.Minute), Provider: p,
+		Breaker: NewBreaker(5, time.Minute), Provider: p,
 	}
 }
 

@@ -3,6 +3,7 @@ package ladder
 import (
 	"context"
 	"errors"
+	"sync"
 	"testing"
 
 	"ausystem/shared/contract"
@@ -109,5 +110,65 @@ func TestAddressRungAsksPlacesWithoutNumber(t *testing.T) {
 	// ...and when places declines, the walk moves on to POI search.
 	if res := walk("woolworths"); res.Strategy != StrategyPOI {
 		t.Errorf("woolworths: strategy %s, want poi", res.Strategy)
+	}
+}
+
+// recordingResolver records the requests it receives and answers each with
+// one candidate.
+type recordingResolver struct {
+	mockResolver
+	mu   sync.Mutex
+	reqs []contract.ResolveRequest
+}
+
+func (r *recordingResolver) Resolve(ctx context.Context, req contract.ResolveRequest) (contract.ResolveResponse, error) {
+	r.mu.Lock()
+	r.reqs = append(r.reqs, req)
+	r.mu.Unlock()
+	return contract.ResolveResponse{Candidates: []contract.Candidate{{Source: "gnaf", Text: "1 NEAREST ST", MatchScore: 0.9}}}, nil
+}
+
+// /reverse with "lat, lon" text must reach the reverse rung, not the coord
+// rung's echo of the input, and must never fall through to the paid LLM.
+func TestReverseUsesReverseRungNotEcho(t *testing.T) {
+	res := &recordingResolver{}
+	llmP := &replyProvider{reply: `{"candidates":[]}`}
+	l := &Ladder{
+		Rungs: []Rung{NewCoordRung(), NewAddressRung(res), NewReverseRung(res)},
+		LLM:   newRung(llmP),
+	}
+	q := "-33.86, 151.2"
+	got, err := l.WalkKind(context.Background(), Query{Raw: q, Normal: normalise.Normalise(q)}, "reverse")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.reqs) != 1 || res.reqs[0].Kind != contract.KindReverse {
+		t.Fatalf("resolver requests: %+v", res.reqs)
+	}
+	if got.Response.Candidates[0].Text != "1 NEAREST ST" {
+		t.Fatalf("reverse echoed the input: %+v", got.Response.Candidates)
+	}
+	// A coordinate outside AU: no rung applies, and the LLM is not asked.
+	q = `{"lat":51.5,"lon":-0.1}`
+	if _, err := l.WalkKind(context.Background(), Query{Raw: q, Normal: normalise.Normalise(q)}, "reverse"); !errors.Is(err, ErrNoRung) {
+		t.Fatalf("out-of-AU reverse: %v", err)
+	}
+	if llmP.calls.Load() != 0 {
+		t.Fatal("/reverse reached the LLM")
+	}
+}
+
+func TestQueryLimitReachesResolver(t *testing.T) {
+	res := &recordingResolver{}
+	l := &Ladder{Rungs: []Rung{NewAddressRung(res)}}
+	q := "12 high st"
+	for _, tc := range []struct{ limit, want int }{{0, 20}, {7, 7}, {50, 20}} {
+		res.reqs = nil
+		if _, err := l.Walk(context.Background(), Query{Raw: q, Normal: normalise.Normalise(q), Limit: tc.limit}); err != nil {
+			t.Fatal(err)
+		}
+		if res.reqs[0].Limit != tc.want {
+			t.Errorf("Limit %d: resolver asked for %d, want %d", tc.limit, res.reqs[0].Limit, tc.want)
+		}
 	}
 }

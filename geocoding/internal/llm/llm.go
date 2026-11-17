@@ -14,6 +14,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"strings"
 	"sync"
@@ -74,6 +75,15 @@ func (h *Holder) Set(c Config) {
 func (h *Holder) Enabled() bool {
 	return h.Get().Enabled
 }
+
+// DefaultTimeout bounds a provider call when the config leaves Timeout unset.
+// It sits under the default request timeout (30s), so a slow provider surfaces
+// as a provider failure rather than eating the whole request.
+const DefaultTimeout = 20 * time.Second
+
+// maxResponseBytes caps how much of a provider response is read. A completion
+// for one geocoding query is a few KB; anything near this is not an answer.
+const maxResponseBytes = 1 << 20
 
 // Client is the provider client. It is stateless — the holder is read per call.
 type Client struct {
@@ -139,13 +149,16 @@ func (c *Client) Complete(ctx context.Context, query string) (string, error) {
 	if err := json.NewEncoder(&buf).Encode(body); err != nil {
 		return "", err
 	}
-	// Timeout: 0 means "no deadline" — an unset timeout must not fire immediately.
-	ctx, cancel := context.WithTimeout(ctx, time.Duration(cfg.Timeout)*time.Second)
-	defer cancel()
-	if cfg.Timeout <= 0 {
-		cancel()
-		ctx = context.Background()
+	// The provider call always runs under the request's context, so the
+	// request deadline and a client disconnect both stop it. Timeout narrows
+	// that further; unset falls back to DefaultTimeout rather than leaving a
+	// slow provider bounded only by the request.
+	timeout := time.Duration(cfg.Timeout) * time.Second
+	if timeout <= 0 {
+		timeout = DefaultTimeout
 	}
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
 
 	url := strings.TrimRight(cfg.BaseURL, "/") + "/chat/completions"
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, &buf)
@@ -160,9 +173,19 @@ func (c *Client) Complete(ctx context.Context, query string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("%w: %v", ErrProvider, err)
 	}
-	defer resp.Body.Close()
+	defer func() {
+		// Drain what is left (bounded) so the connection can be reused.
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, maxResponseBytes))
+		resp.Body.Close()
+	}()
+	// A non-2xx answer is a provider failure whatever its body says: an error
+	// page or {"error":...} must not be decoded as an empty completion.
+	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		return "", fmt.Errorf("%w: status %d", ErrProvider, resp.StatusCode)
+	}
+	// The body is the provider's, not ours: bound what we will buffer.
 	var cr chatResponse
-	if err := json.NewDecoder(resp.Body).Decode(&cr); err != nil {
+	if err := json.NewDecoder(io.LimitReader(resp.Body, maxResponseBytes)).Decode(&cr); err != nil {
 		return "", fmt.Errorf("%w: decode: %v", ErrProvider, err)
 	}
 	if len(cr.Choices) == 0 || cr.Choices[0].Message.Content == "" {
@@ -182,9 +205,15 @@ func (c *Client) do(req *http.Request) (*http.Response, error) {
 }
 
 // systemPrompt is the instruction the provider receives before the user query.
-// It asks the model to emit a JSON ResolveResponse so the ladder can map it.
-const systemPrompt = `You are a geocoding assistant. Parse the user's query and respond with
-JSON only, no prose. The JSON must match this shape:
-{"candidates":[{"id":{"source":"gnaf|osm","pid":""},"kind":0,"point":{"lat":0,"lon":0},"source":"gnaf|osm","text":"","gnaf_pid":"","gnaf_confidence":0,"geocode_reliability":0,"match_score":0,"name":"","brand":"","operator":""}],"truncated":false,"total_matched":0,"generated_count":0,"dataset_version":"","ambiguous":[],"degraded":[]}
-Fill only the fields you can infer. If you cannot resolve anything, return
-{"candidates":[],"truncated":false,"total_matched":0,"generated_count":0,"dataset_version":"","ambiguous":[],"degraded":["llm-no-result"]}.`
+// It asks the model for the few fields a model can honestly supply: what it
+// thinks the place is, roughly where, and how sure it is. It does not ask for
+// G-NAF identifiers or quality fields — the model has no access to G-NAF, and
+// the ladder overwrites any it invents (provenance "llm", score capped).
+const systemPrompt = `You are a geocoding assistant for Australian places. Interpret the user's
+query and respond with JSON only, no prose. The JSON must match this shape:
+{"candidates":[{"kind":0,"point":{"lat":0,"lon":0},"text":"","name":"","match_score":0}]}
+kind is 0 for a street address and 1 for a named place. point is your best
+estimate of the location; it is shown to the user as an approximate,
+model-inferred answer. text is the address or place as you understand it.
+match_score is your confidence from 0 to 1. Only include places in Australia.
+If you cannot resolve anything, return {"candidates":[]}.`

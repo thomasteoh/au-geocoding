@@ -1,11 +1,15 @@
 package llm
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
+	"time"
 )
 
 func TestHolderSetEnabledDerived(t *testing.T) {
@@ -65,5 +69,56 @@ func TestClientDisabled(t *testing.T) {
 	_, err := c.Complete(context.Background(), "q")
 	if err != ErrDisabled {
 		t.Fatalf("want ErrDisabled, got %v", err)
+	}
+}
+
+// The provider call runs under the request context even when Timeout is 0
+// (the old behaviour replaced it with context.Background()).
+func TestClientHonoursRequestDeadline(t *testing.T) {
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-release:
+		case <-r.Context().Done():
+		}
+	}))
+	defer srv.Close()
+	defer close(release)
+	c := NewClient(NewHolder(Config{BaseURL: srv.URL, Enabled: true, Timeout: 0}))
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	_, err := c.Complete(ctx, "q")
+	if err == nil || !errors.Is(err, ErrProvider) {
+		t.Fatalf("want provider error on deadline, got %v", err)
+	}
+	if d := time.Since(start); d > 2*time.Second {
+		t.Fatalf("call ignored the request deadline (%v)", d)
+	}
+}
+
+func TestClientRejectsNonOKStatus(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"{\"candidates\":[]}"}}]}`))
+	}))
+	defer srv.Close()
+	c := NewClient(NewHolder(Config{BaseURL: srv.URL, Enabled: true, Timeout: 5}))
+	if _, err := c.Complete(context.Background(), "q"); !errors.Is(err, ErrProvider) || !strings.Contains(err.Error(), "429") {
+		t.Fatalf("429 from provider: %v", err)
+	}
+}
+
+func TestClientBoundsResponseBody(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// A valid JSON prefix that never ends inside the cap.
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"`))
+		_, _ = w.Write(bytes.Repeat([]byte("a"), 2*maxResponseBytes))
+		_, _ = w.Write([]byte(`"}}]}`))
+	}))
+	defer srv.Close()
+	c := NewClient(NewHolder(Config{BaseURL: srv.URL, Enabled: true, Timeout: 5}))
+	if _, err := c.Complete(context.Background(), "q"); !errors.Is(err, ErrProvider) {
+		t.Fatalf("oversized body: %v", err)
 	}
 }
