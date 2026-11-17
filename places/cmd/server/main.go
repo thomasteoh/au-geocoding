@@ -1,12 +1,12 @@
 // server is the serving binary. It exposes POST /search (the parse ladder),
 // GET /healthz and GET /readyz. The DB is opened read-only (INV-4 — the server
-// never writes; the loader is the only writer).
+// never writes; the loader is the only writer), and the server holds a shared
+// lock on it so no loader can open it for writing while it is served.
 package main
 
 import (
 	"context"
 	"crypto/subtle"
-	"database/sql"
 	"embed"
 	"encoding/json"
 	"flag"
@@ -15,8 +15,8 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
-	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -30,6 +30,14 @@ import (
 
 //go:embed static
 var staticFS embed.FS
+
+// writeTimeout bounds a whole response, activation included (it hashes the
+// dataset against its verify report). drainDelay outlasts it, so an old pool
+// is closed only once no request can still be using it.
+const (
+	writeTimeout = 60 * time.Second
+	drainDelay   = writeTimeout + 5*time.Second
+)
 
 // writeJSONError emits a JSON error body with the correct content type.
 // http.Error forces text/plain even when the body is a JSON object, so the
@@ -75,39 +83,27 @@ func main() {
 	dbPath := cfg.DB
 	addr := cfg.Addr
 
-	db, err := sql.Open("sqlite", dbPath)
+	// The only directory /ctrl/activate may serve from, resolved once.
+	dataDir, err := realDataDir(dbPath)
 	if err != nil {
 		logger.Error("open_db_failed", "error", err.Error(), "db", dbPath)
 		log.Fatalf("open db: %v", err)
 	}
-	defer db.Close()
 
-	// Fail fast on a missing/unopenable DB (D-020): sql.Open is lazy, so a bad
-	// path isn't caught until the first query. Probe the serving dataset now.
+	// Read-only (INV-4): the server must never write the serving dataset.
+	// openServing puts mode=ro and query_only on the DSN so they hold on every
+	// pooled connection (a PRAGMA via db.Exec reaches only one), takes the
+	// shared lock that keeps loaders off the file, and fails fast on a missing
+	// file or address table (D-020): sql.Open is lazy, so it probes now.
 	ctx := context.Background()
-	if err := db.PingContext(ctx); err != nil {
+	db, bootVersion, _, bootRelease, err := openServing(ctx, dbPath)
+	if err != nil {
 		logger.Error("open_db_failed", "error", err.Error(), "db", dbPath)
 		log.Fatalf("open db: %v", err)
 	}
-	// Confirm the address table exists (the core dataset). A DB without it is
-	// a misconfiguration — refuse to serve.
-	var addrCount int
-	if err := db.QueryRowContext(ctx, `SELECT count(*) FROM address`).Scan(&addrCount); err != nil {
-		logger.Error("address_table_missing", "error", err.Error(), "db", dbPath)
-		log.Fatalf("address table: %v", err)
-	}
-
-	// Read-only (INV-4): the server must never write the serving dataset.
-	if _, err := db.Exec(`PRAGMA query_only=ON`); err != nil {
-		logger.Error("query_only_failed", "error", err.Error())
-		log.Fatalf("query_only: %v", err)
-	}
-	// Concurrent reads: this DB is read-only (query_only=ON), so a pool of
-	// reader connections is safe and lets /readyz and requests proceed while
-	// the warmup queries run. Modernc sqlite serializes writers by default;
-	// with query_only there are no writers, so open a small reader pool.
-	db.SetMaxOpenConns(4)
-	db.SetMaxIdleConns(4)
+	// The lock is released by activation when this pool is retired, or by the
+	// OS when the process exits.
+	defer db.Close()
 
 	// Warm the locality set asynchronously (P8/R8.2): /readyz must report the
 	// loading state immediately rather than queue behind the warmup query.
@@ -125,7 +121,9 @@ func main() {
 	// The DBProvider holds the active serving DB and supports the versioned
 	// swap (P3). Handlers read via the provider so an activation routes new
 	// requests to the new pool while in-flight requests finish on the old one.
-	provider := api.NewDBProvider(db, "g-naf-aug26+osm-vic-260914")
+	// The version is the dataset's own address.dataset_version, the same value
+	// every response carries; there is no second copy here to drift.
+	provider := api.NewDBProvider(db, bootVersion)
 
 	// Metrics: minimal Prometheus-style counter set, exposed at /metrics.
 	met := metrics.New("auplaces")
@@ -198,8 +196,13 @@ func main() {
 	})
 	// P3 activate: the control endpoint. Swap the active pool to a new DB file.
 	// Security: requires the AUGEO_CTRL_TOKEN (constant-time compare), the DB
-	// path must live under the serving data dir (no traversal / arbitrary file
-	// open), and errors are generic — no filesystem oracle.
+	// must resolve (symlinks included) to a regular file inside the serving
+	// data dir, it must have a passing verify report, and errors are generic —
+	// no filesystem oracle.
+	var (
+		activateMu     sync.Mutex
+		currentRelease = bootRelease
+	)
 	mux.HandleFunc("/ctrl/activate", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed")
@@ -212,56 +215,72 @@ func main() {
 		}
 		api.LimitBody(w, r)
 		var req struct {
-			DB      string `json:"db"`
+			DB string `json:"db"`
+			// Version is optional. The served version is always the
+			// dataset's own; a caller that names one gets a refusal if the
+			// file says otherwise, rather than a swap it did not expect.
 			Version string `json:"version"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			writeJSONError(w, http.StatusBadRequest, "bad request")
 			return
 		}
-		if req.DB == "" || req.Version == "" {
-			writeJSONError(w, http.StatusBadRequest, "db and version required")
+		if req.DB == "" {
+			writeJSONError(w, http.StatusBadRequest, "db required")
 			return
 		}
-		// Path allowlist: the requested DB must resolve under the serving data
-		// dir. Reject absolute paths and any traversal (..). This prevents
-		// pointing the service at an arbitrary host file.
-		if !withinDir(dbPath, req.DB) {
+		// One activation at a time: each owns the lock release of the pool it
+		// replaces.
+		activateMu.Lock()
+		defer activateMu.Unlock()
+
+		real, err := resolveDataset(dataDir, req.DB)
+		if err != nil {
 			writeJSONError(w, http.StatusForbidden, "db path not allowed")
 			return
 		}
-		// Open the new file read-only; on failure the old pool keeps serving
-		// (R3.5) — we only swap after the new handle is valid.
-		newDB, err := sql.Open("sqlite", req.DB)
+		if err := checkVerified(real, req.DB); err != nil {
+			logger.Error("activate_unverified", "error", err.Error())
+			writeJSONError(w, http.StatusConflict, "dataset not verified")
+			return
+		}
+		// Open exactly the resolved file, read-only; on failure the old pool
+		// keeps serving (R3.5) — we only swap after the new handle is valid.
+		newDB, version, n, release, err := openServing(r.Context(), real)
 		if err != nil {
+			logger.Error("activate_open_failed", "error", err.Error())
 			writeJSONError(w, http.StatusInternalServerError, "activate failed")
 			return
 		}
-		if _, err := newDB.Exec(`PRAGMA query_only=ON`); err != nil {
+		if req.Version != "" && req.Version != version {
 			newDB.Close()
-			writeJSONError(w, http.StatusInternalServerError, "activate failed")
-			return
-		}
-		// Confirm the new dataset is valid before swapping.
-		var n int
-		if err := newDB.QueryRowContext(r.Context(), `SELECT count(*) FROM address`).Scan(&n); err != nil {
-			newDB.Close()
-			writeJSONError(w, http.StatusInternalServerError, "activate failed")
+			release()
+			writeJSONError(w, http.StatusConflict, "version mismatch")
 			return
 		}
 		// Build the new dataset's lookup sets before it takes traffic, so the
 		// first requests after the swap don't each wait on a full-table scan.
 		if err := api.WarmSets(newDB); err != nil {
 			newDB.Close()
+			release()
 			writeJSONError(w, http.StatusInternalServerError, "activate failed")
 			return
 		}
-		// Swap: old handle is returned for draining/closing after in-flight
-		// requests finish (INV-5).
-		oldDB := provider.Swap(newDB, req.Version)
+		// Swap, then drain: a request that fetched the old handle just before
+		// the swap may not have started its query yet, and sql.DB.Close only
+		// waits for queries already running. Every request finishes within
+		// the server's WriteTimeout, so close after that. The old file stays
+		// on disk for rollback (INV-5).
+		oldDB := provider.Swap(newDB, version)
 		api.ForgetSets(oldDB)
-		_ = oldDB // caller drains then closes; we retain the old file for rollback
-		_, _ = w.Write([]byte(fmt.Sprintf(`{"status":"activated","version":%s,"addresses":%d}`, quote(req.Version), n)))
+		oldRelease := currentRelease
+		currentRelease = release
+		go func() {
+			time.Sleep(drainDelay)
+			oldDB.Close()
+			oldRelease()
+		}()
+		_, _ = w.Write([]byte(fmt.Sprintf(`{"status":"activated","version":%s,"addresses":%d}`, quote(version), n)))
 	})
 
 	csp := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -271,7 +290,16 @@ func main() {
 	mux.Handle("/", requestLog(logger, http.RedirectHandler("/static/", http.StatusMovedPermanently)))
 	mux.Handle("/static/", requestLog(logger, csp))
 
-	srv := &http.Server{Addr: addr, Handler: metricsLog(met, mux)}
+	// Timeouts bound how long a slow or idle client can hold a connection;
+	// without them a client trickling headers keeps a goroutine forever.
+	srv := &http.Server{
+		Addr:              addr,
+		Handler:           metricsLog(met, mux),
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       15 * time.Second,
+		WriteTimeout:      writeTimeout,
+		IdleTimeout:       120 * time.Second,
+	}
 	// Graceful shutdown on SIGINT/SIGTERM.
 	done := make(chan os.Signal, 1)
 	signal.Notify(done, syscall.SIGINT, syscall.SIGTERM)
@@ -329,28 +357,4 @@ func (s *statusWriter) Write(b []byte) (int, error) {
 }
 func quote(s string) string {
 	return `"` + s + `"`
-}
-
-// withinDir reports whether target resolves to a path under dir (the serving
-// data dir). It rejects absolute paths and any traversal (..) so /ctrl/activate
-// cannot point the service at an arbitrary host file.
-func withinDir(dir, target string) bool {
-	if target == "" {
-		return false
-	}
-	// Reject absolute paths and any traversal outright.
-	if filepath.IsAbs(target) {
-		return false
-	}
-	clean := filepath.Clean(target)
-	if clean == ".." || strings.HasPrefix(clean, "../") {
-		return false
-	}
-	// The joined path must stay under dir.
-	base, err := filepath.Abs(dir)
-	if err != nil {
-		return false
-	}
-	full := filepath.Join(base, clean)
-	return strings.HasPrefix(full, base+string(filepath.Separator)) || full == base
 }
