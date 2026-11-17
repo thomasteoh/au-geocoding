@@ -370,7 +370,16 @@ func stringList(v any) []string {
 		}
 		return out
 	case string:
-		return strings.FieldsFunc(x, func(r rune) bool { return r == ',' || r == ' ' })
+		// One string is one group (ADFS sends a lone group that way); only
+		// commas separate. Splitting on spaces would turn "Finance Admins"
+		// into a member of "Admins".
+		var out []string
+		for _, g := range strings.Split(x, ",") {
+			if g = strings.TrimSpace(g); g != "" {
+				out = append(out, truncate(g, 256))
+			}
+		}
+		return out
 	}
 	return nil
 }

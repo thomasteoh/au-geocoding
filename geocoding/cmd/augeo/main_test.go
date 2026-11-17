@@ -82,38 +82,6 @@ func TestBatchItemPerItemStatus(t *testing.T) {
 	}
 }
 
-func TestClientIPXFFTrust(t *testing.T) {
-	// Without a trusted proxy, XFF is ignored — RemoteAddr is used.
-	r := httptest.NewRequest("POST", "/search", nil)
-	r.RemoteAddr = "1.2.3.4:5678"
-	r.Header.Set("X-Forwarded-For", "6.7.8.9")
-	if got := clientIP(r, ""); got != "1.2.3.4" {
-		t.Fatalf("no trusted proxy: got %q, want 1.2.3.4", got)
-	}
-	// With a trusted proxy matching the peer, XFF's first value is used.
-	r2 := httptest.NewRequest("POST", "/search", nil)
-	r2.RemoteAddr = "10.0.0.1:1234"
-	r2.Header.Set("X-Forwarded-For", "6.7.8.9, 10.0.0.1")
-	if got := clientIP(r2, "10.0.0.1"); got != "6.7.8.9" {
-		t.Fatalf("trusted proxy: got %q, want 6.7.8.9", got)
-	}
-	// Trusted proxy set but peer doesn't match → RemoteAddr.
-	r3 := httptest.NewRequest("POST", "/search", nil)
-	r3.RemoteAddr = "1.2.3.4:5678"
-	r3.Header.Set("X-Forwarded-For", "6.7.8.9")
-	if got := clientIP(r3, "10.0.0.1"); got != "1.2.3.4" {
-		t.Fatalf("peer not trusted: got %q, want 1.2.3.4", got)
-	}
-}
-
-func TestClientIPIPv6(t *testing.T) {
-	r := httptest.NewRequest("POST", "/search", nil)
-	r.RemoteAddr = "[::1]:5678"
-	if got := clientIP(r, ""); got != "::1" {
-		t.Fatalf("ipv6: got %q, want ::1", got)
-	}
-}
-
 func TestCtrlLLMGate(t *testing.T) {
 	h := llm.NewHolder(llm.Config{BaseURL: "http://a", Model: "m1", Enabled: true, APIKey: "secret"})
 	// Empty token => fail closed (401 even with a token header).

@@ -1,0 +1,167 @@
+# Golden address set: real Victorian addresses as people type them.
+# query<TAB>expected
+# Expected is the street address (number|street_name|street_type|locality), not
+# a PID: G-NAF holds one PID per unit, so any PID at the right street address
+# is a correct answer. A fifth part names the row instead: "unit N", "lot N"
+# for a lot with no street number, or empty for the base address (no unit).
+# Coarser answers are the candidate ID (street:..., locality:...,
+# postcode:...), prefixed "BOX@" for a postal box (PO BOX 1@locality:...), and
+# (none) means /resolve must decline so the ladder moves on to POI search.
+# Coarse, postal and (none) rows are /resolve only.
+#
+# CI runs this against testdata/golden_fixture.tsv.gz (built by
+# cmd/goldenfixture). For the full dataset:
+#   AUPLACES_GOLDEN_DB=/path/to/vic.db go test ./internal/api -run Golden
+#
+# plain addresses, abbreviated types
+31 Acland St St Kilda	31|ACLAND|STREET|ST KILDA
+104 Barkly Street, St Kilda VIC 3182	104|BARKLY|STREET|ST KILDA
+350 Bay St Port Melbourne	350|BAY|STREET|PORT MELBOURNE
+95 Bell St Coburg 3058	95|BELL|STREET|COBURG
+69 Blackburn Rd Doncaster East	69|BLACKBURN|ROAD|DONCASTER EAST
+634 Bridge Rd Richmond VIC 3121	634|BRIDGE|ROAD|RICHMOND
+17 Burwood Ave Hawthorn East	17|BURWOOD|AVENUE|HAWTHORN EAST
+737 Burwood Road Hawthorn East	737|BURWOOD|ROAD|HAWTHORN EAST
+665 Chapel St South Yarra	665|CHAPEL|STREET|SOUTH YARRA
+434 Church St Richmond	434|CHURCH|STREET|RICHMOND
+36 Collins St Melbourne VIC 3000	36|COLLINS|STREET|MELBOURNE
+600 Doncaster Rd Doncaster	600|DONCASTER|ROAD|DONCASTER
+202 Elgar Rd Box Hill South	202|ELGAR|ROAD|BOX HILL SOUTH
+298 Glenferrie Rd Malvern	298|GLENFERRIE|ROAD|MALVERN
+570 Lygon St Carlton	570|LYGON|STREET|CARLTON
+223 Malop St Geelong	223|MALOP|STREET|GEELONG
+86 Maroondah Hwy Ringwood	86|MAROONDAH|HIGHWAY|RINGWOOD
+311 Moorabool St Geelong VIC 3220	311|MOORABOOL|STREET|GEELONG
+836 Moorooduc Hwy Mornington	836|MOOROODUC|HIGHWAY|MORNINGTON
+599 Nepean Hwy Brighton East	599|NEPEAN|HIGHWAY|BRIGHTON EAST
+545 Nicholson St Carlton North	545|NICHOLSON|STREET|CARLTON NORTH
+2 Princes St Port Melbourne	2|PRINCES|STREET|PORT MELBOURNE
+883 Station St Box Hill North	883|STATION|STREET|BOX HILL NORTH
+173 Swan St Richmond	173|SWAN|STREET|RICHMOND
+313 Sydney Rd Brunswick	313|SYDNEY|ROAD|BRUNSWICK
+441 Sydney Road Coburg	441|SYDNEY|ROAD|COBURG
+14 Toorak Ave Toorak	14|TOORAK|AVENUE|TOORAK
+647 Toorak Rd Toorak	647|TOORAK|ROAD|TOORAK
+77 Victoria Pde Fitzroy	77|VICTORIA|PARADE|FITZROY
+118 Victoria St Fitzroy	118|VICTORIA|STREET|FITZROY
+350 Warrigal Rd Oakleigh South	350|WARRIGAL|ROAD|OAKLEIGH SOUTH
+851 Whitehorse Rd Box Hill	851|WHITEHORSE|ROAD|BOX HILL
+#
+# short street numbers on long streets (generation cap truncation)
+5 High St Northcote	5|HIGH|STREET|NORTHCOTE
+93 High St Preston	93|HIGH|STREET|PRESTON
+63 Main Rd St Albans	63|MAIN|ROAD|ST ALBANS
+#
+# 4-digit street numbers (not postcodes)
+1440 Hume Hwy Craigieburn	1440|HUME|HIGHWAY|CRAIGIEBURN
+1351 Nepean Highway Mount Eliza	1351|NEPEAN|HIGHWAY|MOUNT ELIZA
+1251 Plenty Rd Bundoora	1251|PLENTY|ROAD|BUNDOORA
+1322 Sturt St Ballarat Central	1322|STURT|STREET|BALLARAT CENTRAL
+#
+# "St" meaning Saint, in street names and localities
+157 Fitzroy St St Kilda	157|FITZROY|STREET|ST KILDA
+370 St Georges Rd Fitzroy North	370|ST GEORGES|ROAD|FITZROY NORTH
+23 St Georges Rd Toorak	23|ST GEORGES|ROAD|TOORAK
+9 St Georges Ct Toorak	9|ST GEORGES|COURT|TOORAK
+469 St Kilda Rd Melbourne VIC 3004	469|ST KILDA|ROAD|MELBOURNE
+3 St Kilda Rd St Kilda	3|ST KILDA|ROAD|ST KILDA
+#
+# street types outside the common set, and "The ..." streets
+12 Collins Way Melbourne	12|COLLINS|WAY|MELBOURNE
+920 Hume Fwy Craigieburn	920|HUME|FREEWAY|CRAIGIEBURN
+1 Chapel Mews South Yarra	1|CHAPEL|MEWS|SOUTH YARRA
+35 Lygon Lane Carlton	35|LYGON|LANE|CARLTON
+3 Princes Pl Port Melbourne	3|PRINCES|PLACE|PORT MELBOURNE
+13 The Esplanade St Kilda	13|ESPLANADE||ST KILDA
+64 The Boulevard Ivanhoe	64|THE BOULEVARD||IVANHOE
+#
+# units, case, typos (no unit 2 at 36 Collins or unit 3 at 313 Sydney Rd: any
+# row at the street address)
+2/36 Collins St Melbourne	36|COLLINS|STREET|MELBOURNE
+Unit 3, 157 Fitzroy St, St Kilda	157|FITZROY|STREET|ST KILDA|unit 3
+3/313 Sydney Rd Brunswick VIC 3056	313|SYDNEY|ROAD|BRUNSWICK
+5 high street northcote	5|HIGH|STREET|NORTHCOTE
+93 Hgih St Preston	93|HIGH|STREET|PRESTON
+93 High St Prestn	93|HIGH|STREET|PRESTON
+36 Colins Street Melborne	36|COLLINS|STREET|MELBOURNE
+#
+# units pick their own row; without one, the base address
+7/12 Collins St Melbourne	12|COLLINS|STREET|MELBOURNE|unit 7
+Apt 1205, 469 St Kilda Rd Melbourne VIC 3004	469|ST KILDA|ROAD|MELBOURNE|unit 1205
+U4 95 Bell St Coburg	95|BELL|STREET|COBURG|unit 4
+5/104 Barkly St St Kilda	104|BARKLY|STREET|ST KILDA|unit 5
+Flat 1, 31 Acland St, St Kilda	31|ACLAND|STREET|ST KILDA|unit 1
+Unit 707 157 Fitzroy St St Kilda	157|FITZROY|STREET|ST KILDA|unit 707
+Level 2, 12 Collins St Melbourne	12|COLLINS|STREET|MELBOURNE|
+104 Barkly St St Kilda	104|BARKLY|STREET|ST KILDA|
+95 Bell St Coburg VIC 3058	95|BELL|STREET|COBURG|
+570 Lygon St Carlton	570|LYGON|STREET|CARLTON|
+#
+# lots with no street number (2 Wellington St, Wallan is also a street number)
+Lot 14 Old Sydney Rd Wallan	|OLD SYDNEY|ROAD|WALLAN|lot 14
+Lot 2 Wellington St Wallan VIC 3756	|WELLINGTON|STREET|WALLAN|lot 2
+Lot 12 Ararat St Ballarat Central	|ARARAT|STREET|BALLARAT CENTRAL|lot 12
+LOT 7 Pfeiffers Track, Daylesford	|PFEIFFERS|TRACK|DAYLESFORD|lot 7
+#
+# postal boxes: G-NAF has no location for one, so the locality (or postcode)
+# it is addressed to, marked as a postal box. 3001 holds no street address.
+PO Box 123 Melbourne VIC 3001	PO BOX 123@locality:MELBOURNE|VIC
+GPO Box 1234 Melbourne VIC 3001	GPO BOX 1234@locality:MELBOURNE|VIC
+P.O. Box 12, Box Hill VIC 3128	PO BOX 12@locality:BOX HILL|VIC
+Locked Bag 10 Geelong VIC 3220	LOCKED BAG 10@locality:GEELONG|VIC
+Private Bag 1 Warragul	PRIVATE BAG 1@locality:WARRAGUL|VIC
+PO Box 500 3550	PO BOX 500@postcode:3550
+PO Box 123	(none)
+#
+# no street number, or no street: answered at street, locality or postcode
+# precision through /resolve
+High St Preston	street:HIGH STREET|PRESTON
+Collins St Melbourne	street:COLLINS STREET|MELBOURNE
+St Kilda Rd St Kilda	street:ST KILDA ROAD|ST KILDA
+Box Hill North	locality:BOX HILL NORTH|VIC
+St Kilda VIC 3182	locality:ST KILDA|VIC
+133 Warragul VIC	locality:WARRAGUL|VIC
+3000	postcode:3000
+#
+# not addresses: /resolve declines and the ladder moves on
+Melbourne Central	(none)
+Flinders St Station	(none)
+woolworths near doncaster	(none)
+#
+# ---- aliases, levels and postcodes (feat/aliases-levels-postcodes) ----
+#
+# G-NAF locality and street aliases answer as the official name. There is no
+# MELBOURNE CBD alias in G-NAF (August 2026); JOLIMONT, BALLARAT and MORELAND
+# are real ones.
+Jolimont VIC	locality:EAST MELBOURNE|VIC
+211 Wellington Pde Jolimont	211|WELLINGTON|PARADE|EAST MELBOURNE
+Ballarat VIC	locality:BALLARAT CENTRAL|VIC
+Moreland VIC	locality:COBURG|VIC
+Little Latrobe St Melbourne	street:LITTLE LA TROBE STREET|MELBOURNE
+Westgate Fwy Port Melbourne	street:WEST GATE FREEWAY|PORT MELBOURNE
+Tavistock St Werribee	street:VALDA WAY|WERRIBEE
+4 Lonergan Ave Werribee	4|QUEBEC|AVENUE|WERRIBEE
+687 Latrobe St Docklands	687|LA TROBE|STREET|DOCKLANDS
+1 O'Connell St North Melbourne	1|OCONNELL|STREET|NORTH MELBOURNE
+#
+# levels pick the level's own row ("level N": a level with no unit); without a
+# level, the base address as before
+Level 7, 140 Bourke St Melbourne	140|BOURKE|STREET|MELBOURNE|level 7
+L3 111 Bourke St Melbourne VIC 3000	111|BOURKE|STREET|MELBOURNE|level 3
+Lvl 2 59 Bourke St Melbourne	59|BOURKE|STREET|MELBOURNE|level 2
+Floor 4, 180 Bourke St Melbourne	180|BOURKE|STREET|MELBOURNE|level 4
+1st Floor, 88 Acland St, St Kilda	88|ACLAND|STREET|ST KILDA|level 1
+140 Bourke St Melbourne	140|BOURKE|STREET|MELBOURNE|
+#
+# postcodes: a PO box postcode with no address or postal area answers at the
+# locality internal/postbox maps it to; an unmapped one (3050 ROYAL MELBOURNE
+# HOSPITAL, 8003 COLLINS STREET EAST) declines. 3551's address average lies
+# outside its postal area, so its answer is the area's representative point.
+PO Box 9 3001	PO BOX 9@locality:MELBOURNE|VIC
+GPO Box 1234 3001	GPO BOX 1234@locality:MELBOURNE|VIC
+PO Box 77 8002	PO BOX 77@locality:EAST MELBOURNE|VIC
+Locked Bag 5 8012	LOCKED BAG 5@locality:DOCKLANDS|VIC
+PO Box 5 3050	(none)
+PO Box 5 8003	(none)
+3001	postcode:3001
+3551	postcode:3551

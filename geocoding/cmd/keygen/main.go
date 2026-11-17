@@ -19,6 +19,14 @@ func main() {
 	scope := flag.String("scope", "search", "comma-separated scopes")
 	flag.Parse()
 
+	// Reject a mistyped tier before touching the store: QuotaTier would map
+	// it to demo and print the typo back as if it had been honoured.
+	t, err := publicapi.ParseTier(*tier)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "tier: %v\n", err)
+		os.Exit(2)
+	}
+
 	s, err := publicapi.Open(*db)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "open: %v\n", err)
@@ -26,7 +34,7 @@ func main() {
 	}
 	defer s.Close()
 
-	id, raw, err := s.IssueKey(*label, publicapi.QuotaTier(*tier), splitScope(*scope))
+	id, raw, err := s.IssueKey(*label, t, splitScope(*scope))
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "issue: %v\n", err)
 		os.Exit(1)

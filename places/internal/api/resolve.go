@@ -27,16 +27,18 @@ import (
 	"strings"
 
 	"auplaces/internal/match"
+	"auplaces/internal/normalise"
 	"ausystem/shared/contract"
 )
 
-// contractVersion is the wire-format version this side implements.
-// Must equal the geocoder's contract.Version ("v1").
-const contractVersion = "v1"
-
-// contractVersionHeader is the HTTP header carrying the contract version.
-// Must equal the geocoder's contract.ContractVersionHeader.
-const contractVersionHeader = "X-Augeo-Contract-Version"
+// The version this side implements and the header carrying it come from the
+// shared contract package, so the two services cannot drift apart: bumping
+// contract.Version moves both, and a deployment mixing old and new binaries
+// fails the version check instead of mis-reading the wire format.
+const (
+	contractVersion       = contract.Version
+	contractVersionHeader = contract.ContractVersionHeader
+)
 
 // Wire error strings mirror the geocoder's contract error taxonomy. The wire
 // protocol carries them as HTTP status + error string; the geocoder's
@@ -52,6 +54,9 @@ const (
 	maxResults = 20
 	maxRadiusM = 5000
 	maxTokens  = 32
+
+	// generateCap bounds how many address candidates are scored per query.
+	generateCap = 200
 )
 
 // ResolveHandler is the /resolve HTTP handler. p provides the active serving DB.
@@ -89,7 +94,7 @@ func ResolveHandler(p *DBProvider) http.HandlerFunc {
 		if len(req.Score) > maxTokens {
 			req.Score = req.Score[:maxTokens]
 		}
-		resp, err := Resolve(context.Background(), p.Get(), req)
+		resp, err := Resolve(r.Context(), p.Get(), req)
 		if err != nil {
 			writeResolveError(w, err)
 			return
@@ -141,7 +146,10 @@ func (e *resolveError) Error() string { return e.msg }
 // resolveAddress resolves a structured address request (rung 2). Generate on
 // the reliable tokens, score on the full set, expose G-NAF quality.
 func resolveAddress(ctx context.Context, db *sql.DB, req contract.ResolveRequest) (contract.ResolveResponse, error) {
-	locSet := LocalitySet(ctx, db)
+	sets, err := setsFor(db)
+	if err != nil {
+		return contract.ResolveResponse{}, err
+	}
 	var rel, score, fields []string
 	if req.Components != nil {
 		// The caller labelled every value, so no inference is needed or wanted.
@@ -151,11 +159,29 @@ func resolveAddress(ctx context.Context, db *sql.DB, req contract.ResolveRequest
 		// input exists precisely to remove that guess.
 		rel, score, fields = componentTokens(*req.Components)
 	} else {
-		rel, score, fields = contractTokens(req.Generate, req.Score, locSet)
+		rel, score, fields = contractTokens(req.Generate, req.Score, sets)
 	}
+	rel, score, fields = sets.fuzzy.CanonicalTokens(rel, score, fields) // aliases -> official names
 	qm := match.Query{Reliable: rel, Score: score, Fields: fields}
-	fs, _ := match.LoadFuzzySet(ctx, db)
-	cands, _ := match.Generate(ctx, db, qm, fs, 200)
+	limit := req.Limit
+	if limit <= 0 {
+		limit = 20
+	}
+	// A postal box with no street address beside it has no G-NAF row: answer
+	// at the locality or postcode it is addressed to, marked as a postal box.
+	number := qm.Field("street_number")
+	if number == "" {
+		number = qm.Field("lot_number") // a lot stands in for the number
+	}
+	if box := qm.Field("postal_delivery"); box != "" && number == "" {
+		return resolvePostal(ctx, db, sets, qm, box, limit)
+	}
+	// No street number, or no street: answer at street, locality or postcode
+	// precision, or not at all.
+	if number == "" || qm.Field("street_name") == "" {
+		return resolveCoarse(ctx, db, sets, qm, limit)
+	}
+	cands, _ := match.Generate(ctx, db, qm, sets.fuzzy, generateCap)
 
 	resp := contract.ResolveResponse{GeneratedCount: len(cands)}
 	if len(cands) == 0 {
@@ -169,10 +195,6 @@ func resolveAddress(ctx context.Context, db *sql.DB, req contract.ResolveRequest
 		scored = append(scored, scoredCandidate{c: c, s: sc})
 	}
 	sortScored(scored)
-	limit := req.Limit
-	if limit <= 0 {
-		limit = 20
-	}
 	if len(scored) > limit {
 		resp.Truncated = true
 		scored = scored[:limit]
@@ -188,6 +210,7 @@ func resolveAddress(ctx context.Context, db *sql.DB, req contract.ResolveRequest
 		resp.Candidates = append(resp.Candidates, contract.Candidate{
 			ID:                 contract.CandidateID{Source: "gnaf", PID: c.PID},
 			Kind:               contract.KindAddress,
+			Precision:          contract.PrecisionAddress,
 			Point:              contract.Point{Lat: c.Lat, Lon: c.Lon},
 			Source:             "gnaf",
 			Text:               formatCandidateText(c),
@@ -263,7 +286,7 @@ func resolveReverse(ctx context.Context, db *sql.DB, req contract.ResolveRequest
 	if limit <= 0 {
 		limit = 5
 	}
-	res, err := match.Reverse(ctx, db, req.Anchor.Lon, req.Anchor.Lat, limit)
+	res, err := match.ReverseWithin(ctx, db, req.Anchor.Lon, req.Anchor.Lat, limit, float64(req.MaxRadiusM))
 	if err != nil {
 		return contract.ResolveResponse{}, err
 	}
@@ -276,6 +299,7 @@ func resolveReverse(ctx context.Context, db *sql.DB, req contract.ResolveRequest
 		resp.Candidates = append(resp.Candidates, contract.Candidate{
 			ID:        contract.CandidateID{Source: "gnaf", PID: c.PID},
 			Kind:      contract.KindAddress,
+			Precision: contract.PrecisionAddress,
 			Point:     contract.Point{Lat: c.Lat, Lon: c.Lon},
 			Source:    "gnaf",
 			Text:      formatAddress(c),
@@ -369,10 +393,6 @@ func loadQuality(ctx context.Context, db *sql.DB, sc []scoredCandidate) map[stri
 	return out
 }
 
-// contractTokens maps the contract's Generate/Score token sets into the
-// matcher's Query. The contract's Score is the full normalised set; the
-// matcher needs per-token field tags for field-aware scoring. We re-derive
-// fields from token text (state/postcode/number/locality/street).
 // componentTokens builds the match inputs from labelled components. Each value
 // carries its own field tag, so the scorer compares like with like without any
 // token-shape heuristic.
@@ -380,9 +400,11 @@ func loadQuality(ctx context.Context, db *sql.DB, sc []scoredCandidate) map[stri
 // Generation anchors are the street name and locality only: the trigram index
 // does not cover tokens under three characters, so a street number cannot
 // anchor generation and is carried as a scoring signal instead — the same rule
-// the free-text path follows.
+// the free-text path follows. Values are upper-cased to match the dataset; the
+// geocoder folds them to lower case.
 func componentTokens(c contract.AddressComponents) (reliable, sc, fields []string) {
 	add := func(v, field string) {
+		v = strings.ToUpper(v)
 		if v == "" {
 			return
 		}
@@ -390,6 +412,8 @@ func componentTokens(c contract.AddressComponents) (reliable, sc, fields []strin
 		fields = append(fields, field)
 	}
 	add(c.StreetNumber, "street_number")
+	add(leadingDigits(c.Unit), "flat_number")
+	add(leadingDigits(c.Lot), "lot_number")
 	add(c.StreetName, "street_name")
 	add(c.StreetType, "street_type")
 	add(c.Locality, "locality_name")
@@ -398,6 +422,7 @@ func componentTokens(c contract.AddressComponents) (reliable, sc, fields []strin
 
 	seen := map[string]bool{}
 	for _, t := range []string{c.StreetName, c.Locality} {
+		t = strings.ToUpper(t)
 		if len(t) >= 3 && !seen[t] {
 			seen[t] = true
 			reliable = append(reliable, t)
@@ -406,79 +431,44 @@ func componentTokens(c contract.AddressComponents) (reliable, sc, fields []strin
 	return reliable, sc, fields
 }
 
-func contractTokens(gen, score []string, locSet map[string]bool) (reliable, sc, fields []string) {
-	rel := append([]string(nil), gen...)
-	sc = append([]string(nil), score...)
-	if len(sc) == 0 {
-		sc = append([]string(nil), gen...)
+// leadingDigits reduces a unit or lot to the digits the dataset stores ("3A"
+// is unit 3), the same reading the free-text parser gives it. A value with no
+// leading digits is kept, so it still scores against the column.
+func leadingDigits(v string) string {
+	v = strings.TrimSpace(v)
+	n := 0
+	for n < len(v) && v[n] >= '0' && v[n] <= '9' {
+		n++
 	}
-	fields = make([]string, len(sc))
-	for i, t := range sc {
-		fields[i] = fieldOfToken(t, locSet)
+	if n == 0 {
+		return v
 	}
-	seen := map[string]bool{}
-	var relOut []string
-	for _, t := range rel {
-		if !seen[t] {
-			seen[t] = true
-			relOut = append(relOut, t)
-		}
-	}
-	return relOut, sc, fields
+	return v[:n]
 }
 
-func fieldOfToken(t string, locSet map[string]bool) string {
-	switch {
-	case isStateToken(t):
-		return "state"
-	case isPostcodeToken(t):
-		return "postcode"
-	case locSet[t]:
-		return "locality"
-	case isNumberToken(t):
-		return "street_number"
-	default:
-		return "street_name"
+// contractTokens maps the contract's free-text token sets into the matcher's
+// Query. Score is the geocoder's full normalised token list, in query order;
+// the parts of an address are known by position, so the tokens are parsed as
+// a sequence with the same parser as /search, not classified one at a time.
+func contractTokens(gen, score []string, sets *matchSets) (reliable, sc, fields []string) {
+	toks := score
+	if len(toks) == 0 {
+		toks = gen
 	}
+	return normalise.Tokenise(strings.Join(toks, " "), maxTokens, sets.localities, sets.fuzzy.NearestLocality)
 }
 
-func isStateToken(t string) bool {
-	switch t {
-	case "VIC", "NSW", "QLD", "SA", "WA", "TAS", "NT", "ACT":
-		return true
-	}
-	return false
-}
-
-func isPostcodeToken(t string) bool {
-	if len(t) != 4 {
-		return false
-	}
-	for _, c := range t {
-		if c < '0' || c > '9' {
-			return false
-		}
-	}
-	return true
-}
-
-func isNumberToken(t string) bool {
-	if t == "" {
-		return false
-	}
-	for _, c := range t {
-		if c < '0' || c > '9' {
-			return false
-		}
-	}
-	return true
-}
-
-// formatCandidateText builds the display address text for a candidate.
+// formatCandidateText builds the display address text for a candidate. A unit
+// row reads "2/36 COLLINS STREET", a lot "LOT 14 OLD SYDNEY ROAD".
 func formatCandidateText(c match.Candidate) string {
 	parts := []string{}
-	if c.StreetNumber != "" {
+	switch {
+	case c.FlatNumber != "" && c.StreetNumber != "":
+		parts = append(parts, c.FlatNumber+"/"+c.StreetNumber)
+	case c.StreetNumber != "":
 		parts = append(parts, c.StreetNumber)
+	case c.LotNumber != "":
+		parts = append(parts, "LOT "+c.LotNumber)
 	}
 	if c.StreetName != "" {
 		parts = append(parts, c.StreetName)

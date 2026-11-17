@@ -60,9 +60,10 @@ uniform 401 (T6) — the API never confirms which keys exist.
 
 ## Batch geocoding (`POST /batch`)
 
-Batch geocoding is a **keyed, batch-scoped** endpoint — it is never anonymous.
-A key issued with the `batch` scope (or a key with `search`+`batch` scopes)
-can call it; a `search`-only key gets 403.
+Batch geocoding is a **keyed, batch-scoped, batch-tier** endpoint — it is
+never anonymous. The caller needs the `batch` scope *and* the batch quota
+tier; a `search`-only key, or a key on any other tier, gets 403. Moving an
+org off the batch tier also strips `batch` from its keys.
 
 Request: `{"items":[{"query":"12 high st"},{"query":"woolworths near doncaster"},{"kind":"reverse","lat":-38.19,"lon":144.32}]}`
 
@@ -74,13 +75,19 @@ Request: `{"items":[{"query":"12 high st"},{"query":"woolworths near doncaster"}
   always matches request order (results written by item index).
 - Runtime is bounded by `Batch.MaxDuration` (600s), not the single-query
   `RequestTimeout`.
+- One caller runs at most `Batch.MaxConcurrentPerKey` (default 1) batches at
+  a time; another is 429 `too many concurrent batches`.
+- A batch with more items than the rows left in today's quota is refused
+  up front (429 `quota exceeded`), before any item runs.
 
 Response: `{"items":[{"index":0,"status":200,"strategy":"address","candidates":[...]},...]}`
 
 - **Per-item status** — one bad item does not fail the batch. Each item carries
   its own `status`, `strategy`, `candidates`, or `error` (e.g. `no candidates`,
   `query too long`, `reverse needs lat/lon`). The envelope is HTTP 200 when
-  items succeed; item-level errors are 400 in the item, not the response.
+  items succeed; an item's status is the one the single endpoint would give
+  (400, 404, 429, 500, ...). Item errors are fixed messages; a server-side
+  failure is `internal error`, with the reason code in the server log.
 - Quota is charged per **result row** across all items (D-034); a batch that
   would exceed the key's daily ceiling is refused wholesale (429 `quota
   exceeded`) — the caller retries.
@@ -90,14 +97,32 @@ Response: `{"items":[{"index":0,"status":200,"strategy":"address","candidates":[
 
 All env vars use the `AUGEO_` prefix (D-020), precedence flag > env > file >
 default, validated at boot (fail fast). See `internal/config` for the full set.
-Secrets support the `_FILE` convention (e.g. `AUGEO_LLM_API_KEY_FILE`).
+Secrets support the `_FILE` convention (`AUGEO_LLM_API_KEY_FILE`,
+`AUGEO_CTRL_TOKEN_FILE`, `AUGEO_SECRET_KEY_FILE`, `AUGEO_SMTP_PASSWORD_FILE`);
+a `_FILE` that is set but unreadable fails boot.
 
 ## Security notes
 
 - Keys are SHA-256(key ‖ pepper); the pepper is persisted in app.db (all
   processes share it); raw keys are never stored or logged (T6).
 - No raw query text is ever logged or persisted (INV-1/D-015/T9).
-- Quotas are per **result row**, not per request (D-034).
+- Quotas are per **result row**, not per request (D-034). A caller already
+  at its ceiling is refused before any work. An LLM-rung answer costs at
+  least one row, even with no candidates.
+- LLM-rung calls have their own daily caps: anonymous callers
+  `AUGEO_ANON_LLM_DAILY_PER_IP` (10) and `AUGEO_ANON_LLM_DAILY_GLOBAL`
+  (1000) per replica, 0 turns anonymous LLM off; keyed callers 50 (demo),
+  1000 (standard) or 5000 (batch) per org or operator key, counted in
+  `usage_principal.llm_calls`. Each caller holds at most
+  `AUGEO_QUEUE_PER_KEY_INFLIGHT` (2) LLM requests at once. Calls are
+  counted before the provider is called.
+- The client IP for rate limits and anonymous quota is the TCP peer, unless
+  the peer is in `AUGEO_TRUSTED_PROXY` (comma-separated IPs/CIDRs): then
+  `X-Forwarded-For` is read from the right and the first untrusted address
+  is the client. IPv6 clients are keyed by /64. The anonymous per-IP table
+  holds at most 100000 addresses a day; past that, new addresses are refused.
+- Error responses carry fixed messages. Internal error text (upstream
+  addresses, model output) goes to the log only as a reason code.
 - `ErrOutOfScope` propagates as a 400 — it never becomes an empty result
   (T4/D-032).
 - Attribution is returned on OSM-touching responses (D-018).

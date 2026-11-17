@@ -1,5 +1,23 @@
 {{define "content"}}
 <h1>Organisations</h1>
+{{with .Data}}{{with .Invites}}
+<div class="card">
+  <h2>Invitations</h2>
+  <p class="muted">Organisation names are chosen by whoever created the organisation. Accept only invitations you expect.</p>
+  <table>
+    <thead><tr><th>Organisation</th><th>Role</th><th>Invited by</th><th>Expires</th><th></th></tr></thead>
+    <tbody>
+    {{range .}}<tr><td>{{.OrgName}} <span class="muted">({{.OrgSlug}})</span></td><td>{{.Role}}</td><td>{{.InvitedBy}}</td><td>{{.Expires}}</td>
+      <td><form method="post" action="/console/invites/{{.ID}}/accept" class="inline">
+        <input type="hidden" name="csrf" value="{{$.CSRF}}">
+        <button type="submit" aria-label="Accept invitation to {{.OrgName}}">Accept</button></form>
+      <form method="post" action="/console/invites/{{.ID}}/decline" class="inline">
+        <input type="hidden" name="csrf" value="{{$.CSRF}}">
+        <button type="submit" class="danger" aria-label="Decline invitation to {{.OrgName}}">Decline</button></form></td></tr>{{end}}
+    </tbody>
+  </table>
+</div>
+{{end}}{{end}}
 {{if .Orgs}}
 <table>
   <thead><tr><th>Name</th><th>Your role</th><th>Tier</th></tr></thead>

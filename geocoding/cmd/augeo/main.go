@@ -11,7 +11,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -29,6 +28,7 @@ import (
 	"augeocoding/internal/llm"
 	"augeocoding/internal/mail"
 	"augeocoding/internal/oidcrp"
+	"augeocoding/internal/outbox"
 	"augeocoding/internal/placesclient"
 	"augeocoding/internal/publicapi"
 	"augeocoding/internal/safehttp"
@@ -53,13 +53,29 @@ func main() {
 	// Control token: /ctrl/llm is a control-plane operation on an otherwise
 	// read-only server. It must never be reachable without the token (mirrors
 	// au-places' /ctrl/activate gate). Empty token => endpoint disabled.
-	ctrlToken := os.Getenv("AUGEO_CTRL_TOKEN")
+	// Read from AUGEO_CTRL_TOKEN or AUGEO_CTRL_TOKEN_FILE by config.Load.
+	ctrlToken := cfg.CtrlToken
 
 	// Split-mode resolver. In single-binary mode this would be an in-process
 	// call; here we call the au-places HTTP API.
 	var resolver contract.Resolver
 	if cfg.PlacesURL != "" {
-		resolver = placesclient.New(cfg.PlacesURL)
+		pc := placesclient.New(cfg.PlacesURL)
+		// Contract version mismatch is a startup failure (contract.md §
+		// Versioning): every request would fail, and failing here says why.
+		// An unreachable places is not fatal — services start in any order —
+		// and /readyz repeats the check until it passes.
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		err := pc.CheckContract(ctx)
+		cancel()
+		switch {
+		case errors.Is(err, placesclient.ErrContractMismatch):
+			log.Error("boot_failed", "reason", "places_contract_mismatch", "error", err.Error())
+			os.Exit(1)
+		case err != nil:
+			log.Warn("places_contract_unchecked", "reason", "places_unreachable")
+		}
+		resolver = pc
 	} else {
 		log.Error("boot_failed", "reason", "no resolver configured (set AUGEO_PLACES_URL)")
 		os.Exit(1)
@@ -94,6 +110,7 @@ func main() {
 		log.Error("boot_failed", "reason", "identity_db", "error", err.Error())
 		os.Exit(1)
 	}
+	ids.DefaultOrgTier = cfg.Auth.DefaultOrgTier
 	// Admin-controlled URLs (discovery, JWKS, SAML metadata) are fetched
 	// through a client that refuses private addresses (SSRF).
 	fetch := safehttp.Client(10*time.Second, cfg.Auth.AllowPrivateFetch)
@@ -102,9 +119,13 @@ func main() {
 	// has its own budget — AnonRPS/AnonBurst — NOT the keyed one.
 	limiter := publicapi.NewRateLimiter(cfg.Rate.KeyDefaultRPS, cfg.Rate.KeyDefaultBurst)
 	anonLimiter := publicapi.NewRateLimiter(cfg.Rate.AnonRPS, cfg.Rate.AnonBurst)
+	// Bearer tokens are throttled per client IP before verification, at the
+	// keyed rate: a legitimate caller is still bounded by its per-principal
+	// bucket, while a forged-token flood from one address stops here.
+	bearerIPLimiter := publicapi.NewRateLimiter(cfg.Rate.KeyDefaultRPS, cfg.Rate.KeyDefaultBurst)
 	authn := &apiauth.Authenticator{
-		Keys: store, KeyLimiter: limiter, AnonLimiter: anonLimiter, HTTPClient: fetch,
-		ClientIP: func(r *http.Request) string { return clientIP(r, cfg.Server.TrustedProxy) },
+		Keys: store, KeyLimiter: limiter, AnonLimiter: anonLimiter, BearerIPLimiter: bearerIPLimiter, HTTPClient: fetch,
+		ClientIP: func(r *http.Request) string { return clientIP(r, cfg.Server.TrustedProxies) },
 		Reject:   func(reason string) { log.Warn("auth_rejected", "reason", reason) },
 	}
 	if cfg.Auth.JWTBearer {
@@ -114,6 +135,10 @@ func main() {
 	// Console, SSO and SCIM (docs/auth.md). Off unless AUGEO_PUBLIC_URL and
 	// AUGEO_SECRET_KEY are set.
 	var con *console.Server
+	// Background work (the mail outbox) stops when bgCtx ends at shutdown.
+	bgCtx, bgStop := context.WithCancel(context.Background())
+	defer bgStop()
+	var bgDone []chan struct{}
 	if cfg.Auth.ConsoleEnabled() {
 		if cfg.Auth.ProvidersFile != "" {
 			warnings, err := console.LoadProviders(context.Background(), ids, cfg.Auth.ProvidersFile)
@@ -127,29 +152,41 @@ func main() {
 		}
 		rp := &oidcrp.RP{CallbackURL: cfg.Auth.PublicURL + "/auth/oidc/callback", HTTP: fetch}
 		con, err = console.New(console.Config{
-			PublicURL: cfg.Auth.PublicURL,
-			Session:   identity.SessionPolicy{Idle: time.Duration(cfg.Auth.SessionIdle) * time.Second, Max: time.Duration(cfg.Auth.SessionMax) * time.Second},
-			Login:     identity.LoginPolicy{SignupOpen: cfg.Auth.Signup == "open", BootstrapAdmins: cfg.Auth.BootstrapAdmins},
+			PublicURL:      cfg.Auth.PublicURL,
+			Session:        identity.SessionPolicy{Idle: time.Duration(cfg.Auth.SessionIdle) * time.Second, Max: time.Duration(cfg.Auth.SessionMax) * time.Second},
+			Login:          identity.LoginPolicy{SignupOpen: cfg.Auth.Signup == "open", BootstrapAdmins: cfg.Auth.BootstrapAdmins},
+			MaxOrgsPerUser: cfg.Auth.MaxOrgsPerUser,
 		}, ids, store, rp, log, fetch)
 		if err != nil {
 			log.Error("boot_failed", "reason", "console", "error", err.Error())
 			os.Exit(1)
 		}
+		con.ClientIP = func(r *http.Request) string { return clientIP(r, cfg.Server.TrustedProxies) }
+		if cfg.Auth.RateRPS > 0 {
+			con.AuthLimiter = publicapi.NewRateLimiter(cfg.Auth.RateRPS, cfg.Auth.RateBurst)
+		}
 		if cfg.SMTP.Host != "" {
-			sender, err := mail.NewSMTP(mail.Config{Host: cfg.SMTP.Host, Port: cfg.SMTP.Port, Username: cfg.SMTP.Username, Password: cfg.SMTP.Password, From: cfg.SMTP.From})
+			sender, err := mail.NewSMTP(mail.Config{Host: cfg.SMTP.Host, Port: cfg.SMTP.Port, Username: cfg.SMTP.Username, Password: cfg.SMTP.Password,
+				From: cfg.SMTP.From, TLS: cfg.SMTP.TLS})
 			if err != nil {
 				log.Error("boot_failed", "reason", "smtp", "error", err.Error())
 				os.Exit(1)
 			}
-			con.Mail = sender
+			worker := outbox.New(ids, sender, log)
+			con.MailOn, con.MailWake = true, worker.Wake
+			done := make(chan struct{})
+			bgDone = append(bgDone, done)
+			go func() { defer close(done); worker.Run(bgCtx) }()
 		}
-		log.Info("console_enabled", "public_url", cfg.Auth.PublicURL, "signup", cfg.Auth.Signup, "invite_email", cfg.SMTP.Host != "")
+		log.Info("console_enabled", "public_url", cfg.Auth.PublicURL, "signup", cfg.Auth.Signup, "invite_email", cfg.SMTP.Host != "",
+			"smtp_tls", cfg.SMTP.TLS, "auth_rate_rps", cfg.Auth.RateRPS)
 	}
 
 	// LLM: runtime-configurable provider client (rung 5). The holder is seeded
 	// from boot config and is updated at runtime by /ctrl/llm — no restart. The
-	// provider is only wired when the boot config enables it; otherwise the rung
-	// stays configured-but-not-wired (501) until an operator enables it.
+	// rung is always built and reads the holder per call, so an operator can
+	// switch the LLM on with /ctrl/llm even when it was off at boot, and off
+	// again without requests failing.
 	llmHolder := llm.NewHolder(llm.Config{
 		BaseURL:   cfg.LLM.BaseURL,
 		APIKey:    cfg.LLM.APIKey,
@@ -158,16 +195,30 @@ func main() {
 		MaxTokens: cfg.LLM.MaxTokens,
 		Enabled:   cfg.LLM.Enabled,
 	})
-	var llmClient *llm.Client
-	if cfg.LLM.Enabled {
-		llmClient = llm.NewClient(llmHolder)
+	// The ladder: rungs 1–4 deterministic + rung 5 LLM (queued) when enabled.
+	l := buildLadder(resolver, cfg, llmHolder, log)
+
+	// Metrics: in-memory counters, no query-derived labels (runtime.md). The
+	// endpoint label set is fixed; anything else is recorded as "other".
+	met := metrics.New("augeo", "/search", "/geocode", "/reverse", "/poi", "/parse", "/suggest")
+
+	// /metrics on the public listener is gated by the control token. For an
+	// unauthenticated scrape (Prometheus on a private network), set
+	// AUGEO_METRICS_ADDR to a listen address that is not published; that
+	// listener serves /metrics only.
+	var metricsSrv *http.Server
+	if addr := os.Getenv("AUGEO_METRICS_ADDR"); addr != "" {
+		mm := http.NewServeMux()
+		mm.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) { met.Render(w) })
+		metricsSrv = &http.Server{Addr: addr, Handler: mm, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 5 * time.Second, WriteTimeout: 10 * time.Second}
+		go func() {
+			log.Info("metrics_listening", "addr", addr)
+			if err := metricsSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				log.Error("metrics_server_failed", "error", err.Error())
+				os.Exit(1)
+			}
+		}()
 	}
-
-	// The ladder: rungs 1–4 deterministic + rung 5 LLM (queued) when configured.
-	l := buildLadder(resolver, cfg, llmClient, log)
-
-	// Metrics: in-memory counters, no query-derived labels (runtime.md).
-	met := metrics.New("augeo")
 
 	// WriteTimeout must cover the batch path: Batch.MaxDuration (D-034) allows
 	// a batch to run up to 600s, but the default 20s WriteTimeout would cut any
@@ -198,6 +249,18 @@ func main() {
 		ctx, cancel := context.WithTimeout(context.Background(), time.Duration(cfg.Server.ShutdownGrace)*time.Second)
 		defer cancel()
 		_ = srv.Shutdown(ctx)
+		if metricsSrv != nil {
+			_ = metricsSrv.Shutdown(ctx)
+		}
+		// Stop background workers; a send in flight is abandoned and left
+		// pending for the next start.
+		bgStop()
+		for _, d := range bgDone {
+			select {
+			case <-d:
+			case <-ctx.Done():
+			}
+		}
 		close(done)
 	}()
 
@@ -211,10 +274,10 @@ func main() {
 }
 
 // buildLadder constructs the parse ladder. Rungs 1–4 are deterministic; rung 5
-// (LLM) is present only when an endpoint is configured (runtime.md: "the LLM
-// only sees genuinely messy input"). provider is the LLM client — nil keeps the
-// rung configured-but-not-wired (callers report 501).
-func buildLadder(res contract.Resolver, cfg config.Config, provider *llm.Client, log *slog.Logger) *ladder.Ladder {
+// (LLM) takes part only while the holder says the LLM is enabled (runtime.md:
+// "the LLM only sees genuinely messy input"), which /ctrl/llm can change at
+// runtime.
+func buildLadder(res contract.Resolver, cfg config.Config, holder *llm.Holder, log *slog.Logger) *ladder.Ladder {
 	rungs := []ladder.Rung{
 		ladder.NewCoordRung(),
 		ladder.NewAddressRung(res),
@@ -222,30 +285,25 @@ func buildLadder(res contract.Resolver, cfg config.Config, provider *llm.Client,
 		ladder.NewPOIRung(res),
 		ladder.NewReverseRung(res),
 	}
-	var llmRung *ladder.LLMRung
-	if cfg.LLM.Enabled {
-		// Bound the LLM queue with a semaphore at Queue.Depth so admission
-		// control is real, not a no-op (adversarial review M2). When the queue
-		// is at capacity, Admit returns false and the caller sees ErrQueueFull.
-		// Release returns the slot after the request completes (both paths).
-		admit := make(chan struct{}, cfg.Queue.Depth)
-		llmRung = &ladder.LLMRung{
-			Configured: true,
-			Admit: func() bool {
-				select {
-				case admit <- struct{}{}:
-					return true
-				default:
-					return false
-				}
-			},
-			Release:      func() { <-admit },
-			Singleflight: &sync.Map{},
-			Breaker:      ladder.NewBreaker(cfg.Queue.BreakerThreshold, time.Duration(cfg.Queue.BreakerCooldown)*time.Second),
-		}
-		if provider != nil {
-			llmRung.Provider = provider
-		}
+	// Bound the LLM queue with a semaphore at Queue.Depth so admission
+	// control is real, not a no-op (adversarial review M2). When the queue is
+	// at capacity, Admit returns false and the caller sees ErrQueueFull.
+	// Release returns the slot after the request completes (both paths).
+	admit := make(chan struct{}, cfg.Queue.Depth)
+	llmRung := &ladder.LLMRung{
+		Configured: true,
+		Enabled:    holder.Enabled,
+		Admit: func() bool {
+			select {
+			case admit <- struct{}{}:
+				return true
+			default:
+				return false
+			}
+		},
+		Release:  func() { <-admit },
+		Breaker:  ladder.NewBreaker(cfg.Queue.BreakerThreshold, time.Duration(cfg.Queue.BreakerCooldown)*time.Second),
+		Provider: llm.NewClient(holder),
 	}
 	return &ladder.Ladder{Rungs: rungs, LLM: llmRung}
 }
@@ -258,16 +316,17 @@ func newMux(l *ladder.Ladder, store *publicapi.Store, authn *apiauth.Authenticat
 		mux.Handle("/scim/v2/", &scim.Server{IDs: ids, Log: log, BaseURL: cfg.Auth.PublicURL + "/scim/v2"})
 	}
 
-	mux.HandleFunc("/search", handleSearch(l, store, authn, cfg, log, met))
-	mux.HandleFunc("/geocode", handleGeocode(l, store, authn, cfg, log, met))
-	mux.HandleFunc("/reverse", handleReverse(l, store, authn, cfg, log, met))
-	mux.HandleFunc("/poi", handlePOI(l, store, authn, cfg, log, met))
-	mux.HandleFunc("/parse", handleParse(l, store, authn, cfg, log, met))
-	mux.HandleFunc("/batch", handleBatch(l, store, authn, cfg, log))
+	lim := &apiLimits{}
+	mux.HandleFunc("/search", handleQuery(l, store, authn, cfg, log, met, lim, "search", "/search"))
+	mux.HandleFunc("/geocode", handleQuery(l, store, authn, cfg, log, met, lim, "geocode", "/geocode"))
+	mux.HandleFunc("/reverse", handleQuery(l, store, authn, cfg, log, met, lim, "reverse", "/reverse"))
+	mux.HandleFunc("/poi", handleQuery(l, store, authn, cfg, log, met, lim, "poi", "/poi"))
+	mux.HandleFunc("/parse", handleParse(l, store, authn, cfg, log, met, lim, llmHolder))
+	mux.HandleFunc("/batch", handleBatch(l, store, authn, cfg, log, lim))
 	mux.HandleFunc("/suggest", handleSuggest(resolver, store, authn, cfg, log, met))
 	mux.HandleFunc("/healthz", handleHealthz())
-	mux.HandleFunc("/readyz", handleReadyz(resolver, cfg))
-	mux.HandleFunc("/metrics", handleMetrics(met))
+	mux.HandleFunc("/readyz", handleReadyz(resolver, cfg, log, llmHolder))
+	mux.HandleFunc("/metrics", handleMetrics(met, ctrlToken))
 	mux.HandleFunc("/ctrl/llm", handleCtrlLLM(llmHolder, ctrlToken, log))
 
 	return mux
@@ -275,48 +334,27 @@ func newMux(l *ladder.Ladder, store *publicapi.Store, authn *apiauth.Authenticat
 
 // --- handlers ---
 
-// handleSearch is the front door: it classifies free text and dispatches to the
-// right rung (all rungs). This is /search.
-func handleSearch(l *ladder.Ladder, store *publicapi.Store, authn *apiauth.Authenticator, cfg config.Config, log *slog.Logger, met *metrics.Collector) http.HandlerFunc {
-	return handleQuery(l, store, authn, cfg, log, met, "search", "/search")
-}
-
-// handleGeocode is /geocode: address text → G-NAF. Only the address rung (and
-// coord) serve it — never POI.
-func handleGeocode(l *ladder.Ladder, store *publicapi.Store, authn *apiauth.Authenticator, cfg config.Config, log *slog.Logger, met *metrics.Collector) http.HandlerFunc {
-	return handleQuery(l, store, authn, cfg, log, met, "geocode", "/geocode")
-}
-
-// handleReverse is /reverse: lat/lon → RTree nearest. Only the coord rung serves
-// it; an address string is rejected.
-func handleReverse(l *ladder.Ladder, store *publicapi.Store, authn *apiauth.Authenticator, cfg config.Config, log *slog.Logger, met *metrics.Collector) http.HandlerFunc {
-	return handleQuery(l, store, authn, cfg, log, met, "reverse", "/reverse")
-}
-
-// handlePOI is /poi: name (+ optional area) → OSM. Only POI rungs serve it.
-func handlePOI(l *ladder.Ladder, store *publicapi.Store, authn *apiauth.Authenticator, cfg config.Config, log *slog.Logger, met *metrics.Collector) http.HandlerFunc {
-	return handleQuery(l, store, authn, cfg, log, met, "poi", "/poi")
-}
-
 // handleParse is /parse: conversational → LLM structured intent. Deterministic
 // rungs never serve it; only the LLM rung participates.
-func handleParse(l *ladder.Ladder, store *publicapi.Store, authn *apiauth.Authenticator, cfg config.Config, log *slog.Logger, met *metrics.Collector) http.HandlerFunc {
+func handleParse(l *ladder.Ladder, store *publicapi.Store, authn *apiauth.Authenticator, cfg config.Config, log *slog.Logger, met *metrics.Collector, lim *apiLimits, holder *llm.Holder) http.HandlerFunc {
+	h := handleQuery(l, store, authn, cfg, log, met, lim, "parse", "/parse")
 	return func(w http.ResponseWriter, r *http.Request) {
 		// LLM layer must be enabled; /parse is LLM-only (rung 5). Without it the
 		// endpoint is unavailable, not "input unparseable" — distinct signal.
-		if !cfg.LLM.Enabled {
+		// Read per request: /ctrl/llm can switch it either way at runtime.
+		if !holder.Enabled() {
 			writeJSONError(w, http.StatusServiceUnavailable, "llm not configured")
 			met.Record("/parse", 503, 0, 0)
 			return
 		}
-		h := handleQuery(l, store, authn, cfg, log, met, "parse", "/parse")
 		h.ServeHTTP(w, r)
 	}
 }
 
-// handleQuery is the shared request path. kind constrains which rungs run;
-// endpoint is the canonical name for logging.
-func handleQuery(l *ladder.Ladder, store *publicapi.Store, authn *apiauth.Authenticator, cfg config.Config, log *slog.Logger, met *metrics.Collector, kind, endpoint string) http.HandlerFunc {
+// handleQuery is the shared request path for /search, /geocode, /reverse,
+// /poi and /parse. kind constrains which rungs run; endpoint is the
+// canonical name for logging.
+func handleQuery(l *ladder.Ladder, store *publicapi.Store, authn *apiauth.Authenticator, cfg config.Config, log *slog.Logger, met *metrics.Collector, lim *apiLimits, kind, endpoint string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		// Metrics: record endpoint/status/latency/result-count per request.
 		start := time.Now()
@@ -357,6 +395,23 @@ func handleQuery(l *ladder.Ladder, store *publicapi.Store, authn *apiauth.Authen
 			writeJSONError(w, http.StatusForbidden, "key not permitted for this endpoint")
 			return
 		}
+		ip := clientIP(r, cfg.Server.TrustedProxies)
+		// Reserve the rows this request may return before any resolver or LLM
+		// work; a caller at its daily ceiling is refused here, at no cost.
+		// The unused part goes back once the result is known (or all of it
+		// on any error path).
+		resv, err := reserveRows(p, ip, int64(cfg.Limits.MaxResults), store, cfg)
+		if err != nil {
+			status = int64(writeError(w, log, endpoint, err))
+			return
+		}
+		if resv.granted == 0 {
+			status = 429
+			writeJSONError(w, http.StatusTooManyRequests, "quota exceeded")
+			return
+		}
+		var used int64
+		defer func() { resv.settleLogged(used, log, endpoint) }()
 
 		// PR-8.1/8.2 — structured input. A caller who already holds parsed
 		// fields sends them as components instead of a string, and the request
@@ -382,28 +437,14 @@ func handleQuery(l *ladder.Ladder, store *publicapi.Store, authn *apiauth.Authen
 				}
 				ctx, cancel := context.WithTimeout(r.Context(), time.Duration(cfg.Limits.RequestTimeout)*time.Second)
 				defer cancel()
-				res, err := l.ResolveStructured(ctx, *comps, cfg.Limits.MaxResults)
+				res, err := l.ResolveStructured(ctx, *comps, resv.limit())
 				if err != nil {
-					status = int64(writeError(w, err))
+					status = int64(writeError(w, log, endpoint, err))
 					return
 				}
+				trimToLimit(&res, resv.limit())
 				rows := int64(len(res.Response.Candidates))
-				if !anon {
-					ok, _ := store.ChargePrincipal(p, rows)
-					if !ok {
-						status = 429
-						writeJSONError(w, http.StatusTooManyRequests, "quota exceeded")
-						return
-					}
-				} else {
-					ip := clientIP(r, cfg.Server.TrustedProxy)
-					ok, _ := store.ChargeAnonDaily(ip, rows, cfg.Rate.AnonDaily, cfg.AnonLLM.DailyGlobal)
-					if !ok {
-						status = 429
-						writeJSONError(w, http.StatusTooManyRequests, "quota exceeded")
-						return
-					}
-				}
+				used = rows
 				if touchesOSM(res.Response) {
 					w.Header().Set("X-Augeo-Attribution", "© OpenStreetMap contributors, ODbL 1.0 — https://www.openstreetmap.org/copyright")
 				}
@@ -423,7 +464,7 @@ func handleQuery(l *ladder.Ladder, store *publicapi.Store, authn *apiauth.Authen
 		// the actual query text before normalising, never the raw JSON (the
 		// normaliser would see "query" as a token and misclassify the rung).
 		body = requestText(body, kind)
-		q := ladder.Query{Raw: body, Normal: normalise.Normalise(body)}
+		q := ladder.Query{Raw: body, Normal: normalise.Normalise(body), Limit: resv.limit()}
 		if len(q.Normal.Tokens) == 0 {
 			status = 400
 			writeJSONError(w, http.StatusBadRequest, "no tokens")
@@ -431,38 +472,26 @@ func handleQuery(l *ladder.Ladder, store *publicapi.Store, authn *apiauth.Authen
 		}
 		ctx, cancel := context.WithTimeout(r.Context(), time.Duration(cfg.Limits.RequestTimeout)*time.Second)
 		defer cancel()
+		// Rung 5 spend control: per-caller in-flight cap and daily LLM-call
+		// cap, applied only if the walk reaches the LLM.
+		ctx = ladder.WithLLMGate(ctx, lim.llmGate(p, ip, store, cfg))
 		// Kind-constrained walk: /geocode never returns poi, /reverse rejects an
 		// address string, /poi never returns an address, /parse is LLM-only.
 		var res ladder.Result
-		var err error
 		if kind == "search" {
 			res, err = l.Walk(ctx, q)
 		} else {
 			res, err = l.WalkKind(ctx, q, kind)
 		}
 		if err != nil {
-			status = int64(writeError(w, err))
+			status = int64(writeError(w, log, endpoint, err))
 			return
 		}
-		// D-034: charge quota per result row. Keyed rows go to the usage table;
-		// anonymous rows go to the in-memory per-IP daily counter (D-026).
-		rows := int64(len(res.Response.Candidates))
-		if !anon {
-			ok, _ := store.ChargePrincipal(p, rows)
-			if !ok {
-				status = 429
-				writeJSONError(w, http.StatusTooManyRequests, "quota exceeded")
-				return
-			}
-		} else {
-			ip := clientIP(r, cfg.Server.TrustedProxy)
-			ok, _ := store.ChargeAnonDaily(ip, rows, cfg.Rate.AnonDaily, cfg.AnonLLM.DailyGlobal)
-			if !ok {
-				status = 429
-				writeJSONError(w, http.StatusTooManyRequests, "quota exceeded")
-				return
-			}
-		}
+		// D-034: quota is per result row; an LLM answer costs at least one.
+		// The result never exceeds what was reserved.
+		trimToLimit(&res, resv.limit())
+		rows := billableRows(res)
+		used = rows
 		// Attribution (D-018): OSM-touching responses carry the ODbL notice.
 		if touchesOSM(res.Response) {
 			w.Header().Set("X-Augeo-Attribution", "© OpenStreetMap contributors, ODbL 1.0 — https://www.openstreetmap.org/copyright")
@@ -493,7 +522,7 @@ type batchResp struct {
 	Items []batchItem `json:"items"`
 }
 
-func handleBatch(l *ladder.Ladder, store *publicapi.Store, authn *apiauth.Authenticator, cfg config.Config, log *slog.Logger) http.HandlerFunc {
+func handleBatch(l *ladder.Ladder, store *publicapi.Store, authn *apiauth.Authenticator, cfg config.Config, log *slog.Logger, lim *apiLimits) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		// /batch requires a key or bearer token with the batch scope; never
 		// anonymous (security.md: batch is scoped and keyed).
@@ -510,6 +539,18 @@ func handleBatch(l *ladder.Ladder, store *publicapi.Store, authn *apiauth.Authen
 			writeJSONError(w, http.StatusForbidden, "key not permitted for this endpoint")
 			return
 		}
+		// The scope alone is not enough: a key minted under the batch tier
+		// must stop working for /batch once its org leaves that tier.
+		if p.Tier != publicapi.TierBatch {
+			writeJSONError(w, http.StatusForbidden, "batch requires the batch tier")
+			return
+		}
+		// Batch.MaxConcurrentPerKey: one caller cannot run many batches at once.
+		if !lim.batch.acquire(p.RateKey, cfg.Batch.MaxConcurrentPerKey) {
+			writeJSONError(w, http.StatusTooManyRequests, "too many concurrent batches")
+			return
+		}
+		defer lim.batch.release(p.RateKey)
 
 		// D-032: batch body via readBody (same cap + empty-body rejection as the
 		// single-query path). Never trust a raw JSON blob — parse to a struct.
@@ -540,12 +581,25 @@ func handleBatch(l *ladder.Ladder, store *publicapi.Store, authn *apiauth.Authen
 			writeJSONError(w, http.StatusBadRequest, "batch too large")
 			return
 		}
+		// Pre-flight quota: every item can cost at least one row, so a batch
+		// larger than what is left today is refused before any work.
+		left, err := store.QuotaRemaining(p)
+		if err != nil {
+			writeError(w, log, "/batch", err)
+			return
+		}
+		if int64(len(req.Items)) > left {
+			writeJSONError(w, http.StatusTooManyRequests, "quota exceeded")
+			return
+		}
 
 		// Batch runtime is bounded by Batch.MaxDuration (D-034), NOT the
 		// single-query RequestTimeout — a batch is allowed to run far longer
 		// than one geocode. The write deadline already covers this.
 		ctx, cancel := context.WithTimeout(r.Context(), time.Duration(cfg.Batch.MaxDuration)*time.Second)
 		defer cancel()
+		ip := clientIP(r, cfg.Server.TrustedProxies)
+		ctx = ladder.WithLLMGate(ctx, batchLLMGate(ctx, lim.llmGate(p, ip, store, cfg), cfg.Queue.PerKeyInflight))
 
 		// Worker pool (Batch.Workers): process items in parallel. Sequential
 		// processing would be unusable for large batches (each item is a ladder
@@ -559,6 +613,7 @@ func handleBatch(l *ladder.Ladder, store *publicapi.Store, authn *apiauth.Authen
 		resp := batchResp{Items: make([]batchItem, n)}
 		var totalMu sync.Mutex
 		var totalRows int64
+		errReasons := map[string]int{}
 		sem := make(chan struct{}, workers)
 		var wg sync.WaitGroup
 		for i := 0; i < n; i++ {
@@ -570,17 +625,25 @@ func handleBatch(l *ladder.Ladder, store *publicapi.Store, authn *apiauth.Authen
 				defer wg.Done()
 				defer func() { <-sem }() // release the slot
 				bi := batchItem{Index: i}
-				// Per-item query-length cap (same as the single path).
+				fail := func(status int, msg string) {
+					bi.Status, bi.Error = status, msg
+					resp.Items[i] = bi
+				}
+				// Per-item validation, the same as the single path: length cap,
+				// then the empty/no-token guard (T1) — an empty item must not
+				// walk the ladder, let alone reach the LLM.
 				it.Query = strings.TrimSpace(it.Query)
 				if len(it.Query) > cfg.Limits.MaxQueryLen {
-					bi.Status = 400
-					bi.Error = "query too long"
-					resp.Items[i] = bi
+					fail(400, "query too long")
 					return
 				}
 				kind := it.Kind
 				if kind == "" {
 					kind = "search"
+				}
+				if !batchKinds[kind] {
+					fail(400, "unknown kind")
+					return
 				}
 				q := ladder.Query{Raw: it.Query, Normal: normalise.Normalise(it.Query)}
 				// Reverse items carry lat/lon, not a query string. The reverse rung
@@ -588,43 +651,76 @@ func handleBatch(l *ladder.Ladder, store *publicapi.Store, authn *apiauth.Authen
 				// so we hand it the same JSON form the /reverse endpoint sends.
 				if kind == "reverse" {
 					if it.Lat == 0 && it.Lon == 0 {
-						bi.Status = 400
-						bi.Error = "reverse needs lat/lon"
-						resp.Items[i] = bi
+						fail(400, "reverse needs lat/lon")
 						return
 					}
 					q.Raw = fmt.Sprintf(`{"lat":%v,"lon":%v}`, it.Lat, it.Lon)
+				} else {
+					if it.Query == "" {
+						fail(400, "empty query")
+						return
+					}
+					if len(q.Normal.Tokens) == 0 {
+						fail(400, "no tokens")
+						return
+					}
 				}
+				// Reserve this item's rows before its work (see rowReservation):
+				// once the quota runs out mid-batch, the remaining items are
+				// refused without being run.
+				resv, err := reserveRows(p, ip, int64(cfg.Limits.MaxResults), store, cfg)
+				if err != nil {
+					st, msg, reason := errorResponse(err)
+					fail(st, msg)
+					totalMu.Lock()
+					errReasons[reason]++
+					totalMu.Unlock()
+					return
+				}
+				if resv.granted == 0 {
+					fail(429, "quota exceeded")
+					return
+				}
+				var used int64
+				defer func() { resv.settleLogged(used, log, "/batch") }()
+				q.Limit = resv.limit()
 				var res ladder.Result
-				var err error
 				if kind == "search" {
 					res, err = l.Walk(ctx, q)
 				} else {
 					res, err = l.WalkKind(ctx, q, kind)
 				}
 				if err != nil {
-					bi.Status = 400
-					bi.Error = err.Error()
+					// Fixed messages only: raw errors can carry upstream detail.
+					st, msg, reason := errorResponse(err)
+					bi.Status, bi.Error = st, msg
 					resp.Items[i] = bi
+					if st >= 500 {
+						totalMu.Lock()
+						errReasons[reason]++
+						totalMu.Unlock()
+					}
 					return
 				}
+				trimToLimit(&res, resv.limit())
+				used = billableRows(res)
 				bi.Status = 200
 				bi.Strategy = res.Strategy
 				bi.Candidates = res.Response.Candidates
 				totalMu.Lock()
-				totalRows += int64(len(res.Response.Candidates))
+				totalRows += used
 				totalMu.Unlock()
 				resp.Items[i] = bi
 			}()
 		}
 		wg.Wait()
-
-		// Charge quota for the total result rows across all items (D-034). If the
-		// keyed quota is exhausted, refuse the whole batch — the caller retries.
-		if ok, _ := store.ChargePrincipal(p, totalRows); !ok {
-			writeJSONError(w, http.StatusTooManyRequests, "quota exceeded")
-			return
+		for reason, count := range errReasons {
+			log.Warn("batch_item_errors", "reason", reason, "count", count)
 		}
+
+		// Rows were reserved and settled per item (D-034), so the batch is
+		// already paid for: items the quota could not cover carry their own
+		// 429 and were never run.
 		store.LogPrincipalRequest(p, "/batch", http.StatusOK, 0, int(totalRows), "batch")
 
 		// Attribution (D-018): OSM-touching responses carry the ODbL notice.
@@ -634,6 +730,10 @@ func handleBatch(l *ladder.Ladder, store *publicapi.Store, authn *apiauth.Authen
 		writeJSON(w, resp)
 	}
 }
+
+// batchKinds are the item kinds /batch accepts. /parse is LLM-only and is not
+// offered in bulk.
+var batchKinds = map[string]bool{"search": true, "geocode": true, "reverse": true, "poi": true}
 
 // touchesOSMItems reports whether any item's candidates touch OSM (D-018).
 func touchesOSMItems(resp batchResp) bool {
@@ -686,6 +786,7 @@ func handleSuggest(resolver contract.Resolver, store *publicapi.Store, authn *ap
 			writeJSONError(w, http.StatusForbidden, "key not permitted for this endpoint")
 			return
 		}
+		ip := clientIP(r, cfg.Server.TrustedProxies)
 		// Decode the prefix. Suggest is keystroke-driven — the prefix is short.
 		var req struct {
 			Prefix string `json:"prefix"`
@@ -702,36 +803,43 @@ func handleSuggest(resolver contract.Resolver, store *publicapi.Store, authn *ap
 			writeJSONError(w, http.StatusBadRequest, "empty prefix")
 			return
 		}
+		// D-034: quota per suggestion row, reserved before the upstream call
+		// (see rowReservation). Session semantics (PR-7.4) are a caller
+		// concern — the meter still counts rows; a session-aware billing shim
+		// (S-14) sits in front of this endpoint.
+		want := req.Limit
+		if want <= 0 || want > maxSuggest {
+			want = maxSuggest
+		}
+		resv, err := reserveRows(p, ip, int64(want), store, cfg)
+		if err != nil {
+			status = int64(writeError(w, log, "/suggest", err))
+			return
+		}
+		if resv.granted == 0 {
+			status = 429
+			writeJSONError(w, http.StatusTooManyRequests, "quota exceeded")
+			return
+		}
+		var used int64
+		defer func() { resv.settleLogged(used, log, "/suggest") }()
 		ctx, cancel := context.WithTimeout(r.Context(), time.Duration(cfg.Limits.RequestTimeout)*time.Second)
 		defer cancel()
 		// Wire the caller's Limit through to the upstream so it isn't silently
-		// capped at 10 (UX review finding #7: SuggestRequest.Limit was dead code).
-		sres, err := resolver.Suggest(ctx, contract.SuggestRequest{Prefix: req.Prefix, Limit: req.Limit})
+		// capped at 10 (UX review finding #7: SuggestRequest.Limit was dead code),
+		// bounded by what the caller holds.
+		sres, err := resolver.Suggest(ctx, contract.SuggestRequest{Prefix: req.Prefix, Limit: resv.limit()})
 		if err != nil {
 			status = 502
 			writeJSONError(w, http.StatusBadGateway, "suggest upstream unavailable")
 			return
 		}
-		rows := int64(len(sres.Suggestions))
-		// D-034: charge quota per suggestion row. Session semantics (PR-7.4)
-		// are a caller concern — the meter still counts rows; a session-aware
-		// billing shim (S-14) sits in front of this endpoint.
-		if !anon {
-			ok, _ := store.ChargePrincipal(p, rows)
-			if !ok {
-				status = 429
-				writeJSONError(w, http.StatusTooManyRequests, "quota exceeded")
-				return
-			}
-		} else {
-			ip := clientIP(r, cfg.Server.TrustedProxy)
-			ok, _ := store.ChargeAnonDaily(ip, rows, cfg.Rate.AnonDaily, cfg.AnonLLM.DailyGlobal)
-			if !ok {
-				status = 429
-				writeJSONError(w, http.StatusTooManyRequests, "quota exceeded")
-				return
-			}
+		if len(sres.Suggestions) > resv.limit() {
+			sres.Suggestions = sres.Suggestions[:resv.limit()]
+			sres.Truncated = true
 		}
+		rows := int64(len(sres.Suggestions))
+		used = rows
 		status = 200
 		resultRows = rows
 		store.LogPrincipalRequest(p, "/suggest", http.StatusOK, 0, int(rows), "suggest")
@@ -743,6 +851,10 @@ func handleSuggest(resolver contract.Resolver, store *publicapi.Store, authn *ap
 }
 
 // metrics moved to ausystem/shared/metrics (see shared/metrics).
+// maxSuggest is the most suggestions one /suggest request returns (au-places
+// clamps to the same bound).
+const maxSuggest = 10
+
 // endpointScope maps an endpoint kind to the scope a key needs to call it.
 // /search and /geocode use the "search" scope; /poi, /reverse, /parse too;
 // /batch requires "batch". Unknown kinds default to "search".
@@ -768,44 +880,6 @@ func hasScope(scopes []string, s string) bool {
 	return false
 }
 
-// clientIP returns the client IP for anonymous rate limiting. It trusts
-// X-Forwarded-For only when the direct peer is a configured trusted proxy
-// (security.md assigns connection-flood control to the reverse proxy; blindly
-// trusting XFF lets any client spoof a fresh IP and bypass the per-IP limiter).
-// Otherwise it uses the peer address, stripping the port from IPv4 and IPv6.
-func clientIP(r *http.Request, trustedProxy string) string {
-	if trustedProxy != "" {
-		if peerIP(r) == trustedProxy {
-			if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-				// Use the first (client) address in the chain.
-				if i := strings.Index(xff, ","); i >= 0 {
-					xff = xff[:i]
-				}
-				xff = strings.TrimSpace(xff)
-				if h, _, err := net.SplitHostPort(xff); err == nil {
-					return h
-				}
-				return xff
-			}
-		}
-	}
-	host, _, err := net.SplitHostPort(r.RemoteAddr)
-	if err != nil {
-		// No port (rare); return as-is.
-		return r.RemoteAddr
-	}
-	return host
-}
-
-// peerIP returns the immediate peer address (no port), for proxy comparison.
-func peerIP(r *http.Request) string {
-	host, _, err := net.SplitHostPort(r.RemoteAddr)
-	if err != nil {
-		return r.RemoteAddr
-	}
-	return host
-}
-
 // requestText extracts the query string from a request body. For /geocode and
 // /poi the body is {"query": "..."}; for /reverse it's {"lat":..,"lon":..}.
 // The normaliser must see the query text, not JSON keys — "query" as a token
@@ -823,6 +897,8 @@ func structuredRequest(body string) (comps *contract.AddressComponents, hasQuery
 		Components *contract.AddressComponents `json:"components"`
 		// Components may also be supplied flat at the top level, which is what
 		// a caller mapping their own record shape will reach for first.
+		Unit         string `json:"unit"`
+		Lot          string `json:"lot"`
 		StreetNumber string `json:"street_number"`
 		StreetName   string `json:"street_name"`
 		StreetType   string `json:"street_type"`
@@ -838,6 +914,7 @@ func structuredRequest(body string) (comps *contract.AddressComponents, hasQuery
 
 	if obj.Components != nil && !obj.Components.Empty() {
 		flat := contract.AddressComponents{
+			Unit: obj.Unit, Lot: obj.Lot,
 			StreetNumber: obj.StreetNumber, StreetName: obj.StreetName,
 			StreetType: obj.StreetType, Locality: obj.Locality,
 			State: obj.State, Postcode: obj.Postcode,
@@ -848,6 +925,7 @@ func structuredRequest(body string) (comps *contract.AddressComponents, hasQuery
 		return obj.Components, hasQuery, nil
 	}
 	flat := contract.AddressComponents{
+		Unit: obj.Unit, Lot: obj.Lot,
 		StreetNumber: obj.StreetNumber, StreetName: obj.StreetName,
 		StreetType: obj.StreetType, Locality: obj.Locality,
 		State: obj.State, Postcode: obj.Postcode,
@@ -933,37 +1011,14 @@ func writeJSONError(w http.ResponseWriter, status int, msg string) {
 
 // writeError writes the error body and returns the HTTP status it wrote, so
 // the caller can record an accurate metric (the Prometheus status must match
-// what the client actually saw — UX review finding #5).
-func writeError(w http.ResponseWriter, err error) int {
-	switch {
-	case errors.Is(err, contract.ErrOutOfScope):
-		writeJSONError(w, http.StatusBadRequest, "out of scope")
-		return http.StatusBadRequest
-	case errors.Is(err, contract.ErrNoCandidates):
-		writeJSONError(w, http.StatusNotFound, "no candidates")
-		return http.StatusNotFound
-	case errors.Is(err, ladder.ErrNoRung):
-		// No rung applies to this input for the requested endpoint kind — a
-		// client error, not a server failure (e.g. an address string sent to
-		// /reverse). 400.
-		writeJSONError(w, http.StatusBadRequest, "no parse rung applies")
-		return http.StatusBadRequest
-	case errors.Is(err, ladder.ErrQueueFull):
-		writeJSONError(w, http.StatusTooManyRequests, "queue full")
-		return http.StatusTooManyRequests
-	case errors.Is(err, ladder.ErrLLMNotImplemented):
-		// The LLM rung is configured but not wired — a server-side gap, not a
-		// client error. Distinct 501 so callers know the endpoint is absent,
-		// not that their input was unparseable.
-		writeJSONError(w, http.StatusNotImplemented, "llm not implemented")
-		return http.StatusNotImplemented
-	case errors.Is(err, contract.ErrNotLoaded):
-		writeJSONError(w, http.StatusServiceUnavailable, "not loaded")
-		return http.StatusServiceUnavailable
-	default:
-		writeJSONError(w, http.StatusInternalServerError, err.Error())
-		return http.StatusInternalServerError
-	}
+// what the client actually saw — UX review finding #5). The body is always a
+// fixed message (errorResponse); server-side failures are logged as a reason
+// code and error type, never the error text.
+func writeError(w http.ResponseWriter, log *slog.Logger, endpoint string, err error) int {
+	status, msg, reason := errorResponse(err)
+	logRequestError(log, endpoint, status, reason, err)
+	writeJSONError(w, status, msg)
+	return status
 }
 
 func writeJSON(w http.ResponseWriter, v any) {
@@ -1021,7 +1076,7 @@ func handleHealthz() http.HandlerFunc {
 	}
 }
 
-func handleReadyz(resolver contract.Resolver, cfg config.Config) http.HandlerFunc {
+func handleReadyz(resolver contract.Resolver, cfg config.Config, log *slog.Logger, holder *llm.Holder) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		// Probe the upstream resolver (split mode). In single-binary mode the
 		// resolver is in-process and always available.
@@ -1032,21 +1087,30 @@ func handleReadyz(resolver contract.Resolver, cfg config.Config) http.HandlerFun
 			defer cancel()
 			ready, ds, err := resolver.Ready(ctx)
 			if err != nil || !ready {
+				// The upstream error stays in the log (as a code): /readyz is
+				// unauthenticated and must not describe the internal network.
 				status = "not_ready"
+				reason := "resolver_not_ready"
 				if err != nil {
-					status = "not_ready:" + err.Error()
+					_, _, reason = errorResponse(err)
+					reason = "resolver_" + reason
+				}
+				if log != nil {
+					log.Warn("readyz_not_ready", "reason", reason)
 				}
 			}
 			dataset = ds
 		}
 		states := strings.Join(cfg.Data.States, ",")
+		// The runtime LLM config, not the boot one: /ctrl/llm may have changed it.
+		llmCfg := holder.Get()
 		w.Header().Set("Content-Type", "application/json")
 		_ = jsonEncode(w, map[string]any{
 			"status":         status,
 			"states":         states,
 			"dataset":        dataset,
-			"llm_configured": cfg.LLM.Enabled,
-			"query_leak":     cfg.LLM.Enabled && cfg.LLM.BaseURL != "",
+			"llm_configured": llmCfg.Enabled,
+			"query_leak":     llmCfg.Enabled && llmCfg.BaseURL != "",
 		})
 	}
 }
@@ -1065,7 +1129,7 @@ func handleCtrlLLM(h *llm.Holder, ctrlToken string, log *slog.Logger) http.Handl
 		}
 		// Token gate. Empty token => endpoint disabled entirely (fail closed).
 		if ctrlToken == "" || subtle.ConstantTimeCompare([]byte(r.Header.Get("X-Augeo-Ctrl-Token")), []byte(ctrlToken)) != 1 {
-			writeJSONError(w, http.StatusUnauthorized, `{"error":"unauthorized"}`)
+			writeJSONError(w, http.StatusUnauthorized, "unauthorized")
 			return
 		}
 
@@ -1103,7 +1167,7 @@ func handleCtrlLLM(h *llm.Holder, ctrlToken string, log *slog.Logger) http.Handl
 		// The control endpoint is operator-only, so a fixed cap suffices.
 		r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
 		if err := json.NewDecoder(r.Body).Decode(&upd); err != nil {
-			writeJSONError(w, http.StatusBadRequest, `{"error":"bad request"}`)
+			writeJSONError(w, http.StatusBadRequest, "bad request")
 			return
 		}
 		cur := h.Get()
@@ -1125,14 +1189,35 @@ func handleCtrlLLM(h *llm.Holder, ctrlToken string, log *slog.Logger) http.Handl
 		if upd.Enabled != nil {
 			cur.Enabled = *upd.Enabled
 		}
+		// Refuse what the holder would quietly ignore: "enabled" without a base
+		// URL stays disabled, and the operator would read 200 as done.
+		if cur.Enabled && cur.BaseURL == "" {
+			writeJSONError(w, http.StatusBadRequest, "enabled requires base_url")
+			return
+		}
+		if cur.Timeout < 0 || cur.MaxTokens < 0 {
+			writeJSONError(w, http.StatusBadRequest, "timeout and max_tokens must be >= 0")
+			return
+		}
 		h.Set(cur)
 		log.Info("llm_config_updated", "base_url", cur.BaseURL, "model", cur.Model, "enabled", cur.Enabled)
 		writeJSON(w, map[string]any{"updated": true, "base_url": cur.BaseURL, "model": cur.Model, "enabled": cur.Enabled})
 	}
 }
 
-func handleMetrics(met *metrics.Collector) http.HandlerFunc {
+// handleMetrics serves /metrics on the public listener, gated by the control
+// token (X-Augeo-Ctrl-Token or Authorization: Bearer). Empty token => endpoint
+// disabled (fail closed); use AUGEO_METRICS_ADDR for an internal scrape port.
+func handleMetrics(met *metrics.Collector, ctrlToken string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		tok := r.Header.Get("X-Augeo-Ctrl-Token")
+		if b, ok := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer "); ok && tok == "" {
+			tok = b
+		}
+		if ctrlToken == "" || subtle.ConstantTimeCompare([]byte(tok), []byte(ctrlToken)) != 1 {
+			writeJSONError(w, http.StatusUnauthorized, "unauthorized")
+			return
+		}
 		met.Render(w)
 	}
 }

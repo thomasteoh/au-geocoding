@@ -11,8 +11,17 @@
 #   3. Start the stack:
 #        docker compose up -d places augeo prometheus
 #   4. Verify:
-#        curl http://localhost:8090/readyz   # places
-#        curl http://localhost:8099/readyz   # geocoder
+#        curl http://localhost:8099/readyz   # geocoder (reports places readiness)
+#
+# au-places has no authentication, so it is not published: augeo reaches it
+# on the compose network at http://places:8080. To reach it from the host for
+# debugging, add a loopback-only mapping in a local override file
+# (docker-compose.override.yml, not committed):
+#   services:
+#     places:
+#       ports:
+#         - "127.0.0.1:8090:8080"
+# Prometheus is bound to 127.0.0.1 for the same reason (it has no auth).
 
 services:
   places:
@@ -20,8 +29,7 @@ services:
       context: .
       dockerfile: places/Dockerfile
     image: auplaces:latest
-    ports:
-      - "8090:8080"
+    # No ports: unauthenticated resolver, internal to the compose network.
     volumes:
       - places_data:/data:ro    # read-only mount (D-019, INV-4)
     environment:
@@ -29,7 +37,7 @@ services:
       - AUGEO_ADDR=:8080
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "curl", "-fsS", "http://localhost:8080/readyz"]
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8080/readyz"]
       interval: 30s
       timeout: 5s
       retries: 3
@@ -65,21 +73,28 @@ services:
       - AUGEO_APP_DB=/data/app.db
       - AUGEO_PLACES_URL=http://places:8080
       - AUGEO_CTRL_TOKEN=${AUGEO_CTRL_TOKEN:-}
+      # Unauthenticated metrics listener for Prometheus on the compose network.
+      # Port 9100 is deliberately not published; /metrics on the published
+      # port requires the ctrl token.
+      - AUGEO_METRICS_ADDR=:9100
+      # Or mount a secret and set AUGEO_CTRL_TOKEN_FILE=/run/secrets/ctrl_token.
     depends_on:
       places:
         condition: service_healthy
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "curl", "-fsS", "http://localhost:8080/readyz"]
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8080/readyz"]
       interval: 30s
       timeout: 5s
       retries: 3
       start_period: 60s
 
   prometheus:
-    image: prom/prometheus:latest
+    # Pinned release and multi-arch index digest; bump both deliberately
+    # (docker buildx imagetools inspect prom/prometheus:<tag>).
+    image: prom/prometheus:v3.5.0@sha256:63805ebb8d2b3920190daf1cb14a60871b16fd38bed42b857a3182bc621f4996
     ports:
-      - "9090:9090"
+      - "127.0.0.1:9090:9090"
     volumes:
       - ./deploy/prometheus.yml:/etc/prometheus/prometheus.yml:ro
     restart: unless-stopped

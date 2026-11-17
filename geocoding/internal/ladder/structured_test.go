@@ -156,3 +156,32 @@ func TestStructuredPropagatesResolverError(t *testing.T) {
 		t.Error("resolver error should propagate, not become an empty result")
 	}
 }
+
+// A unit or lot reaches the resolver both as a component and leading Score in
+// its free-text form, so a resolver that reads Score by position still sees it.
+func TestStructuredCarriesUnitAndLot(t *testing.T) {
+	st := &stubResolver{resp: oneCandidate()}
+	l := ladderWith(st)
+	_, err := l.ResolveStructured(context.Background(), contract.AddressComponents{
+		Unit: "2", StreetNumber: "36", StreetName: "Collins", StreetType: "St", Locality: "Melbourne",
+	}, 10)
+	if err != nil {
+		t.Fatalf("ResolveStructured: %v", err)
+	}
+	if st.got.Components.Unit != "2" {
+		t.Errorf("unit = %q, want 2", st.got.Components.Unit)
+	}
+	if len(st.got.Score) < 3 || st.got.Score[0] != "unit" || st.got.Score[1] != "2" {
+		t.Errorf("score = %v, want it to open with unit 2", st.got.Score)
+	}
+
+	_, err = l.ResolveStructured(context.Background(), contract.AddressComponents{
+		Lot: "14", StreetName: "Old Sydney", StreetType: "Rd", Locality: "Wallan",
+	}, 10)
+	if err != nil {
+		t.Fatalf("ResolveStructured: %v", err)
+	}
+	if st.got.Components.Lot != "14" || st.got.Kind != contract.KindAddress {
+		t.Errorf("lot = %q kind %v, want 14 KindAddress", st.got.Components.Lot, st.got.Kind)
+	}
+}

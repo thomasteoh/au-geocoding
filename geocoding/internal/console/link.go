@@ -22,9 +22,16 @@ func linkFresh(sess identity.Session) bool {
 	return sess.Method != "passkey" && passkeyNow().Sub(sess.Created) <= passkeyFreshness
 }
 
+// canAddMethod is linkFresh plus general access: a session scoped to one
+// org's IdP must not add a sign-in method (a link or a passkey), or that
+// org's IdP admin could turn a minted assertion into full account access.
+func (s *Server) canAddMethod(r *http.Request, sess identity.Session) bool {
+	return linkFresh(sess) && s.IDs.SessionHasGeneralAccess(r.Context(), sess)
+}
+
 func (s *Server) handleLinkStart(w http.ResponseWriter, r *http.Request) {
 	v := viewerFrom(r.Context())
-	if !linkFresh(v.Session) {
+	if !s.canAddMethod(r, v.Session) {
 		redirectFlash(w, r, "/console/account", "Sign in again with single sign-on, then link the new method within 10 minutes.")
 		return
 	}

@@ -24,6 +24,8 @@ type FuzzySet struct {
 	localities map[string]bool            // canonical locality names (upper)
 	streets    map[string]bool            // canonical street names (upper)
 	streetLocs map[string]map[string]bool // street -> set of localities it appears in
+	locStreets map[string][]string        // locality -> streets in it
+	aliases                               // G-NAF locality and street aliases (alias.go)
 }
 
 // LoadFuzzySet builds the fuzzy set from the real address table.
@@ -34,6 +36,7 @@ func LoadFuzzySet(ctx context.Context, db *sql.DB) (*FuzzySet, error) {
 		localities: map[string]bool{},
 		streets:    map[string]bool{},
 		streetLocs: map[string]map[string]bool{},
+		locStreets: map[string][]string{},
 	}
 	rows, err := db.QueryContext(ctx, `SELECT locality_name, street_name FROM address`)
 	if err != nil {
@@ -58,11 +61,62 @@ func LoadFuzzySet(ctx context.Context, db *sql.DB) (*FuzzySet, error) {
 					locs = map[string]bool{}
 					fs.streetLocs[up] = locs
 				}
-				locs[strings.ToUpper(loc)] = true
+				ul := strings.ToUpper(loc)
+				if !locs[ul] {
+					locs[ul] = true
+					fs.locStreets[ul] = append(fs.locStreets[ul], up)
+				}
 			}
 		}
 	}
-	return fs, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return fs, fs.loadAliases(ctx, db)
+}
+
+// Localities returns the known locality names (upper case), aliases included:
+// the parser recognises an alias as a locality, and CanonicalLocality then
+// names the official locality. The map is shared, not copied: callers must
+// not modify it.
+func (fs *FuzzySet) Localities() map[string]bool { return fs.known() }
+
+// NearestLocality returns the known locality closest to name by edit distance,
+// and its similarity. It scans the locality names (a few thousand per state).
+func (fs *FuzzySet) NearestLocality(name string) (string, float64) {
+	up := strings.ToUpper(name)
+	known := fs.known()
+	if known[up] {
+		return up, 1
+	}
+	best, bestSim := "", 0.0
+	for loc := range known {
+		if s := levenshteinSim(up, loc); s > bestSim {
+			best, bestSim = loc, s
+		}
+	}
+	return best, bestSim
+}
+
+// NearestStreetIn returns the street in locality closest to name by edit
+// distance, and its similarity. An exact street in the locality scores 1. It
+// returns "", 0 when the locality is unknown.
+//
+// This is the locality-first correction: "COLINS" is a real street (in
+// Leongatha), so global resolution keeps it, but in MELBOURNE the street meant
+// is COLLINS.
+func (fs *FuzzySet) NearestStreetIn(name, locality string) (string, float64) {
+	up, loc := strings.ToUpper(name), strings.ToUpper(locality)
+	best, bestSim := "", 0.0
+	for _, st := range fs.locStreets[loc] {
+		if st == up {
+			return st, 1
+		}
+		if s := levenshteinSim(up, st); s > bestSim {
+			best, bestSim = st, s
+		}
+	}
+	return best, bestSim
 }
 
 // Resolve finds the canonical form of a possibly-typo'd token. If the token is
@@ -117,11 +171,16 @@ func (q Query) fuzzyGenerate(ctx context.Context, db *sql.DB, fs *FuzzySet, cap 
 		}
 	}
 	var phrases []string
+	seen := map[string]bool{}
 	for _, t := range q.Reliable {
 		if t == "" || len(t) < 3 {
 			continue
 		}
 		resolved := fs.Resolve(t, queryLoc, 0.75)
+		if seen[resolved] {
+			continue
+		}
+		seen[resolved] = true
 		phrases = append(phrases, `"`+strings.ReplaceAll(resolved, `"`, `""`)+`"`)
 	}
 	if len(phrases) == 0 {
@@ -129,7 +188,7 @@ func (q Query) fuzzyGenerate(ctx context.Context, db *sql.DB, fs *FuzzySet, cap 
 	}
 	// Try full AND with resolved anchors.
 	match := strings.Join(phrases, " AND ")
-	cands, err := generateMatch(ctx, db, match, cap)
+	cands, err := generateMatch(ctx, db, q, match, cap)
 	if err != nil {
 		return nil, err
 	}
@@ -139,7 +198,7 @@ func (q Query) fuzzyGenerate(ctx context.Context, db *sql.DB, fs *FuzzySet, cap 
 	// Still zero: drop one anchor at a time (resolved).
 	for i := len(phrases) - 1; i > 0; i-- {
 		relaxed := strings.Join(phrases[:i], " AND ")
-		cands, err := generateMatch(ctx, db, relaxed, cap)
+		cands, err := generateMatch(ctx, db, q, relaxed, cap)
 		if err != nil {
 			return nil, err
 		}

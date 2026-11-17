@@ -27,9 +27,8 @@ const (
 // Point is an X/Y coordinate pair.
 type Point struct{ X, Y float64 }
 
-// Polygon is a set of rings (parts); parts[0] is the outer ring, later parts
-// are holes or islands. GeoJSON needs one polygon per outer ring with holes
-// as interior rings, which we emit as separate geopoly rows.
+// Polygon is a set of rings (parts). Winding, not position, tells outer rings
+// (clockwise) from holes (anticlockwise); ClassifyRings splits them.
 type Polygon struct {
 	Parts [][]Point
 	BBox  [4]float64
@@ -43,6 +42,7 @@ type Locality struct {
 	Name      string
 	LocClass  string
 	State     string
+	Attrs     map[string]string // every DBF attribute, by field name
 	ShapeType int
 }
 

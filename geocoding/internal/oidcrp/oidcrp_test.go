@@ -273,3 +273,12 @@ func TestEntraGroupOverage(t *testing.T) {
 		t.Fatalf("graph failure should mark groups unknown: %+v %v", a, err)
 	}
 }
+
+func TestGroupsStringIsOneGroup(t *testing.T) {
+	if g := stringList("Finance Admins"); len(g) != 1 || g[0] != "Finance Admins" {
+		t.Fatalf("single string: %v", g)
+	}
+	if g := stringList("a, b"); len(g) != 2 || g[1] != "b" {
+		t.Fatalf("comma list: %v", g)
+	}
+}

@@ -11,7 +11,11 @@ package schema
 const SchemaSQL = `
 CREATE TABLE IF NOT EXISTS address (
   gnaf_pid       TEXT PRIMARY KEY,      -- ADDRESS_DETAIL.gnaf_pid
-  street_number  TEXT,                  -- ADDRESS_DETAIL.street_number (may be empty)
+  street_number  TEXT,                  -- ADDRESS_DETAIL.number_first (empty on a lot-only address)
+  flat_number    TEXT NOT NULL DEFAULT '', -- ADDRESS_DETAIL.flat_number, digits; '' when no unit
+  lot_number     TEXT NOT NULL DEFAULT '', -- ADDRESS_DETAIL.lot_number; '' when none
+  level_number   TEXT NOT NULL DEFAULT '', -- ADDRESS_DETAIL.level_number, digits, LEVEL/FLOOR only; '' otherwise
+  level_type     TEXT NOT NULL DEFAULT '', -- LEVEL_TYPE_AUT.name (LEVEL, FLOOR, BASEMENT, ...); '' when none
   street_name    TEXT NOT NULL,         -- STREET_LOCALITY.flat_name
   street_type    TEXT,                  -- STREET_LOCALITY.street_type (STREET/ROAD/...)
   locality_name  TEXT NOT NULL,         -- LOCALITY.flat_name (LOCALITY_ALIAS-resolved)
@@ -21,7 +25,7 @@ CREATE TABLE IF NOT EXISTS address (
   longitude      REAL NOT NULL,
   confidence     INTEGER NOT NULL,      -- -1..2 contributor agreement
   geocode_rel    INTEGER NOT NULL,      -- 1..6 coordinate precision
-  primary_sec    TEXT NOT NULL DEFAULT 'P',  -- PRIMARY_SECONDARY
+  primary_sec    TEXT NOT NULL DEFAULT 'P',  -- PRIMARY_SECONDARY: 'S' for a unit within a building, else 'P'
   address_alias  TEXT NOT NULL DEFAULT '',   -- ADDRESS_ALIAS
   mb_2026        TEXT,                  -- ABS Mesh Block 2026
   dataset_version TEXT NOT NULL DEFAULT 'synthetic-1'

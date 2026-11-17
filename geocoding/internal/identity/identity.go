@@ -76,6 +76,9 @@ var AllRoles = []Role{RoleViewer, RoleDeveloper, RoleAdmin, RoleOwner}
 type Store struct {
 	db  *sql.DB
 	box *secretbox.Box
+	// DefaultOrgTier is the quota tier new orgs get (one of ValidTiers;
+	// empty means demo). Set once at boot.
+	DefaultOrgTier string
 }
 
 // New migrates the identity schema on db and returns a store. box seals

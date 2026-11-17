@@ -592,3 +592,81 @@ func TestLinkIdentity(t *testing.T) {
 	}
 	_ = google
 }
+
+func TestPasskeyProofsOwnerOnlyAndScoped(t *testing.T) {
+	s := newStore(t)
+	org, c, owner := setupOrgWithDomain(t, s, "acme", "acme.example", false)
+	google := platformConn(t, s, "google", true)
+	p := SessionPolicy{Idle: time.Hour, Max: time.Hour}
+	// Registered from a platform session: no org proof recorded.
+	_, plat, _ := s.CreateSession(ctx, NewSession{UserID: owner.ID, Method: "oidc", ConnectionID: google.ID}, p)
+	pk1, _ := s.AddPasskey(ctx, Passkey{UserID: owner.ID, CredentialID: []byte("k1"), Data: "{}"})
+	s.RecordPasskeyProofs(ctx, pk1, plat.IDHash)
+	_, pks, _ := s.CreateSession(ctx, NewSession{UserID: owner.ID, Method: "passkey"}, p)
+	s.GrantPasskeyProofs(ctx, pks.IDHash, owner.ID, []byte("k1"))
+	if s.SessionSatisfiesOrg(ctx, pks.IDHash, org.ID, 0) {
+		t.Fatal("platform-registered passkey grants org break-glass")
+	}
+	// Registered under the org's SSO: granted while owner, not after demotion.
+	_, orgSess, _ := s.CreateSession(ctx, NewSession{UserID: owner.ID, Method: "oidc", ConnectionID: c.ID}, p)
+	pk2, _ := s.AddPasskey(ctx, Passkey{UserID: owner.ID, CredentialID: []byte("k2"), Data: "{}"})
+	s.RecordPasskeyProofs(ctx, pk2, orgSess.IDHash)
+	_, pks2, _ := s.CreateSession(ctx, NewSession{UserID: owner.ID, Method: "passkey"}, p)
+	s.GrantPasskeyProofs(ctx, pks2.IDHash, owner.ID, []byte("k2"))
+	if !s.SessionSatisfiesOrg(ctx, pks2.IDHash, org.ID, 0) {
+		t.Fatal("org-registered passkey refused for owner")
+	}
+	v, _ := s.CreateUser(ctx, "v@acme.example", "")
+	s.SetMembership(ctx, org.ID, v.ID, RoleOwner, "manual")
+	s.SetMembership(ctx, org.ID, owner.ID, RoleDeveloper, "manual")
+	_, pks3, _ := s.CreateSession(ctx, NewSession{UserID: owner.ID, Method: "passkey"}, p)
+	s.GrantPasskeyProofs(ctx, pks3.IDHash, owner.ID, []byte("k2"))
+	if s.SessionSatisfiesOrg(ctx, pks3.IDHash, org.ID, 0) {
+		t.Fatal("non-owner got break-glass")
+	}
+}
+
+func TestIdPLogoutRevokesCarriedProofs(t *testing.T) {
+	s := newStore(t)
+	org, c, owner := setupOrgWithDomain(t, s, "acme", "acme.example", false)
+	google := platformConn(t, s, "google", true)
+	p := SessionPolicy{Idle: time.Hour, Max: time.Hour}
+	_, a, _ := s.CreateSession(ctx, NewSession{UserID: owner.ID, Method: "oidc", ConnectionID: c.ID, IdPSID: "sid-1"}, p)
+	_, b, _ := s.CreateSession(ctx, NewSession{UserID: owner.ID, Method: "oidc", ConnectionID: google.ID}, p)
+	if err := s.CarrySessionProofs(ctx, a.IDHash, b.IDHash); err != nil {
+		t.Fatal(err)
+	}
+	if !s.SessionSatisfiesOrg(ctx, b.IDHash, org.ID, 0) {
+		t.Fatal("carried proof missing")
+	}
+	if _, err := s.DeleteIdPSessions(ctx, c.ID, "sid-1", ""); err != nil {
+		t.Fatal(err)
+	}
+	if s.SessionSatisfiesOrg(ctx, b.IDHash, org.ID, 0) {
+		t.Fatal("carried proof survived IdP logout")
+	}
+	// Disabling a connection voids its proofs.
+	_, a2, _ := s.CreateSession(ctx, NewSession{UserID: owner.ID, Method: "oidc", ConnectionID: c.ID}, p)
+	c.Enabled = false
+	if _, err := s.SaveConnection(ctx, c); err != nil {
+		t.Fatal(err)
+	}
+	if s.SessionSatisfiesOrg(ctx, a2.IDHash, org.ID, 0) {
+		t.Fatal("disabled connection still satisfies enforcement")
+	}
+}
+
+func TestDeniedFirstLoginLeavesNoIdentity(t *testing.T) {
+	s := newStore(t)
+	org, c, _ := setupOrgWithDomain(t, s, "acme", "acme.example", false)
+	s.AddGroupMapping(ctx, GroupMapping{OrgID: org.ID, Source: SourceSSO, ConnectionID: c.ID, Group: "g", Role: RoleAdmin})
+	u, _ := s.CreateUser(ctx, "x@acme.example", "")
+	if _, err := s.ResolveLogin(ctx, Assertion{Connection: c, Subject: "x", Email: u.Email}, LoginPolicy{}); denialCode(err) != "not_member" {
+		t.Fatalf("expected not_member: %v", err)
+	}
+	var n int
+	s.db.QueryRow(`SELECT COUNT(*) FROM identities WHERE connection_id=?`, c.ID).Scan(&n)
+	if n != 0 {
+		t.Fatal("denied login left an identity")
+	}
+}

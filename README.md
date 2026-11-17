@@ -8,7 +8,7 @@ Australian geocoding, split into two services that share one contract.
 | [`places/`](places/README.md) | `auplaces` | au-places: the resolver. Loaders, the G-NAF/OSM datasets, the `/resolve` contract endpoint. |
 | [`shared/`](shared/) | `ausystem/shared` | Code both services compile against: `contract`, `normalise`, `streettype`, `slog`, `metrics`. |
 | `deploy/` | | Prometheus scrape config for the compose stack. |
-| `scripts/` | | CI helpers (`smoke-geocoding.sh`). |
+| `scripts/` | | `smoke-geocoding.sh` (CI, mock resolver); `smoke-real.sh` (manual, both services on a real dataset). |
 
 Each service is its own Go module and its own image. `go.work` ties them
 together for local development; each service's `go.mod` also carries
@@ -28,7 +28,7 @@ go build ./shared/... ./geocoding/... ./places/...
 ```sh
 docker compose run --rm loader                     # build the dataset (one-shot)
 docker compose run --rm --entrypoint keygen augeo -app-db /data/app.db -label my-key
-docker compose up -d places augeo prometheus
+docker compose up -d places augeo prometheus     # only augeo (8099) is published
 ```
 
 Images build from the repository root so `shared/` is in the context:

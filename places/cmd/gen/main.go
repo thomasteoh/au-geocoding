@@ -12,7 +12,6 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
-	"strings"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -67,27 +66,6 @@ func main() {
 	// Load corpus.
 	queries := loadCorpus(*corpus)
 
-	// Load the locality set from the DB — the normaliser needs it to classify
-	// locality tokens as reliable anchors.
-	localitySet := map[string]bool{}
-	{
-		rows, err := db.QueryContext(ctx, `SELECT DISTINCT locality_name FROM address`)
-		if err != nil {
-			log.Fatalf("locality set: %v", err)
-		}
-		defer rows.Close()
-		for rows.Next() {
-			var l string
-			if err := rows.Scan(&l); err != nil {
-				log.Fatalf("scan locality: %v", err)
-			}
-			localitySet[strings.ToUpper(l)] = true
-		}
-		if err := rows.Err(); err != nil {
-			log.Fatalf("locality set rows: %v", err)
-		}
-	}
-
 	// Load the fuzzy set (locality + street names) for typo-tolerant
 	// generation — a typo'd locality/street resolves to its near-match.
 	fs, err := match.LoadFuzzySet(ctx, db)
@@ -106,7 +84,7 @@ func main() {
 		if *limit > 0 && i >= *limit {
 			break
 		}
-		rel, score, fields := normalise.Tokenise(q.text, 32, localitySet)
+		rel, score, fields := fs.CanonicalTokens(normalise.Tokenise(q.text, 32, fs.Localities(), fs.NearestLocality))
 		qm := match.Query{Reliable: rel, Score: score, Fields: fields}
 		start := time.Now()
 		cands, err := match.Generate(ctx, db, qm, fs, *capN)

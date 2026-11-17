@@ -276,6 +276,18 @@ func (s *Store) SaveConnection(ctx context.Context, c Connection) (Connection, e
 		if _, err := tx.ExecContext(ctx, `DELETE FROM sessions WHERE connection_id=?`, c.ID); err != nil {
 			return c, err
 		}
+		if _, err := tx.ExecContext(ctx, `DELETE FROM session_proofs WHERE connection_id=?`, c.ID); err != nil {
+			return c, err
+		}
+	}
+	if old.Enabled && !c.Enabled {
+		// A disabled connection grants nothing, now or later.
+		if _, err := tx.ExecContext(ctx, `DELETE FROM sessions WHERE connection_id=?`, c.ID); err != nil {
+			return c, err
+		}
+		if _, err := tx.ExecContext(ctx, `DELETE FROM session_proofs WHERE connection_id=?`, c.ID); err != nil {
+			return c, err
+		}
 	}
 	if err := tx.Commit(); err != nil {
 		return c, err
@@ -471,7 +483,8 @@ type GroupMapping struct {
 }
 
 // AddGroupMapping adds a mapping. For SSO mappings the connection must belong
-// to the org.
+// to the org. A SCIM mapping recomputes SCIM members' roles at once (see
+// DeleteGroupMapping).
 func (s *Store) AddGroupMapping(ctx context.Context, m GroupMapping) (GroupMapping, error) {
 	m.Group = strings.TrimSpace(m.Group)
 	if m.Group == "" || len(m.Group) > 256 || m.Role < RoleViewer || m.Role > RoleOwner {
@@ -487,7 +500,12 @@ func (s *Store) AddGroupMapping(ctx context.Context, m GroupMapping) (GroupMappi
 	default:
 		return m, ErrInvalid
 	}
-	res, err := s.db.ExecContext(ctx, `INSERT INTO group_mappings(org_id, source, connection_id, grp, role, created) VALUES (?,?,?,?,?,?)`,
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return m, err
+	}
+	defer tx.Rollback()
+	res, err := tx.ExecContext(ctx, `INSERT INTO group_mappings(org_id, source, connection_id, grp, role, created) VALUES (?,?,?,?,?,?)`,
 		m.OrgID, m.Source, nullID(m.ConnectionID), m.Group, m.Role.String(), now())
 	if err != nil {
 		if isUnique(err) {
@@ -496,7 +514,12 @@ func (s *Store) AddGroupMapping(ctx context.Context, m GroupMapping) (GroupMappi
 		return m, err
 	}
 	m.ID, _ = res.LastInsertId()
-	return m, nil
+	if m.Source == SourceSCIM {
+		if err := scimRecomputeOrgTx(ctx, tx, m.OrgID); err != nil {
+			return m, err
+		}
+	}
+	return m, tx.Commit()
 }
 
 // GroupMappings lists an org's mappings.
@@ -524,15 +547,32 @@ func (s *Store) groupMappings(ctx context.Context, q string, args ...any) ([]Gro
 }
 
 // DeleteGroupMapping removes a mapping within an org.
+//
+// Removing (or adding) a SCIM mapping recomputes the role of every
+// SCIM-sourced membership in the org at once, since SCIM keeps group
+// membership here; if that would demote the last owner the change is
+// refused with ErrLastOwner. SSO mappings take effect at each member's next
+// sign-in, because the IdP's groups are only known then.
 func (s *Store) DeleteGroupMapping(ctx context.Context, orgID, id int64) error {
-	res, err := s.db.ExecContext(ctx, `DELETE FROM group_mappings WHERE id=? AND org_id=?`, id, orgID)
+	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
-	if n, _ := res.RowsAffected(); n == 0 {
+	defer tx.Rollback()
+	var source string
+	err = tx.QueryRowContext(ctx, `DELETE FROM group_mappings WHERE id=? AND org_id=? RETURNING source`, id, orgID).Scan(&source)
+	if errors.Is(err, sql.ErrNoRows) {
 		return ErrNotFound
 	}
-	return nil
+	if err != nil {
+		return err
+	}
+	if source == SourceSCIM {
+		if err := scimRecomputeOrgTx(ctx, tx, orgID); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
 }
 
 // MappedRole returns the highest role any of groups maps to for an SSO

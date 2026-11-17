@@ -59,3 +59,33 @@ func TestSMTPPasswordFile(t *testing.T) {
 		t.Fatalf("password from file: %q", cfg.SMTP.Password)
 	}
 }
+
+func TestSMTPTLSAndAuthRate(t *testing.T) {
+	t.Setenv("AUGEO_SMTP_HOST", "smtp.example.com")
+	t.Setenv("AUGEO_SMTP_FROM", "noreply@geo.example")
+	cfg, err := Load(nil, "")
+	if err != nil || cfg.SMTP.TLS != "starttls" || cfg.Auth.RateRPS != 1 || cfg.Auth.RateBurst != 20 {
+		t.Fatalf("defaults: %v %+v %+v", err, cfg.SMTP, cfg.Auth)
+	}
+	t.Setenv("AUGEO_SMTP_PORT", "465")
+	if cfg, err = Load(nil, ""); err != nil || cfg.SMTP.TLS != "implicit" {
+		t.Fatalf("465: %v %q", err, cfg.SMTP.TLS)
+	}
+	t.Setenv("AUGEO_SMTP_TLS", "StartTLS")
+	if cfg, err = Load(nil, ""); err != nil || cfg.SMTP.TLS != "starttls" {
+		t.Fatalf("explicit: %v %q", err, cfg.SMTP.TLS)
+	}
+	t.Setenv("AUGEO_SMTP_TLS", "ssl")
+	if _, err = Load(nil, ""); err == nil || !strings.Contains(err.Error(), "AUGEO_SMTP_TLS") {
+		t.Fatalf("bad mode: %v", err)
+	}
+	t.Setenv("AUGEO_SMTP_TLS", "")
+	t.Setenv("AUGEO_AUTH_RATE_RPS", "0")
+	if cfg, err = Load(nil, ""); err != nil || cfg.Auth.RateRPS != 0 {
+		t.Fatalf("rate off: %v", err)
+	}
+	t.Setenv("AUGEO_AUTH_RATE_RPS", "-1")
+	if _, err = Load(nil, ""); err == nil {
+		t.Fatal("accepted negative rate")
+	}
+}

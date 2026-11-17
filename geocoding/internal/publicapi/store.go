@@ -6,6 +6,7 @@
 package publicapi
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
@@ -46,6 +47,20 @@ var TierQuota = map[Tier]int64{
 	TierDemo:      1000,
 	TierStandard:  10000,
 	TierBatch:     100000,
+}
+
+// ErrUnknownTier is returned by ParseTier for a name that is not a tier.
+var ErrUnknownTier = errors.New("unknown quota tier")
+
+// ParseTier is QuotaTier for operator input: an unknown name is an error, not
+// a silent demo key. QuotaTier's fallback suits rows already stored; a typo
+// at issuance ("standrad") must not mint a key with a tenth of the quota.
+func ParseTier(s string) (Tier, error) {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "anonymous", "demo", "standard", "batch":
+		return QuotaTier(strings.TrimSpace(s)), nil
+	}
+	return 0, fmt.Errorf("%w: %q (want anonymous, demo, standard or batch)", ErrUnknownTier, s)
 }
 
 // QuotaTier returns the tier for a key's quota_tier string.
@@ -154,12 +169,12 @@ type Store struct {
 	mu     sync.Mutex
 	keys   map[string]Key // prefix → Key (non-secret index)
 
-	// AnonDaily tracks anonymous daily usage per IP, in memory only (D-026:
-	// per-IP quota is per-replica and resets on restart — accepted weakness,
-	// capped by the global ceiling). Never persisted, never logged.
-	anonMu  sync.Mutex
-	anonDay string
-	anonIPs map[string]int64 // ip → rows consumed today
+	// anonRows and anonLLM track anonymous daily usage per IP, in memory
+	// only (D-026: per-IP quota is per-replica and resets on restart —
+	// accepted weakness, capped by the global ceiling). Never persisted,
+	// never logged.
+	anonRows *anonCounter
+	anonLLM  *anonCounter
 }
 
 // Open opens app.db (creating the schema on first run) and loads keys. The
@@ -182,10 +197,11 @@ func Open(path string) (*Store, error) {
 // New builds the store on an open app.db handle shared with other stores.
 func New(db *sql.DB) (*Store, error) {
 	s := &Store{
-		db:      db,
-		pepper:  GeneratePepper(),
-		keys:    make(map[string]Key),
-		anonIPs: make(map[string]int64),
+		db:       db,
+		pepper:   GeneratePepper(),
+		keys:     make(map[string]Key),
+		anonRows: newAnonCounter(MaxAnonIPs),
+		anonLLM:  newAnonCounter(MaxAnonIPs),
 	}
 	if err := s.migrate(); err != nil {
 		return nil, err
@@ -418,6 +434,11 @@ type IssueOptions struct {
 	OrgID     int64
 	CreatedBy int64
 	Expires   *time.Time
+	// Guard, if set, runs in the insert's transaction after the insert
+	// (which holds SQLite's write lock); an error aborts the issue. The
+	// console passes an org-exists check, so a key cannot outlive an org
+	// deleted concurrently (see DeleteOrgWith / RevokeOrgKeysTx).
+	Guard func(*sql.Tx) error
 }
 
 // IssueKeyWith creates a key with an optional org, creator and expiry. The
@@ -441,13 +462,26 @@ func (s *Store) IssueKeyWith(o IssueOptions) (Key, string, error) {
 	if o.Expires != nil {
 		expires = o.Expires.UTC().Format(time.RFC3339)
 	}
-	res, err := s.db.Exec(`INSERT INTO api_keys(prefix, hash, label, quota_tier, enabled, scopes, created, org_id, created_by, expires)
+	tx, err := s.db.Begin()
+	if err != nil {
+		return Key{}, "", err
+	}
+	defer tx.Rollback()
+	res, err := tx.Exec(`INSERT INTO api_keys(prefix, hash, label, quota_tier, enabled, scopes, created, org_id, created_by, expires)
 		VALUES (?, ?, ?, ?, 1, ?, ?, ?, ?, ?)`,
 		prefix, hash[:], o.Label, tierName(o.Tier), strings.Join(o.Scopes, " "), created.Format(time.RFC3339), nullInt(o.OrgID), nullInt(o.CreatedBy), expires)
 	if err != nil {
 		return Key{}, "", err
 	}
 	id, _ := res.LastInsertId()
+	if o.Guard != nil {
+		if err := o.Guard(tx); err != nil {
+			return Key{}, "", err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return Key{}, "", err
+	}
 	k := Key{ID: id, Prefix: prefix, Hash: hash, Label: o.Label, Tier: o.Tier, Enabled: true, Scopes: o.Scopes, Created: created,
 		OrgID: o.OrgID, CreatedBy: o.CreatedBy, Expires: o.Expires}
 	s.keys[prefix] = k
@@ -507,20 +541,46 @@ func (s *Store) RevokeOrgKeys(orgID int64) error {
 	return nil
 }
 
-// SetOrgTier moves every live key of an org to a new tier, in the table and
-// the in-memory index, so a tier change takes effect at once.
-func (s *Store) SetOrgTier(orgID int64, tier Tier) error {
-	if _, err := s.db.Exec(`UPDATE api_keys SET quota_tier=? WHERE org_id=?`, tierName(tier), orgID); err != nil {
-		return err
-	}
+// RevokeOrgKeysTx revokes every live key of an org inside tx (org
+// deletion, with the org's delete in the same transaction). Call
+// ForgetOrgKeys after the commit to update the in-memory index.
+func (s *Store) RevokeOrgKeysTx(tx *sql.Tx, orgID int64) error {
+	_, err := tx.Exec(`UPDATE api_keys SET enabled=0, revoked=? WHERE org_id=? AND revoked IS NULL`,
+		time.Now().UTC().Format(time.RFC3339), orgID)
+	return err
+}
+
+// ForgetOrgKeys marks every key of an org revoked in the in-memory index,
+// so they stop authenticating at once (after RevokeOrgKeysTx committed).
+func (s *Store) ForgetOrgKeys(orgID int64) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	t := time.Now().UTC()
 	for p, k := range s.keys {
-		if k.OrgID == orgID {
-			k.Tier = tier
+		if k.OrgID == orgID && k.Revoked == nil {
+			k.Enabled = false
+			k.Revoked = &t
 			s.keys[p] = k
 		}
 	}
+}
+
+// SetOrgTier moves every live key of an org to a new tier, in the table and
+// the in-memory index, so a tier change takes effect at once. Leaving the
+// batch tier strips the batch scope from the org's keys.
+func (s *Store) SetOrgTier(orgID int64, tier Tier) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if err := s.SetOrgTierTx(context.Background(), tx, orgID, tier); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	s.ApplyOrgTier(orgID, tier)
 	return nil
 }
 
@@ -584,6 +644,9 @@ func (s *Store) charge(principal string, tier Tier, rows int64) (bool, error) {
 	if principal == "" {
 		return false, errors.New("charge: empty principal")
 	}
+	if rows <= 0 {
+		return true, nil // nothing to charge; no empty usage row
+	}
 	day := time.Now().UTC().Format("2006-01-02")
 	quota := TierQuota[tier]
 	s.mu.Lock()
@@ -609,38 +672,11 @@ func (s *Store) charge(principal string, tier Tier, rows int64) (bool, error) {
 		ON CONFLICT(principal, day) DO UPDATE SET rows=rows+excluded.rows`, principal, day, rows); err != nil {
 		return false, err
 	}
-	return true, tx.Commit()
-}
-
-// ChargeAnonDaily accounts for anonymous result rows consumed today, per IP
-// (D-026: per-IP quota plus a global ceiling). In memory only — resets on
-// restart and is per-replica; the global ceiling bounds the worst case.
-// Returns false when the IP's daily ceiling or the global ceiling is exceeded.
-func (s *Store) ChargeAnonDaily(ip string, rows int64, perIP, global int64) (bool, error) {
-	if perIP <= 0 {
-		return true, nil // no anonymous daily ceiling configured
+	// The charge exists only once committed: a failed commit must not report
+	// success, or the caller is served rows nobody paid for.
+	if err := tx.Commit(); err != nil {
+		return false, err
 	}
-	day := time.Now().UTC().Format("2006-01-02")
-	s.anonMu.Lock()
-	defer s.anonMu.Unlock()
-	// Roll the day at midnight.
-	if s.anonDay != day {
-		s.anonDay = day
-		s.anonIPs = make(map[string]int64)
-	}
-	cur := s.anonIPs[ip]
-	if cur+rows > perIP {
-		return false, ErrQuotaExceeded
-	}
-	// Global ceiling: sum over all IPs.
-	var total int64
-	for _, v := range s.anonIPs {
-		total += v
-	}
-	if global > 0 && total+rows > global {
-		return false, ErrQuotaExceeded
-	}
-	s.anonIPs[ip] = cur + rows
 	return true, nil
 }
 
@@ -661,85 +697,6 @@ func (s *Store) LogPrincipalRequest(p Principal, endpoint string, status int, la
 	_, err := s.db.Exec(`INSERT INTO request_log(ts, key_id, endpoint, status, latency_ms, result_count, strategy, principal)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?)`, ts, p.KeyID, endpoint, status, latencyMS, resultCount, strategy, principal)
 	return err
-}
-
-// tokenBucket is a per-key token bucket (D-006). Tokens refill continuously;
-// a burst up to the bucket size is allowed, then the steady rate.
-type tokenBucket struct {
-	mu     sync.Mutex
-	rate   float64 // tokens per second
-	burst  float64
-	tokens float64
-	last   time.Time
-	used   time.Time // last touch for LRU eviction
-}
-
-// newTokenBucket creates a bucket with the given per-second rate and burst.
-func newTokenBucket(rate, burst float64) *tokenBucket {
-	return &tokenBucket{rate: rate, burst: burst, tokens: burst, last: time.Now(), used: time.Now()}
-}
-
-// Allow consumes one token. Returns false when the bucket is empty.
-func (b *tokenBucket) Allow() bool {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	now := time.Now()
-	elapsed := now.Sub(b.last).Seconds()
-	b.tokens = min(b.tokens+elapsed*b.rate, b.burst)
-	b.last = now
-	b.used = now
-	if b.tokens < 1 {
-		return false
-	}
-	b.tokens--
-	return true
-}
-
-// RateLimiter holds per-key token buckets.
-type RateLimiter struct {
-	mu      sync.Mutex
-	keys    map[string]*tokenBucket
-	rate    float64
-	burst   float64
-	maxKeys int
-}
-
-// NewRateLimiter creates a limiter with per-key buckets at rate/s and burst.
-func NewRateLimiter(rate, burst float64) *RateLimiter {
-	return &RateLimiter{
-		keys:    make(map[string]*tokenBucket),
-		rate:    rate,
-		burst:   burst,
-		maxKeys: 100000,
-	}
-}
-
-// Allow consumes one token for the key (or IP for anonymous). When the key map
-// exceeds maxKeys it evicts the least-recently-used bucket — prevents the map
-// growing unboundedly with every unique IP/key (memory exhaustion).
-func (r *RateLimiter) Allow(key string) bool {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	b, ok := r.keys[key]
-	if !ok {
-		// Evict LRU if at cap.
-		if r.maxKeys > 0 && len(r.keys) >= r.maxKeys {
-			var oldestKey string
-			var oldest time.Time
-			for k, b := range r.keys {
-				if oldest.IsZero() || b.used.Before(oldest) {
-					oldest = b.used
-					oldestKey = k
-				}
-			}
-			if oldestKey != "" {
-				delete(r.keys, oldestKey)
-			}
-		}
-		b = newTokenBucket(r.rate, r.burst)
-		r.keys[key] = b
-	}
-	return b.Allow()
 }
 
 func tierName(t Tier) string {
@@ -763,12 +720,4 @@ func newKeyString() string {
 		panic(err)
 	}
 	return hex.EncodeToString(b)
-}
-
-// min is the Go 1.21+ builtin; keep a local for safety.
-func min(a, b float64) float64 {
-	if a < b {
-		return a
-	}
-	return b
 }

@@ -9,50 +9,69 @@ import "strings"
 // what the dataset uses (STREET, ROAD, AVENUE, ...); abbreviations are the
 // short forms a user might type or that appear in raw G-NAF data.
 var fullNames = map[string]string{
-	"street":    "STREET",
-	"st":        "STREET",
-	"str":       "STREET",
-	"road":      "ROAD",
-	"rd":        "ROAD",
-	"avenue":    "AVENUE",
-	"ave":       "AVENUE",
-	"av":        "AVENUE",
-	"drive":     "DRIVE",
-	"dr":        "DRIVE",
-	"drv":       "DRIVE",
-	"court":     "COURT",
-	"ct":        "COURT",
-	"place":     "PLACE",
-	"pl":        "PLACE",
-	"crescent":  "CRESCENT",
-	"cres":      "CRESCENT",
-	"cr":        "CRESCENT",
-	"terrace":   "TERRACE",
-	"tce":       "TERRACE",
-	"lane":      "LANE",
-	"ln":        "LANE",
-	"highway":   "HIGHWAY",
-	"hwy":       "HIGHWAY",
-	"boulevard": "BOULEVARD",
-	"blvd":      "BOULEVARD",
-	"bvd":       "BOULEVARD",
-	"close":     "CLOSE",
-	"cl":        "CLOSE",
-	"parade":    "PARADE",
-	"pde":       "PARADE",
-	"walk":      "WALK",
-	"parkway":   "PARKWAY",
-	"bypass":    "BYPASS",
-	"esplanade": "ESPLANADE",
-}
-
-// Suffixes in canonical display form (with a leading space) for stripping.
-var canonicalSuffixes = []string{
-	" ROAD", " RD", " STREET", " ST", " AVENUE", " AVE",
-	" DRIVE", " DR", " COURT", " CT", " CRESCENT", " CRES",
-	" TERRACE", " TCE", " LANE", " LN", " HIGHWAY", " HWY",
-	" BOULEVARD", " BLVD", " CLOSE", " CL", " PARADE", " PDE",
-	" WALK", " PARKWAY", " BYPASS", " ESPLANADE", " PLACE", " PL",
+	"street":     "STREET",
+	"st":         "STREET",
+	"str":        "STREET",
+	"road":       "ROAD",
+	"rd":         "ROAD",
+	"avenue":     "AVENUE",
+	"ave":        "AVENUE",
+	"av":         "AVENUE",
+	"drive":      "DRIVE",
+	"dr":         "DRIVE",
+	"drv":        "DRIVE",
+	"court":      "COURT",
+	"ct":         "COURT",
+	"place":      "PLACE",
+	"pl":         "PLACE",
+	"crescent":   "CRESCENT",
+	"cres":       "CRESCENT",
+	"cr":         "CRESCENT",
+	"terrace":    "TERRACE",
+	"tce":        "TERRACE",
+	"lane":       "LANE",
+	"ln":         "LANE",
+	"highway":    "HIGHWAY",
+	"hwy":        "HIGHWAY",
+	"boulevard":  "BOULEVARD",
+	"blvd":       "BOULEVARD",
+	"bvd":        "BOULEVARD",
+	"close":      "CLOSE",
+	"cl":         "CLOSE",
+	"parade":     "PARADE",
+	"pde":        "PARADE",
+	"walk":       "WALK",
+	"parkway":    "PARKWAY",
+	"bypass":     "BYPASS",
+	"esplanade":  "ESPLANADE",
+	"way":        "WAY",
+	"mews":       "MEWS",
+	"freeway":    "FREEWAY",
+	"fwy":        "FREEWAY",
+	"grove":      "GROVE",
+	"gr":         "GROVE",
+	"gve":        "GROVE",
+	"circuit":    "CIRCUIT",
+	"cct":        "CIRCUIT",
+	"square":     "SQUARE",
+	"sq":         "SQUARE",
+	"rise":       "RISE",
+	"gardens":    "GARDENS",
+	"gdns":       "GARDENS",
+	"track":      "TRACK",
+	"trk":        "TRACK",
+	"loop":       "LOOP",
+	"link":       "LINK",
+	"retreat":    "RETREAT",
+	"rtt":        "RETREAT",
+	"circle":     "CIRCLE",
+	"cir":        "CIRCLE",
+	"boulevarde": "BOULEVARD",
+	"crt":        "COURT",
+	"hway":       "HIGHWAY",
+	"pkwy":       "PARKWAY",
+	"esp":        "ESPLANADE",
+	"wk":         "WALK",
 }
 
 // IsStreetType reports whether the (upper-case) word is a known street type.
@@ -80,26 +99,24 @@ func ExpandLower(word string) string {
 	return strings.ToLower(word)
 }
 
-// StripSuffix removes a trailing street-type suffix from a name ("ROAD", " RD",
-// "STREET", ...). It is presentation-agnostic: it strips whatever suffix is
-// present, leaving the bare street name. A name with no suffix is unchanged.
+// StripSuffix removes a trailing street-type word, full or abbreviated, from a
+// name ("SYDNEY ROAD" and "SYDNEY RD" both give "SYDNEY"). The name must keep
+// at least one word other than THE: "THE ESPLANADE" and a bare "PARADE" are
+// names, not types, and are returned unchanged.
 func StripSuffix(s string) string {
-	up := strings.ToUpper(strings.TrimSpace(s))
-	for _, suf := range canonicalSuffixes {
-		if strings.HasSuffix(up, suf) {
-			return strings.TrimSpace(strings.TrimSuffix(up, suf))
-		}
+	up := strings.Join(strings.Fields(strings.ToUpper(s)), " ")
+	if !HasSuffix(up) {
+		return up
 	}
-	return up
+	return up[:strings.LastIndexByte(up, ' ')]
 }
 
-// HasSuffix reports whether a name carries a trailing street-type suffix.
+// HasSuffix reports whether a name ends in a street-type word that StripSuffix
+// would remove.
 func HasSuffix(s string) bool {
-	up := strings.ToUpper(strings.TrimSpace(s))
-	for _, suf := range canonicalSuffixes {
-		if strings.HasSuffix(up, suf) {
-			return true
-		}
+	words := strings.Fields(strings.ToUpper(s))
+	if len(words) < 2 || !IsStreetType(words[len(words)-1]) {
+		return false
 	}
-	return false
+	return len(words) > 2 || words[0] != "THE"
 }

@@ -102,7 +102,7 @@ func SuggestHandler(p *DBProvider) http.HandlerFunc {
 		}
 		// INV-1 (PR-7.5): the prefix is never logged, never a metric label,
 		// never cached. Only the suggestion count is recorded.
-		resp := Suggest(context.Background(), p.Get(), req)
+		resp := Suggest(r.Context(), p.Get(), req)
 		// Echo the contract version so the caller can verify which wire
 		// format it got (UX review finding #3).
 		w.Header().Set(contractVersionHeader, contractVersion)
@@ -130,7 +130,10 @@ func Suggest(ctx context.Context, db *sql.DB, req SuggestRequest) SuggestRespons
 			continue
 		}
 		// Prefix phrase: the index has prefix='2 3 4', so "ST*" matches STATION.
-		phrases = append(phrases, `"`+f+`"*`)
+		// A '"' inside an FTS5 string is written as '""'; left bare it ends the
+		// phrase early and the rest of the token is parsed as query syntax,
+		// which either errors or matches something the caller did not type.
+		phrases = append(phrases, `"`+strings.ReplaceAll(f, `"`, `""`)+`"*`)
 	}
 	if len(phrases) == 0 {
 		return SuggestResponse{}

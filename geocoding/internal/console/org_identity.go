@@ -563,7 +563,7 @@ func (s *Server) handleSSOMappingAdd(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.audit(r, oc.Org.ID, "mapping.add", c.Slug, "source=sso group="+m.Group+" role="+m.Role.String())
-	redirectFlash(w, r, back, "Added the mapping.")
+	redirectFlash(w, r, back, "Added the mapping. Members' roles follow it from their next sign-in.")
 }
 
 // deleteMapping removes a mapping only if it belongs to this org and matches
@@ -595,11 +595,27 @@ func (s *Server) deleteMapping(w http.ResponseWriter, r *http.Request, source st
 			s.notFound(w, r)
 			return
 		}
+		if errors.Is(err, identity.ErrLastOwner) {
+			redirectFlash(w, r, back, lastOwnerMappingMsg)
+			return
+		}
 		s.serverError(w, r, err)
 		return
 	}
 	s.audit(r, oc.Org.ID, "mapping.delete", target, "source="+source+" group="+found.Group+" role="+found.Role.String())
-	redirectFlash(w, r, back, "Removed the mapping.")
+	redirectFlash(w, r, back, "Removed the mapping. "+mappingEffect(source))
+}
+
+const lastOwnerMappingMsg = "That change would leave the organisation without an owner, so it was not made. Make someone else an owner first."
+
+// mappingEffect says when a mapping change reaches members' roles. SCIM
+// groups are stored here, so SCIM members are recomputed at once; SSO
+// groups are only known at sign-in.
+func mappingEffect(source string) string {
+	if source == identity.SourceSCIM {
+		return "Provisioned users' roles were updated."
+	}
+	return "Members' roles follow it from their next sign-in."
 }
 
 func (s *Server) handleSSOMappingDelete(w http.ResponseWriter, r *http.Request) {
@@ -691,12 +707,16 @@ func (s *Server) handleSCIMMappingAdd(w http.ResponseWriter, r *http.Request) {
 		redirectFlash(w, r, back, "That group already has a mapping.")
 		return
 	}
+	if errors.Is(err, identity.ErrLastOwner) {
+		redirectFlash(w, r, back, lastOwnerMappingMsg)
+		return
+	}
 	if err != nil {
 		s.serverError(w, r, err)
 		return
 	}
 	s.audit(r, oc.Org.ID, "mapping.add", "scim", "source=scim group="+m.Group+" role="+m.Role.String())
-	redirectFlash(w, r, back, "Added the mapping.")
+	redirectFlash(w, r, back, "Added the mapping. "+mappingEffect(identity.SourceSCIM))
 }
 
 func (s *Server) handleSCIMMappingDelete(w http.ResponseWriter, r *http.Request) {
@@ -720,6 +740,9 @@ type issuersData struct {
 	Issuers []identity.JWTIssuer
 	Form    issuerForm
 	APIBase string
+	// Shared marks issuers whose (issuer, audience) another org also
+	// registered; the other org is never named.
+	Shared map[int64]bool
 }
 
 func issuerToForm(j identity.JWTIssuer) issuerForm {
@@ -750,9 +773,11 @@ func readIssuer(r *http.Request) (identity.JWTIssuer, issuerForm, string) {
 func issuerErr(err error) string {
 	switch {
 	case errors.Is(err, identity.ErrConflict):
-		return "That issuer and audience are already registered."
+		return "This organisation already registered that issuer and audience."
 	case errors.Is(err, identity.ErrInvalid):
 		return "Check the fields and try again."
+	case errors.Is(err, identity.ErrTooManyIssuers):
+		return fmt.Sprintf("An organisation can register at most %d issuers. Remove one first.", identity.MaxJWTIssuersPerOrg)
 	}
 	return ""
 }
@@ -768,8 +793,13 @@ func (s *Server) issuersPage(w http.ResponseWriter, r *http.Request, status int,
 		s.serverError(w, r, err)
 		return
 	}
+	shared, err := s.IDs.SharedJWTIssuers(r.Context(), oc.Org.ID)
+	if err != nil {
+		s.serverError(w, r, err)
+		return
+	}
 	s.render(w, r, status, "org_tokens", Page{Title: "OAuth tokens", Active: "tokens", Error: errMsg,
-		Data: issuersData{Issuers: list, Form: form, APIBase: s.Cfg.PublicURL}})
+		Data: issuersData{Issuers: list, Form: form, APIBase: s.Cfg.PublicURL, Shared: shared}})
 }
 
 func (s *Server) handleIssuers(w http.ResponseWriter, r *http.Request) {

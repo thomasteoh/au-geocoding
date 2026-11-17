@@ -6,13 +6,11 @@ import (
 	"strings"
 )
 
-// ToGeoJSON converts a Polygon into a GeoJSON polygon string for geopoly.
+// ToGeoJSON converts one ring into a GeoJSON polygon string for geopoly.
 // Geopoly requires a single simple polygon (no self-intersections, no holes
-// in the same row). Shapefile polygons have an outer ring (parts[0]) plus
-// optional interior rings (parts[1:]). We emit each ring as a separate geopoly
-// row so containment queries work on all of them; the outer ring is the
-// locality boundary, interior rings are holes (islands) we keep as separate
-// polygons.
+// in the same row), so a shapefile polygon is stored ring by ring: outer rings
+// in boundary, holes in boundary_hole (see ClassifyRings and
+// schema.BoundarySchemaSQL).
 //
 // GeoJSON format: array of vertexes, each a [x,y] pair, first==last, CCW.
 // Geopoly expects coordinates as [X,Y] where X=longitude, Y=latitude in our

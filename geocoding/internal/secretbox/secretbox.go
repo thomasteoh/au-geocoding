@@ -6,7 +6,9 @@ package secretbox
 import (
 	"crypto/aes"
 	"crypto/cipher"
+	"crypto/hmac"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
 	"errors"
@@ -20,8 +22,12 @@ var ErrOpen = errors.New("secretbox: cannot open sealed value")
 
 const prefix = "v1:"
 
-// Box seals and opens values under one key.
-type Box struct{ aead cipher.AEAD }
+// Box seals and opens values under one key, and computes keyed hashes with
+// a subkey derived from it.
+type Box struct {
+	aead   cipher.AEAD
+	macKey []byte
+}
 
 // ParseKey accepts a 32-byte key as 64 hex characters or standard/raw
 // base64.
@@ -51,7 +57,17 @@ func New(key []byte) (*Box, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Box{aead: aead}, nil
+	mk := sha256.Sum256(append([]byte("augeo-mac\x00"), key...))
+	return &Box{aead: aead, macKey: mk[:]}, nil
+}
+
+// MAC is HMAC-SHA256 of msg under the box's MAC subkey: a stable identifier
+// for a value (such as an email address) that cannot be confirmed by
+// guessing without the deployment's secret key.
+func (b *Box) MAC(msg string) []byte {
+	m := hmac.New(sha256.New, b.macKey)
+	m.Write([]byte(msg))
+	return m.Sum(nil)
 }
 
 // Seal encrypts plaintext. The empty string seals to the empty string so an

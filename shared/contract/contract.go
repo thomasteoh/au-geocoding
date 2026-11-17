@@ -49,10 +49,24 @@ type Candidate struct {
 	Source string      `json:"source"` // "gnaf" | "osm"
 	Text   string      `json:"text"`   // full address or POI name — what the caller scores against
 
+	// Precision says what Point locates: a single address, or the centre of a
+	// street, locality or postcode when the query named nothing finer. Empty
+	// for POIs and from resolvers that predate the field.
+	Precision Precision `json:"precision,omitempty"`
+
 	// G-NAF only — distinct quality axes, never collapsed
 	GnafPID            string `json:"gnaf_pid,omitempty"`
 	GnafConfidence     int8   `json:"gnaf_confidence,omitempty"`     // -1..2, how many authorities contributed
 	GeocodeReliability int8   `json:"geocode_reliability,omitempty"` // 1..6, coordinate precision
+
+	// PostalDelivery is set when the query named a postal delivery point
+	// ("PO BOX 123", "GPO BOX 1", "LOCKED BAG 5", "PRIVATE BAG 2"). G-NAF has
+	// no location for one, so the candidate is the centre of the locality or
+	// postcode it was addressed to (Precision says which) and this field says
+	// why the answer is coarse: the text was not an unresolved street address.
+	// Canonical upper case. Additive within contract v1: callers that ignore
+	// it see an ordinary locality or postcode candidate.
+	PostalDelivery string `json:"postal_delivery,omitempty"`
 
 	// MatchScore is the caller-side similarity (0..1) — set by the geocoder's
 	// scoring phase, carried so ranking can use it without re-deriving.
@@ -67,6 +81,16 @@ type Candidate struct {
 	LocalityID LocalityID `json:"locality_id,omitempty"`
 	DistanceM  *float64   `json:"distance_m,omitempty"` // set when Anchor was supplied
 }
+
+// Precision is how specific a candidate's point is.
+type Precision string
+
+const (
+	PrecisionAddress  Precision = "address"  // one G-NAF address
+	PrecisionStreet   Precision = "street"   // centre of a street within a locality
+	PrecisionLocality Precision = "locality" // centre of a locality's addresses
+	PrecisionPostcode Precision = "postcode" // centre of a postcode's addresses
+)
 
 // Locality is a resolved locality name.
 type Locality struct {
@@ -85,6 +109,12 @@ type Locality struct {
 //
 // INV-2 still holds — these are address parts, not identity.
 type AddressComponents struct {
+	// Unit is the flat, unit, shop or suite number; Lot is the lot number of
+	// an address that has no street number. Both are matched against G-NAF's
+	// FLAT_NUMBER and LOT_NUMBER. Added within contract v1 (omitempty), so a
+	// caller or resolver that predates them is unaffected.
+	Unit         string `json:"unit,omitempty"`
+	Lot          string `json:"lot,omitempty"`
 	StreetNumber string `json:"street_number,omitempty"`
 	StreetName   string `json:"street_name,omitempty"`
 	StreetType   string `json:"street_type,omitempty"`
@@ -95,7 +125,7 @@ type AddressComponents struct {
 
 // Empty reports whether no component was supplied at all.
 func (c AddressComponents) Empty() bool {
-	return c.StreetNumber == "" && c.StreetName == "" && c.StreetType == "" &&
+	return c.Unit == "" && c.Lot == "" && c.StreetNumber == "" && c.StreetName == "" && c.StreetType == "" &&
 		c.Locality == "" && c.State == "" && c.Postcode == ""
 }
 
@@ -108,7 +138,13 @@ func (c AddressComponents) HasStreet() bool { return c.StreetName != "" }
 type ResolveRequest struct {
 	Kind     Kind     `json:"kind"`
 	Generate []string `json:"generate,omitempty"` // reliable tokens — candidate generation
-	Score    []string `json:"score,omitempty"`    // full normalised token set — returned for caller scoring
+	// Score is the full normalised token set, in query order — returned for
+	// caller scoring. Places reads the address parts from it by position, so
+	// a unit, lot or postal delivery point travels as its canonical words
+	// ("unit 2 36 ...", "lot 5 ...", "po box 123 ...") rather than in fields
+	// of its own: a resolver that predates them already parsed and dropped
+	// those words, so the request shape stays v1 in both directions.
+	Score []string `json:"score,omitempty"`
 
 	// Components is set when the caller supplied a structured address instead
 	// of free text. Places uses it for field-aware matching rather than

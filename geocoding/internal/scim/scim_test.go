@@ -363,16 +363,23 @@ func TestLinkExistingUser(t *testing.T) {
 	if r := f.do(t, f.tokA, "POST", "/Users", userBody("ops@acme.example", nil)); r.code != 400 {
 		t.Fatalf("platform admin linked: %d", r.code)
 	}
-	// An account with no other access links, keeps its name, and a
-	// deactivate leaves its manual membership alone.
+	// An account with no other access links and keeps its existing
+	// membership. Once linked, it is under this org's SCIM control: a
+	// deactivate removes the membership whatever its source.
 	solo, _ := f.ids.CreateUser(ctx, "solo@acme.example", "Original")
 	f.ids.SetMembership(ctx, f.orgA.ID, solo.ID, identity.RoleDeveloper, "manual")
 	r = f.do(t, f.tokA, "POST", "/Users", userBody("solo@acme.example", nil))
 	f.mustCode(t, r, 201)
 	id := r.body["id"].(string)
-	f.mustCode(t, f.do(t, f.tokA, "PATCH", "/Users/"+id, patch(map[string]any{"op": "replace", "value": map[string]any{"active": false}})), 200)
 	if f.role(t, f.orgA.ID, solo.Email) != identity.RoleDeveloper {
-		t.Fatal("SCIM deactivate removed a console-added membership")
+		t.Fatal("linking changed the existing membership")
+	}
+	f.mustCode(t, f.do(t, f.tokA, "PATCH", "/Users/"+id, patch(map[string]any{"op": "replace", "value": map[string]any{"active": false}})), 200)
+	if f.role(t, f.orgA.ID, solo.Email) != identity.RoleNone {
+		t.Fatal("SCIM deactivate left a linked user's console-added membership")
+	}
+	if u, _ := f.ids.UserByEmail(ctx, solo.Email); u.Status != identity.StatusDeprovisioned {
+		t.Fatalf("user left with no orgs not deprovisioned: %s", u.Status)
 	}
 }
 
@@ -622,14 +629,31 @@ func TestManualMembershipNotChanged(t *testing.T) {
 func TestLastOwner(t *testing.T) {
 	f := setup(t)
 	ctx := context.Background()
-	// Linking the org's manual owner and deactivating them leaves the
-	// owner membership in place: SCIM only removes what SCIM created.
+	// The org's manual owner, once linked, is under SCIM control, but as the
+	// last owner cannot be deactivated or deleted: 400, nothing changes.
 	owner := f.createUser(t, f.tokA, "owner@acme.example")
-	f.mustCode(t, f.do(t, f.tokA, "PATCH", "/Users/"+owner, patch(map[string]any{"op": "replace", "path": "active", "value": false})), 200)
-	f.mustCode(t, f.do(t, f.tokA, "DELETE", "/Users/"+owner, nil), 204)
-	if f.role(t, f.orgA.ID, "owner@acme.example") != identity.RoleOwner {
-		t.Fatal("owner removed through SCIM")
+	if r := f.do(t, f.tokA, "PATCH", "/Users/"+owner, patch(map[string]any{"op": "replace", "path": "active", "value": false})); r.code != 400 {
+		t.Fatalf("last owner deactivated: %d %v", r.code, r.body)
 	}
+	if r := f.do(t, f.tokA, "DELETE", "/Users/"+owner, nil); r.code != 400 {
+		t.Fatalf("last owner deleted: %d %v", r.code, r.body)
+	}
+	if f.role(t, f.orgA.ID, "owner@acme.example") != identity.RoleOwner {
+		t.Fatal("last owner removed through SCIM")
+	}
+	if g := f.do(t, f.tokA, "GET", "/Users/"+owner, nil); g.body["active"] != true {
+		t.Fatalf("refused deactivate was persisted: %v", g.body)
+	}
+	// With a second owner, deactivating the first removes them.
+	second, _ := f.ids.CreateUser(ctx, "second@acme.example", "")
+	f.ids.SetMembership(ctx, f.orgA.ID, second.ID, identity.RoleOwner, "manual")
+	f.mustCode(t, f.do(t, f.tokA, "PATCH", "/Users/"+owner, patch(map[string]any{"op": "replace", "path": "active", "value": false})), 200)
+	if f.role(t, f.orgA.ID, "owner@acme.example") != identity.RoleNone {
+		t.Fatal("deactivated owner kept the membership")
+	}
+	f.mustCode(t, f.do(t, f.tokA, "PATCH", "/Users/"+owner, patch(map[string]any{"op": "replace", "path": "active", "value": true})), 200)
+	f.ids.SetMembership(ctx, f.orgA.ID, f.ownerA.ID, identity.RoleOwner, "manual")
+	f.ids.RemoveMember(ctx, f.orgA.ID, second.ID)
 
 	// A SCIM-mapped owner becomes the last owner; removing them from the
 	// group is refused and changes nothing.

@@ -1,6 +1,9 @@
 # Prometheus scrape config for the au-system compose stack. Both services
 # expose /metrics (counters per endpoint/status, latency histogram, no
-# query-derived labels). Targets are compose service names.
+# query-derived labels). Targets are compose service names. augeo serves an
+# unauthenticated /metrics only on its internal metrics listener
+# (AUGEO_METRICS_ADDR=:9100, unpublished); /metrics on :8080 needs the ctrl
+# token.
 global:
   scrape_interval: 15s
   scrape_timeout: 10s
@@ -16,4 +19,4 @@ scrape_configs:
     metrics_path: /metrics
     static_configs:
       - targets:
-          - augeo:8080
+          - augeo:9100

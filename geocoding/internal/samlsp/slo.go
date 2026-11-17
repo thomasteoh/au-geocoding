@@ -24,6 +24,8 @@ import (
 	xrv "github.com/mattermost/xml-roundtrip-validator"
 	dsig "github.com/russellhaering/goxmldsig"
 	"github.com/russellhaering/goxmldsig/etreeutils"
+
+	"augeocoding/internal/identity"
 )
 
 // SAML single logout (docs/auth.md "SAML 2.0"). crewjam v0.5.1 signs
@@ -42,29 +44,33 @@ func SLOURL(publicURL, slug string) string {
 	return publicURL + "/auth/saml/" + url.PathEscape(slug) + "/slo"
 }
 
-// idpSLOLocation returns the IdP's HTTP-Redirect single logout endpoint and
-// where it wants responses (ResponseLocation, else Location).
-func idpSLOLocation(sp *saml.ServiceProvider) (loc, respLoc string) {
+// idpSLO returns the IdP's single logout endpoint: HTTP-Redirect if the
+// metadata publishes one, else HTTP-POST. respLoc is where it wants
+// responses (ResponseLocation, else Location).
+func idpSLO(sp *saml.ServiceProvider) (binding, loc, respLoc string) {
 	if sp.IDPMetadata == nil {
-		return "", ""
+		return "", "", ""
 	}
-	for _, d := range sp.IDPMetadata.IDPSSODescriptors {
-		for _, e := range d.SingleLogoutServices {
-			if e.Binding == saml.HTTPRedirectBinding && e.Location != "" {
-				respLoc = e.ResponseLocation
-				if respLoc == "" {
-					respLoc = e.Location
+	for _, want := range []string{saml.HTTPRedirectBinding, saml.HTTPPostBinding} {
+		for _, d := range sp.IDPMetadata.IDPSSODescriptors {
+			for _, e := range d.SingleLogoutServices {
+				if e.Binding == want && e.Location != "" {
+					respLoc = e.ResponseLocation
+					if respLoc == "" {
+						respLoc = e.Location
+					}
+					return want, e.Location, respLoc
 				}
-				return e.Location, respLoc
 			}
 		}
 	}
-	return "", ""
+	return "", "", ""
 }
 
-// HasSLO reports whether the IdP publishes an HTTP-Redirect SLO endpoint.
+// HasSLO reports whether the IdP publishes an HTTP-Redirect or HTTP-POST
+// SLO endpoint.
 func HasSLO(sp *saml.ServiceProvider) bool {
-	loc, _ := idpSLOLocation(sp)
+	_, loc, _ := idpSLO(sp)
 	return loc != ""
 }
 
@@ -78,35 +84,101 @@ func spIssuer(sp *saml.ServiceProvider) *saml.Issuer {
 	return &saml.Issuer{Format: "urn:oasis:names:tc:SAML:2.0:nameid-format:entity", Value: sp.EntityID}
 }
 
-// LogoutRequestURL returns the IdP HTTP-Redirect SLO URL carrying a
-// LogoutRequest for nameID (and sessionIndex, if known), signed in the query
-// with the SP key.
-func LogoutRequestURL(sp *saml.ServiceProvider, nameID, sessionIndex string) (string, error) {
-	loc, _ := idpSLOLocation(sp)
+// Outbound is a signed logout message ready to send to the IdP.
+//
+// For HTTP-Redirect, URL is the full IdP URL with the message signed in the
+// query. For HTTP-POST, URL is the form action and Param (SAMLRequest or
+// SAMLResponse), Value (base64 XML with an enveloped signature) and
+// RelayState are the form fields.
+type Outbound struct {
+	ID         string
+	Binding    string
+	URL        string
+	Param      string
+	Value      string
+	RelayState string
+}
+
+// LogoutRequest builds a signed LogoutRequest for nameID, carrying the
+// NameID format and qualifiers from the assertion (strict IdPs such as ADFS
+// match on them) and sessionIndex, if known. Its ID is what the IdP's
+// LogoutResponse must answer.
+func LogoutRequest(sp *saml.ServiceProvider, nameID string, q identity.NameIDQualifiers, sessionIndex string) (*Outbound, error) {
+	binding, loc, _ := idpSLO(sp)
 	if loc == "" {
-		return "", errors.New("IdP has no HTTP-Redirect single logout endpoint")
+		return nil, errors.New("IdP has no single logout endpoint")
 	}
 	if nameID == "" {
-		return "", errors.New("no NameID to log out")
+		return nil, errors.New("no NameID to log out")
 	}
 	req := &saml.LogoutRequest{ID: newID(), Version: "2.0", IssueInstant: saml.TimeNow(), Destination: loc,
-		Issuer: spIssuer(sp), NameID: &saml.NameID{Value: nameID}}
+		Issuer: spIssuer(sp), NameID: &saml.NameID{Value: nameID, Format: q.Format,
+			NameQualifier: q.NameQualifier, SPNameQualifier: q.SPNameQualifier}}
 	if sessionIndex != "" {
 		req.SessionIndex = &saml.SessionIndex{Value: sessionIndex}
 	}
-	return redirectURL(sp, loc, "SAMLRequest", req.Element(), "")
+	return outbound(sp, binding, loc, "SAMLRequest", req.ID, req.Element(), "")
 }
 
-// LogoutResponseURL returns the IdP HTTP-Redirect SLO URL carrying a
-// successful LogoutResponse to the request inResponseTo, signed in the query.
-func LogoutResponseURL(sp *saml.ServiceProvider, inResponseTo, relayState string) (string, error) {
-	_, loc := idpSLOLocation(sp)
+// LogoutResponse builds a signed, successful LogoutResponse to the request
+// inResponseTo, echoing relayState.
+func LogoutResponse(sp *saml.ServiceProvider, inResponseTo, relayState string) (*Outbound, error) {
+	binding, _, loc := idpSLO(sp)
 	if loc == "" {
-		return "", errors.New("IdP has no HTTP-Redirect single logout endpoint")
+		return nil, errors.New("IdP has no single logout endpoint")
 	}
 	resp := &saml.LogoutResponse{ID: newID(), InResponseTo: inResponseTo, Version: "2.0", IssueInstant: saml.TimeNow(),
 		Destination: loc, Issuer: spIssuer(sp), Status: saml.Status{StatusCode: saml.StatusCode{Value: saml.StatusSuccess}}}
-	return redirectURL(sp, loc, "SAMLResponse", resp.Element(), relayState)
+	return outbound(sp, binding, loc, "SAMLResponse", resp.ID, resp.Element(), relayState)
+}
+
+func outbound(sp *saml.ServiceProvider, binding, loc, param, id string, el *etree.Element, relayState string) (*Outbound, error) {
+	out := &Outbound{ID: id, Binding: binding}
+	var err error
+	if binding == saml.HTTPRedirectBinding {
+		out.URL, err = redirectURL(sp, loc, param, el, relayState)
+		return out, err
+	}
+	// The console CSP allows form posts to https: only.
+	u, err := url.Parse(loc)
+	if err != nil || u.Scheme != "https" || u.Host == "" {
+		return nil, errors.New("IdP HTTP-POST single logout URL is not https")
+	}
+	if out.Value, err = postValue(sp, el); err != nil {
+		return nil, err
+	}
+	out.URL, out.Param, out.RelayState = loc, param, relayState
+	return out, nil
+}
+
+// postValue signs el with an enveloped XML signature for the HTTP-POST
+// binding (bindings 3.5.4) and returns it base64-encoded. The Signature is
+// moved to follow Issuer, where the schema puts it; the enveloped-signature
+// transform makes its position irrelevant to the digest.
+func postValue(sp *saml.ServiceProvider, el *etree.Element) (string, error) {
+	sc, err := saml.GetSigningContext(sp)
+	if err != nil {
+		return "", err
+	}
+	signed, err := sc.SignEnveloped(el)
+	if err != nil {
+		return "", err
+	}
+	if n := len(signed.Child); n > 0 {
+		if sig, ok := signed.Child[n-1].(*etree.Element); ok && sig.Tag == "Signature" {
+			if iss := signed.FindElement("./Issuer"); iss != nil {
+				signed.RemoveChildAt(n - 1)
+				signed.InsertChildAt(iss.Index()+1, sig)
+			}
+		}
+	}
+	doc := etree.NewDocument()
+	doc.SetRoot(signed)
+	raw, err := doc.WriteToBytes()
+	if err != nil {
+		return "", err
+	}
+	return base64.StdEncoding.EncodeToString(raw), nil
 }
 
 // redirectURL encodes el for the HTTP-Redirect binding (DEFLATE, base64) and
@@ -149,6 +221,27 @@ func redirectURL(sp *saml.ServiceProvider, dest, param string, el *etree.Element
 	return u.String(), nil
 }
 
+// RejectError is why ParseLogout refused a message: Code is a short reason
+// for the audit log; the message is for logs. Neither includes the XML.
+type RejectError struct {
+	Code string
+	msg  string
+}
+
+func (e *RejectError) Error() string { return e.msg }
+
+func reject(code, msg string) error { return &RejectError{Code: code, msg: msg} }
+
+// RejectCode returns the reason code of a ParseLogout error ("invalid" if
+// it has none).
+func RejectCode(err error) string {
+	var re *RejectError
+	if errors.As(err, &re) {
+		return re.Code
+	}
+	return "invalid"
+}
+
 // LogoutMessage is a verified logout message from the IdP: exactly one of
 // Request (IdP-initiated) and Response (to an SP-initiated request) is set.
 type LogoutMessage struct {
@@ -182,10 +275,10 @@ func ParseLogout(sp *saml.ServiceProvider, r *http.Request) (*LogoutMessage, err
 			param = "SAMLResponse"
 		}
 		if _, ok := q["SAMLRequest"]; ok == (param == "SAMLResponse") {
-			return nil, errors.New("need exactly one of SAMLRequest and SAMLResponse")
+			return nil, reject("malformed", "need exactly one of SAMLRequest and SAMLResponse")
 		}
 		if m.RelayState, err = url.QueryUnescape(q["RelayState"]); err != nil {
-			return nil, errors.New("bad RelayState")
+			return nil, reject("malformed", "bad RelayState")
 		}
 		if _, ok := q["Signature"]; ok {
 			if err := verifyQuery(certs, q, param); err != nil {
@@ -195,39 +288,39 @@ func ParseLogout(sp *saml.ServiceProvider, r *http.Request) (*LogoutMessage, err
 		}
 		v, err := url.QueryUnescape(q[param])
 		if err != nil {
-			return nil, errors.New("bad message encoding")
+			return nil, reject("malformed", "bad message encoding")
 		}
 		if raw, err = inflate(v); err != nil {
 			return nil, err
 		}
 	case http.MethodPost:
 		if err := r.ParseForm(); err != nil {
-			return nil, errors.New("unreadable form")
+			return nil, reject("malformed", "unreadable form")
 		}
 		v := r.PostForm.Get("SAMLRequest")
 		if r.PostForm.Get("SAMLResponse") != "" {
 			if v != "" {
-				return nil, errors.New("need exactly one of SAMLRequest and SAMLResponse")
+				return nil, reject("malformed", "need exactly one of SAMLRequest and SAMLResponse")
 			}
 			v = r.PostForm.Get("SAMLResponse")
 		}
 		m.RelayState = r.PostForm.Get("RelayState")
 		if raw, err = base64.StdEncoding.DecodeString(v); err != nil || len(raw) == 0 {
-			return nil, errors.New("message is missing or not base64")
+			return nil, reject("malformed", "message is missing or not base64")
 		}
 	default:
-		return nil, errors.New("method not allowed")
+		return nil, reject("method", "method not allowed")
 	}
 	if len(m.RelayState) > maxRelayState {
-		return nil, errors.New("RelayState too long")
+		return nil, reject("malformed", "RelayState too long")
 	}
 
 	if err := xrv.Validate(bytes.NewReader(raw)); err != nil {
-		return nil, errors.New("message XML does not round-trip")
+		return nil, reject("malformed", "message XML does not round-trip")
 	}
 	doc := etree.NewDocument()
 	if err := doc.ReadFromBytes(raw); err != nil || doc.Root() == nil {
-		return nil, errors.New("message is not XML")
+		return nil, reject("malformed", "message is not XML")
 	}
 	el := doc.Root()
 	if !querySigned {
@@ -238,7 +331,7 @@ func ParseLogout(sp *saml.ServiceProvider, r *http.Request) (*LogoutMessage, err
 	}
 	ns := el.NamespaceURI()
 	if ns != protocolNS {
-		return nil, errors.New("not a SAML protocol message")
+		return nil, reject("malformed", "not a SAML protocol message")
 	}
 	b, err := elementBytes(el)
 	if err != nil {
@@ -249,53 +342,53 @@ func ParseLogout(sp *saml.ServiceProvider, r *http.Request) (*LogoutMessage, err
 	case "LogoutRequest":
 		var req saml.LogoutRequest
 		if err := xml.Unmarshal(b, &req); err != nil {
-			return nil, errors.New("malformed LogoutRequest")
+			return nil, reject("malformed", "malformed LogoutRequest")
 		}
 		if err := checkCommon(sp, req.Version, req.Issuer, req.Destination, req.IssueInstant, now); err != nil {
 			return nil, err
 		}
 		if req.ID == "" {
-			return nil, errors.New("LogoutRequest has no ID")
+			return nil, reject("malformed", "LogoutRequest has no ID")
 		}
 		if req.NotOnOrAfter != nil && !now.Before(req.NotOnOrAfter.Add(saml.MaxClockSkew)) {
-			return nil, errors.New("LogoutRequest has expired (NotOnOrAfter)")
+			return nil, reject("expired", "LogoutRequest has expired (NotOnOrAfter)")
 		}
 		if req.NameID == nil || strings.TrimSpace(req.NameID.Value) == "" {
-			return nil, errors.New("LogoutRequest has no NameID")
+			return nil, reject("malformed", "LogoutRequest has no NameID")
 		}
 		m.Request = &req
 	case "LogoutResponse":
 		var resp saml.LogoutResponse
 		if err := xml.Unmarshal(b, &resp); err != nil {
-			return nil, errors.New("malformed LogoutResponse")
+			return nil, reject("malformed", "malformed LogoutResponse")
 		}
 		if err := checkCommon(sp, resp.Version, resp.Issuer, resp.Destination, resp.IssueInstant, now); err != nil {
 			return nil, err
 		}
 		if resp.Status.StatusCode.Value != saml.StatusSuccess {
-			return nil, fmt.Errorf("logout status %q", resp.Status.StatusCode.Value)
+			return nil, reject("status_not_success", fmt.Sprintf("logout status %q", resp.Status.StatusCode.Value))
 		}
 		m.Response = &resp
 	default:
-		return nil, errors.New("not a logout message")
+		return nil, reject("malformed", "not a logout message")
 	}
 	return m, nil
 }
 
 func checkCommon(sp *saml.ServiceProvider, version string, iss *saml.Issuer, dest string, issued, now time.Time) error {
 	if version != "2.0" {
-		return errors.New("not SAML 2.0")
+		return reject("malformed", "not SAML 2.0")
 	}
 	if iss == nil || strings.TrimSpace(iss.Value) != sp.IDPMetadata.EntityID {
-		return errors.New("issuer is not the IdP")
+		return reject("wrong_issuer", "issuer is not the IdP")
 	}
 	// Signed messages must carry a Destination (bindings 3.4.5.2, 3.5.5.2).
 	if dest != sp.SloURL.String() {
-		return errors.New("destination is not this SLO URL")
+		return reject("wrong_destination", "destination is not this SLO URL")
 	}
 	if issued.IsZero() || issued.After(now.Add(saml.MaxClockSkew)) ||
 		issued.Add(saml.MaxIssueDelay+saml.MaxClockSkew).Before(now) {
-		return errors.New("IssueInstant out of range")
+		return reject("stale", "IssueInstant out of range")
 	}
 	return nil
 }
@@ -311,10 +404,10 @@ func rawQuery(q string) (map[string]string, error) {
 		k, v, _ := strings.Cut(kv, "=")
 		k, err := url.QueryUnescape(k)
 		if err != nil {
-			return nil, errors.New("bad query")
+			return nil, reject("malformed", "bad query")
 		}
 		if _, dup := out[k]; dup {
-			return nil, errors.New("repeated query parameter")
+			return nil, reject("malformed", "repeated query parameter")
 		}
 		out[k] = v
 	}
@@ -332,19 +425,19 @@ var sigHashes = map[string]crypto.Hash{
 func verifyQuery(certs []*x509.Certificate, q map[string]string, param string) error {
 	alg, err := url.QueryUnescape(q["SigAlg"])
 	if err != nil {
-		return errors.New("bad SigAlg")
+		return reject("bad_signature", "bad SigAlg")
 	}
 	h, ok := sigHashes[alg]
 	if !ok {
-		return errors.New("unsupported or missing SigAlg")
+		return reject("bad_signature", "unsupported or missing SigAlg")
 	}
 	sigB64, err := url.QueryUnescape(q["Signature"])
 	if err != nil {
-		return errors.New("bad Signature")
+		return reject("bad_signature", "bad Signature")
 	}
 	sig, err := base64.StdEncoding.DecodeString(sigB64)
 	if err != nil || len(sig) == 0 {
-		return errors.New("bad Signature")
+		return reject("bad_signature", "bad Signature")
 	}
 	signed := param + "=" + q[param]
 	if rs, ok := q["RelayState"]; ok {
@@ -359,14 +452,14 @@ func verifyQuery(certs []*x509.Certificate, q map[string]string, param string) e
 			return nil
 		}
 	}
-	return errors.New("query signature does not verify against the IdP's certificates")
+	return reject("bad_signature", "query signature does not verify against the IdP's certificates")
 }
 
 // verifyXML checks an enveloped signature on the root element and returns
 // the verified element.
 func verifyXML(certs []*x509.Certificate, el *etree.Element) (*etree.Element, error) {
 	if el.FindElement("./Signature") == nil {
-		return nil, errors.New("message is not signed")
+		return nil, reject("unsigned", "message is not signed")
 	}
 	// As crewjam does: with no certificate in KeyInfo, drop KeyInfo so the
 	// metadata certificates are used.
@@ -385,7 +478,7 @@ func verifyXML(certs []*x509.Certificate, el *etree.Element) (*etree.Element, er
 		el, err = etreeutils.NSDetatch(ctx, el)
 	}
 	if err != nil {
-		return nil, errors.New("bad XML namespaces")
+		return nil, reject("bad_signature", "bad XML namespaces")
 	}
 	vc := dsig.NewDefaultValidationContext(&dsig.MemoryX509CertificateStore{Roots: certs})
 	vc.IdAttribute = "ID"
@@ -394,7 +487,7 @@ func verifyXML(certs []*x509.Certificate, el *etree.Element) (*etree.Element, er
 	}
 	out, err := vc.Validate(el)
 	if err != nil {
-		return nil, fmt.Errorf("XML signature: %v", err)
+		return nil, reject("bad_signature", "XML signature: "+err.Error())
 	}
 	return out, nil
 }
@@ -402,14 +495,14 @@ func verifyXML(certs []*x509.Certificate, el *etree.Element) (*etree.Element, er
 func inflate(b64 string) ([]byte, error) {
 	z, err := base64.StdEncoding.DecodeString(b64)
 	if err != nil || len(z) == 0 {
-		return nil, errors.New("message is missing or not base64")
+		return nil, reject("malformed", "message is missing or not base64")
 	}
 	raw, err := io.ReadAll(io.LimitReader(flate.NewReader(bytes.NewReader(z)), MaxResponseBytes+1))
 	if err != nil {
-		return nil, errors.New("message is not DEFLATE")
+		return nil, reject("malformed", "message is not DEFLATE")
 	}
 	if len(raw) > MaxResponseBytes {
-		return nil, errors.New("message too large")
+		return nil, reject("malformed", "message too large")
 	}
 	return raw, nil
 }
@@ -425,7 +518,7 @@ var spaceRe = regexp.MustCompile(`\s+`)
 // idpSigningCerts returns the IdP's signing certificates from its metadata.
 func idpSigningCerts(ed *saml.EntityDescriptor) ([]*x509.Certificate, error) {
 	if ed == nil {
-		return nil, errors.New("no IdP metadata")
+		return nil, reject("idp_metadata", "no IdP metadata")
 	}
 	var certs []*x509.Certificate
 	for _, d := range ed.IDPSSODescriptors {
@@ -436,18 +529,18 @@ func idpSigningCerts(ed *saml.EntityDescriptor) ([]*x509.Certificate, error) {
 			for _, xc := range kd.KeyInfo.X509Data.X509Certificates {
 				der, err := base64.StdEncoding.DecodeString(spaceRe.ReplaceAllString(xc.Data, ""))
 				if err != nil {
-					return nil, errors.New("bad IdP certificate")
+					return nil, reject("idp_metadata", "bad IdP certificate")
 				}
 				c, err := x509.ParseCertificate(der)
 				if err != nil {
-					return nil, errors.New("bad IdP certificate")
+					return nil, reject("idp_metadata", "bad IdP certificate")
 				}
 				certs = append(certs, c)
 			}
 		}
 	}
 	if len(certs) == 0 {
-		return nil, errors.New("IdP metadata has no signing certificate")
+		return nil, reject("idp_metadata", "IdP metadata has no signing certificate")
 	}
 	return certs, nil
 }

@@ -1,0 +1,13 @@
+# Victorian postcodes that hold only post office boxes (or reply paid), with no
+# street address in G-NAF and no ABS postal area, mapped to the G-NAF locality
+# they are delivered at. Each row was checked against the source URL on the
+# retrieved date; add a row only from a source you have read, and only when the
+# source names a G-NAF locality (Australia Post names many CBD box postcodes
+# after their post office, e.g. 8003 COLLINS STREET EAST, which are left out).
+# Columns are tab-separated:
+# postcode	locality	state	category	details	source_url	retrieved
+3001	MELBOURNE	VIC	Post Office Boxes	GPO Boxes	https://auspost.com.au/postcode/3001	2026-11-18
+8001	MELBOURNE	VIC	Post Office Boxes	PO Boxes	https://auspost.com.au/postcode/8001	2026-11-18
+8002	EAST MELBOURNE	VIC	Post Office Boxes	PO Boxes	https://auspost.com.au/postcode/8002	2026-11-18
+8012	DOCKLANDS	VIC	Post Office Boxes	PO Boxes	https://auspost.com.au/postcode/8012	2026-11-18
+8060	MELBOURNE	VIC	Post Office Boxes	Reply Paid	https://auspost.com.au/postcode/8060	2026-11-18

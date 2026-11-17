@@ -220,6 +220,80 @@ CREATE INDEX idx_audit_org_ts ON audit_events(org_id, ts);
 `,
 	// 2: Entra tenant allowlist on connections.
 	`ALTER TABLE connections ADD COLUMN allowed_tenants TEXT NOT NULL DEFAULT '';`,
+	// 3: connections a session has signed in through (per-org SSO proofs).
+	`CREATE TABLE session_proofs (
+	id_hash       BLOB NOT NULL REFERENCES sessions(id_hash) ON DELETE CASCADE,
+	connection_id INTEGER NOT NULL REFERENCES connections(id) ON DELETE CASCADE,
+	created       TEXT NOT NULL,
+	PRIMARY KEY (id_hash, connection_id)
+);
+CREATE INDEX idx_session_proofs_conn ON session_proofs(connection_id);`,
+	// 4: SAML NameID format and qualifiers (JSON) for LogoutRequest, and
+	// lookup of SAML logout flows by request ID.
+	`ALTER TABLE sessions ADD COLUMN idp_sub_qual TEXT NOT NULL DEFAULT '';
+CREATE INDEX idx_auth_flows_request ON auth_flows(request_id);`,
+	// 5: outbound mail queue (invite emails). recipient and body are blanked
+	// once a message is sent or has finally failed; the row stays a while
+	// (with the recipient hash) for rate limiting.
+	`
+CREATE TABLE mail_outbox (
+	id             INTEGER PRIMARY KEY AUTOINCREMENT,
+	org_id         INTEGER REFERENCES orgs(id) ON DELETE CASCADE,
+	kind           TEXT NOT NULL,
+	recipient      TEXT NOT NULL,
+	recipient_hash BLOB NOT NULL,
+	subject        TEXT NOT NULL,
+	body           TEXT NOT NULL,
+	status         TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','sent','failed')),
+	attempts       INTEGER NOT NULL DEFAULT 0,
+	next_attempt   TEXT NOT NULL,
+	last_error     TEXT NOT NULL DEFAULT '',
+	created        TEXT NOT NULL,
+	updated        TEXT NOT NULL
+);
+CREATE INDEX idx_mail_outbox_due ON mail_outbox(status, next_attempt);
+CREATE INDEX idx_mail_outbox_org ON mail_outbox(org_id, created);
+CREATE INDEX idx_mail_outbox_rcpt ON mail_outbox(recipient_hash, created);
+-- StartFlow prunes expired flows on every call.
+CREATE INDEX idx_auth_flows_expires ON auth_flows(expires);
+`,
+	// 6: IdP session on proofs (so IdP logout revokes carried proofs) and
+	// the org connections a passkey was registered under (break-glass).
+	`ALTER TABLE session_proofs ADD COLUMN idp_sid TEXT NOT NULL DEFAULT '';
+ALTER TABLE session_proofs ADD COLUMN idp_sub TEXT NOT NULL DEFAULT '';
+CREATE TABLE passkey_proofs (
+	passkey_id    INTEGER NOT NULL REFERENCES passkeys(id) ON DELETE CASCADE,
+	connection_id INTEGER NOT NULL REFERENCES connections(id) ON DELETE CASCADE,
+	PRIMARY KEY (passkey_id, connection_id)
+);`,
+	// 7: tenant abuse limits. orgs.created_by counts the orgs a user created
+	// (AUGEO_AUTH_MAX_ORGS_PER_USER); mail_outbox.sender_id bounds invite
+	// emails per inviting user; JWT issuer registrations are unique per org,
+	// not globally, so no org can squat an (issuer, audience) another org
+	// needs (a pair registered by two orgs is refused as ambiguous).
+	`
+ALTER TABLE orgs ADD COLUMN created_by INTEGER REFERENCES users(id) ON DELETE SET NULL;
+CREATE INDEX idx_orgs_created_by ON orgs(created_by);
+ALTER TABLE mail_outbox ADD COLUMN sender_id INTEGER;
+CREATE INDEX idx_mail_outbox_sender ON mail_outbox(sender_id, created);
+CREATE TABLE jwt_issuers_v7 (
+	id               INTEGER PRIMARY KEY AUTOINCREMENT,
+	org_id           INTEGER NOT NULL REFERENCES orgs(id) ON DELETE CASCADE,
+	issuer           TEXT NOT NULL,
+	audience         TEXT NOT NULL,
+	jwks_url         TEXT NOT NULL DEFAULT '',
+	scope_prefix     TEXT NOT NULL DEFAULT '',
+	allowed_subjects TEXT NOT NULL DEFAULT '',
+	enabled          INTEGER NOT NULL DEFAULT 1,
+	created          TEXT NOT NULL,
+	UNIQUE (org_id, issuer, audience)
+);
+INSERT INTO jwt_issuers_v7(id, org_id, issuer, audience, jwks_url, scope_prefix, allowed_subjects, enabled, created)
+	SELECT id, org_id, issuer, audience, jwks_url, scope_prefix, allowed_subjects, enabled, created FROM jwt_issuers;
+DROP TABLE jwt_issuers;
+ALTER TABLE jwt_issuers_v7 RENAME TO jwt_issuers;
+CREATE INDEX idx_jwt_issuers_iss ON jwt_issuers(issuer, audience);
+`,
 }
 
 func migrate(db *sql.DB) error {

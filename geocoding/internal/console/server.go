@@ -21,7 +21,6 @@ import (
 	"time"
 
 	"augeocoding/internal/identity"
-	"augeocoding/internal/mail"
 	"augeocoding/internal/oidcrp"
 	"augeocoding/internal/publicapi"
 	"ausystem/shared/slog"
@@ -35,6 +34,10 @@ type Config struct {
 	PublicURL string // origin, no trailing slash
 	Session   identity.SessionPolicy
 	Login     identity.LoginPolicy
+	// MaxOrgsPerUser caps the non-personal orgs one user may create
+	// (AUGEO_AUTH_MAX_ORGS_PER_USER); 0 means no cap. Platform admins are
+	// exempt.
+	MaxOrgsPerUser int
 }
 
 // Server serves the console.
@@ -49,8 +52,17 @@ type Server struct {
 	HTTP *http.Client
 	// LookupTXT resolves DNS TXT records for domain verification.
 	LookupTXT func(ctx context.Context, name string) ([]string, error)
-	// Mail sends invite emails; mail.Nop when SMTP is not configured.
-	Mail mail.Sender
+	// MailOn queues invite emails in the mail outbox (SMTP is configured
+	// and the outbox worker runs). MailWake, if set, nudges the worker
+	// after an enqueue.
+	MailOn   bool
+	MailWake func()
+	// ClientIP returns the client address for rate limiting (trusted-proxy
+	// aware, set by main). Nil uses the TCP peer.
+	ClientIP func(*http.Request) string
+	// AuthLimiter rate limits the anonymous sign-in endpoints per client
+	// IP. Nil disables the limit.
+	AuthLimiter *publicapi.RateLimiter
 
 	pages  map[string]*template.Template
 	origin string
@@ -63,7 +75,7 @@ func New(cfg Config, ids *identity.Store, keys *publicapi.Store, rp *oidcrp.RP, 
 		return nil, fmt.Errorf("console: bad public URL %q", cfg.PublicURL)
 	}
 	s := &Server{Cfg: cfg, IDs: ids, Keys: keys, RP: rp, Log: log, HTTP: httpClient, origin: u.Scheme + "://" + u.Host,
-		LookupTXT: net.DefaultResolver.LookupTXT, Mail: mail.Nop{}}
+		LookupTXT: net.DefaultResolver.LookupTXT}
 	if err := s.loadTemplates(); err != nil {
 		return nil, err
 	}
@@ -77,19 +89,22 @@ func (s *Server) Register(mux *http.ServeMux) {
 
 	// Sign-in.
 	mux.Handle("GET /auth/login", s.secure(s.withViewer(http.HandlerFunc(s.handleLogin))))
-	mux.Handle("POST /auth/discover", s.secure(s.checkOrigin(http.HandlerFunc(s.handleDiscover))))
-	mux.Handle("GET /auth/oidc/{conn}/start", s.secure(http.HandlerFunc(s.handleOIDCStart)))
-	mux.Handle("GET /auth/oidc/callback", s.secure(http.HandlerFunc(s.handleOIDCCallback)))
-	mux.Handle("POST /auth/oidc/{conn}/backchannel-logout", http.HandlerFunc(s.handleBackchannelLogout))
+	// Anonymous sign-in endpoints are rate limited per client IP (rl):
+	// each start writes an auth_flows row and may fetch IdP metadata.
+	rl := s.authRateLimit
+	mux.Handle("POST /auth/discover", s.secure(rl(s.checkOrigin(http.HandlerFunc(s.handleDiscover)))))
+	mux.Handle("GET /auth/oidc/{conn}/start", s.secure(rl(http.HandlerFunc(s.handleOIDCStart))))
+	mux.Handle("GET /auth/oidc/callback", s.secure(rl(http.HandlerFunc(s.handleOIDCCallback))))
+	mux.Handle("POST /auth/oidc/{conn}/backchannel-logout", rl(http.HandlerFunc(s.handleBackchannelLogout)))
 	mux.Handle("GET /auth/saml/{conn}/metadata", http.HandlerFunc(s.handleSAMLMetadata))
-	mux.Handle("GET /auth/saml/{conn}/start", s.secure(http.HandlerFunc(s.handleSAMLStart)))
-	mux.Handle("POST /auth/oidc/{conn}/start", s.secure(s.checkOrigin(http.HandlerFunc(s.handleOIDCStart))))
-	mux.Handle("POST /auth/saml/{conn}/start", s.secure(s.checkOrigin(http.HandlerFunc(s.handleSAMLStart))))
-	mux.Handle("POST /auth/saml/{conn}/acs", s.secure(http.HandlerFunc(s.handleSAMLACS)))
-	mux.Handle("GET /auth/saml/{conn}/slo", s.secure(http.HandlerFunc(s.handleSAMLSLO)))
-	mux.Handle("POST /auth/saml/{conn}/slo", s.secure(http.HandlerFunc(s.handleSAMLSLO)))
-	mux.Handle("POST /auth/passkey/login/begin", s.secure(s.checkOrigin(http.HandlerFunc(s.handlePasskeyLoginBegin))))
-	mux.Handle("POST /auth/passkey/login/finish", s.secure(s.checkOrigin(http.HandlerFunc(s.handlePasskeyLoginFinish))))
+	mux.Handle("GET /auth/saml/{conn}/start", s.secure(rl(http.HandlerFunc(s.handleSAMLStart))))
+	mux.Handle("POST /auth/oidc/{conn}/start", s.secure(rl(s.checkOrigin(http.HandlerFunc(s.handleOIDCStart)))))
+	mux.Handle("POST /auth/saml/{conn}/start", s.secure(rl(s.checkOrigin(http.HandlerFunc(s.handleSAMLStart)))))
+	mux.Handle("POST /auth/saml/{conn}/acs", s.secure(rl(http.HandlerFunc(s.handleSAMLACS))))
+	mux.Handle("GET /auth/saml/{conn}/slo", s.secure(rl(http.HandlerFunc(s.handleSAMLSLO))))
+	mux.Handle("POST /auth/saml/{conn}/slo", s.secure(rl(http.HandlerFunc(s.handleSAMLSLO))))
+	mux.Handle("POST /auth/passkey/login/begin", s.secure(rl(s.checkOrigin(http.HandlerFunc(s.handlePasskeyLoginBegin)))))
+	mux.Handle("POST /auth/passkey/login/finish", s.secure(rl(s.checkOrigin(http.HandlerFunc(s.handlePasskeyLoginFinish)))))
 	mux.Handle("POST /auth/logout", s.secure(s.withViewer(s.requireUser(s.checkCSRF(http.HandlerFunc(s.handleLogout))))))
 
 	// Console.
@@ -98,16 +113,18 @@ func (s *Server) Register(mux *http.ServeMux) {
 	mux.Handle("GET /console", user(s.handleHome))
 	mux.Handle("GET /console/{$}", user(s.handleHome))
 	mux.Handle("POST /console/orgs", userPost(s.handleCreateOrg))
+	mux.Handle("POST /console/invites/{id}/accept", userPost(s.handleInviteAccept))
+	mux.Handle("POST /console/invites/{id}/decline", userPost(s.handleInviteDecline))
 
 	// Account.
 	mux.Handle("GET /console/account", user(s.handleAccount))
 	mux.Handle("POST /console/account/profile", userPost(s.handleAccountProfile))
 	mux.Handle("POST /console/account/sessions/revoke", userPost(s.handleRevokeSession))
 	mux.Handle("POST /console/account/sessions/revoke-others", userPost(s.handleRevokeOtherSessions))
-	mux.Handle("POST /console/account/passkeys/register/begin", userPost(s.handlePasskeyRegisterBegin))
+	mux.Handle("POST /console/account/passkeys/register/begin", rl(userPost(s.handlePasskeyRegisterBegin)))
 	mux.Handle("POST /console/account/passkeys/register/finish", userPost(s.handlePasskeyRegisterFinish))
 	mux.Handle("POST /console/account/passkeys/{id}/delete", userPost(s.handlePasskeyDelete))
-	mux.Handle("POST /console/account/links/{conn}", userPost(s.handleLinkStart))
+	mux.Handle("POST /console/account/links/{conn}", rl(userPost(s.handleLinkStart)))
 	mux.Handle("POST /console/account/identities/{id}/unlink", userPost(s.handleUnlink))
 
 	s.registerOrgRoutes(mux)

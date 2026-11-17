@@ -7,7 +7,6 @@ package api
 // locality polygon containing it via the boundary geopoly index.
 
 import (
-	"context"
 	"encoding/json"
 	"net/http"
 	"strings"
@@ -20,7 +19,15 @@ type ReverseRequest struct {
 	Lat   float64 `json:"latitude"`
 	Lon   float64 `json:"longitude"`
 	Limit int     `json:"limit,omitempty"`
+	// MaxRadiusM bounds how far away a result may be. 0 means the default
+	// (match.DefaultReverseRadiusM); larger values are capped at
+	// match.MaxReverseRadiusM.
+	MaxRadiusM float64 `json:"max_radius_m,omitempty"`
 }
+
+// maxReverseLimit caps /reverse and /locality results. The limit is
+// caller-controlled, and each extra row is another join into address.
+const maxReverseLimit = 20
 
 // ReverseResponse is the /reverse response.
 type ReverseResponse struct {
@@ -63,8 +70,9 @@ func ReverseHandler(p *DBProvider) http.HandlerFunc {
 		if req.Limit <= 0 {
 			req.Limit = 5
 		}
-		res, err := match.Reverse(context.Background(), p.Get(), req.Lon, req.Lat, req.Limit)
-		resp := ReverseResponse{Version: datasetVersion(context.Background(), p.Get())}
+		req.Limit = min(req.Limit, maxReverseLimit)
+		res, err := match.ReverseWithin(r.Context(), p.Get(), req.Lon, req.Lat, req.Limit, req.MaxRadiusM)
+		resp := ReverseResponse{Version: datasetVersion(r.Context(), p.Get())}
 		if err != nil {
 			writeJSONError(w, http.StatusInternalServerError, "reverse failed")
 			return
@@ -129,8 +137,9 @@ func LocalityHandler(p *DBProvider) http.HandlerFunc {
 		if req.Limit <= 0 {
 			req.Limit = 3
 		}
-		hits, err := match.LocalityAt(context.Background(), p.Get(), req.Lon, req.Lat, req.Limit)
-		resp := LocalityResponse{Version: datasetVersion(context.Background(), p.Get())}
+		req.Limit = min(req.Limit, maxReverseLimit)
+		hits, err := match.LocalityAt(r.Context(), p.Get(), req.Lon, req.Lat, req.Limit)
+		resp := LocalityResponse{Version: datasetVersion(r.Context(), p.Get())}
 		if err != nil {
 			writeJSONError(w, http.StatusInternalServerError, "locality failed")
 			return

@@ -59,6 +59,12 @@ func readPasskeyFinish(w http.ResponseWriter, r *http.Request) (passkeyFinish, b
 // with the state and the browser options.
 func (s *Server) beginPasskeyFlow(w http.ResponseWriter, r *http.Request, f identity.Flow, opts passkey.Options) {
 	state, binding, err := s.IDs.StartFlow(r.Context(), f)
+	if errors.Is(err, identity.ErrTooManyFlows) {
+		s.Log.Warn("auth_flows_full")
+		w.Header().Set("Retry-After", "60")
+		jsonError(w, http.StatusServiceUnavailable, "Sign-in is busy. Try again in a minute.")
+		return
+	}
 	if err != nil {
 		s.Log.Error("console_error", "path", r.URL.Path, "error", err.Error())
 		jsonError(w, http.StatusInternalServerError, "Something went wrong. Try again.")
@@ -85,7 +91,7 @@ func (s *Server) passkeyServerError(w http.ResponseWriter, r *http.Request, err 
 
 func (s *Server) handlePasskeyRegisterBegin(w http.ResponseWriter, r *http.Request) {
 	v := viewerFrom(r.Context())
-	if v.Session.Method == "passkey" || passkeyNow().Sub(v.Session.Created) > passkeyFreshness {
+	if !s.canAddMethod(r, v.Session) {
 		jsonError(w, http.StatusForbidden, "To add a passkey, sign out and sign in again with single sign-on, then add it within 10 minutes.")
 		return
 	}
@@ -133,6 +139,12 @@ func (s *Server) handlePasskeyRegisterFinish(w http.ResponseWriter, r *http.Requ
 		return
 	}
 	if err != nil {
+		s.passkeyServerError(w, r, err)
+		return
+	}
+	// Remember which org SSO sessions this passkey was registered under:
+	// only those orgs' break-glass can be claimed with it.
+	if err := s.IDs.RecordPasskeyProofs(r.Context(), id, v.Session.IDHash); err != nil {
 		s.passkeyServerError(w, r, err)
 		return
 	}
@@ -214,8 +226,12 @@ func (s *Server) handlePasskeyLoginFinish(w http.ResponseWriter, r *http.Request
 		s.passkeyServerError(w, r, err)
 		return
 	}
-	if !s.startSession(w, r, u, identity.NewSession{Method: "passkey"}) {
+	sess, ok := s.startSessionWith(w, r, u, identity.NewSession{Method: "passkey"})
+	if !ok {
 		return
+	}
+	if err := s.IDs.GrantPasskeyProofs(r.Context(), sess.IDHash, u.ID, pk.CredentialID); err != nil {
+		s.Log.Error("passkey_proofs_failed", "error", err.Error())
 	}
 	s.IDs.Audit(r.Context(), identity.AuditEvent{ActorID: u.ID, Actor: u.Email, Action: "login.success", Detail: "passkey"})
 	writeJSON(w, http.StatusOK, map[string]string{"redirect": safeReturn(f.ReturnTo)})
@@ -230,7 +246,7 @@ func (s *Server) handlePasskeyDelete(w http.ResponseWriter, r *http.Request) {
 	}
 	// Same freshness rule as registering: a stolen passkey session must not
 	// be able to strip the owner's other passkeys.
-	if v.Session.Method == "passkey" || passkeyNow().Sub(v.Session.Created) > passkeyFreshness {
+	if !s.canAddMethod(r, v.Session) {
 		redirectFlash(w, r, "/console/account", "Sign in again with single sign-on to remove a passkey.")
 		return
 	}

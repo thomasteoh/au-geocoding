@@ -82,6 +82,12 @@ func startPath(c identity.Connection, ret string) string {
 // carry a Lax cookie; the cookie is only a random binding, useless alone.
 func (s *Server) beginFlow(w http.ResponseWriter, r *http.Request, f identity.Flow) (state string, ok bool) {
 	state, binding, err := s.IDs.StartFlow(r.Context(), f)
+	if errors.Is(err, identity.ErrTooManyFlows) {
+		s.Log.Warn("auth_flows_full")
+		w.Header().Set("Retry-After", "60")
+		s.renderError(w, r, http.StatusServiceUnavailable, "Sign-in is busy. Try again in a minute.")
+		return "", false
+	}
 	if err != nil {
 		s.serverError(w, r, err)
 		return "", false
@@ -207,7 +213,7 @@ func (s *Server) completeLogin(w http.ResponseWriter, r *http.Request, a identit
 		return
 	}
 	if !s.startSession(w, r, res.User, identity.NewSession{ConnectionID: a.Connection.ID, Method: method, IdPSID: a.IdPSID,
-		IdPSub: a.Subject, IDToken: a.IDToken}) {
+		IdPSub: a.Subject, IdPSubQual: a.IdPSubQual, IDToken: a.IDToken}) {
 		return
 	}
 	detail := method + " via " + a.Connection.Slug
@@ -221,18 +227,32 @@ func (s *Server) completeLogin(w http.ResponseWriter, r *http.Request, a identit
 // startSession replaces any current session with a new one (new ID on every
 // login, A1) and sets the cookie.
 func (s *Server) startSession(w http.ResponseWriter, r *http.Request, u identity.User, n identity.NewSession) bool {
-	if old := cookieValue(r, sessionCookie); old != "" {
-		s.IDs.DeleteSession(r.Context(), identity.HashToken(old))
-	}
+	_, ok := s.startSessionWith(w, r, u, n)
+	return ok
+}
+
+// startSessionWith is startSession returning the new session.
+func (s *Server) startSessionWith(w http.ResponseWriter, r *http.Request, u identity.User, n identity.NewSession) (identity.Session, bool) {
 	n.UserID = u.ID
 	n.UserAgent = r.UserAgent()
-	raw, _, err := s.IDs.CreateSession(r.Context(), n, s.Cfg.Session)
+	raw, sess, err := s.IDs.CreateSession(r.Context(), n, s.Cfg.Session)
 	if err != nil {
 		s.serverError(w, r, err)
-		return false
+		return identity.Session{}, false
+	}
+	if old := cookieValue(r, sessionCookie); old != "" {
+		// Same person signing in again (e.g. into a second org's SSO): keep
+		// the orgs the old session already satisfied. CarrySessionProofs
+		// only copies between sessions of one user, and only live ones.
+		if _, prev, err := s.IDs.LookupSession(r.Context(), old, s.Cfg.Session); err == nil && prev.ID == u.ID {
+			if err := s.IDs.CarrySessionProofs(r.Context(), identity.HashToken(old), sess.IDHash); err != nil {
+				s.Log.Error("session_proofs_failed", "error", err.Error())
+			}
+		}
+		s.IDs.DeleteSession(r.Context(), identity.HashToken(old))
 	}
 	setCookie(w, sessionCookie, raw, s.Cfg.Session.Max, http.SameSiteLaxMode)
-	return true
+	return sess, true
 }
 
 func (s *Server) denyLogin(w http.ResponseWriter, r *http.Request, c identity.Connection, d *identity.Denial) {
@@ -251,8 +271,7 @@ func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
 	s.IDs.DeleteSession(r.Context(), v.Session.IDHash)
 	clearCookie(w, sessionCookie, http.SameSiteLaxMode)
 	s.audit(r, 0, "logout", "", v.Session.Method)
-	if u, ok := s.samlLogoutURL(r, v.Session); ok {
-		http.Redirect(w, r, u, http.StatusSeeOther)
+	if s.samlLogout(w, r, v.Session) {
 		return
 	}
 	if v.Session.ConnectionID != 0 && (v.Session.Method == identity.KindOIDC) {

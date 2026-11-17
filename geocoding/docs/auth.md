@@ -77,6 +77,24 @@ callback requires the cookie to match, which stops an attacker from
 completing a flow they started in someone else's browser (login CSRF). The
 row is deleted on first use.
 
+At most 100,000 unexpired flows exist at once; past that a new sign-in start
+gets a 503 "Sign-in is busy" page (JSON for passkeys) until flows expire, so
+anonymous starts cannot grow app.db without bound.
+
+### Rate limits
+
+The anonymous sign-in endpoints share a token bucket per client IP
+(`AUGEO_AUTH_RATE_RPS`, `AUGEO_AUTH_RATE_BURST`; default 1/s, burst 20):
+`POST /auth/discover`, `GET`/`POST /auth/{oidc,saml}/{id}/start`, the OIDC
+callback, the SAML ACS and `POST /auth/passkey/login/begin` and `/finish`. A
+full sign-in uses two or three tokens. Over the limit the answer is 429 with
+`Retry-After`: an error page, or JSON for the passkey endpoints. The client
+IP is the TCP peer or, when the peer is one of `AUGEO_TRUSTED_PROXY`
+(comma-separated IPs or CIDRs), the first untrusted `X-Forwarded-For`
+entry counting from the right; a malformed entry falls back to the peer
+(the same rule as the public API). IPv6 clients are keyed by their /64.
+Buckets live in memory, per process.
+
 `return_to` must be a relative path starting with `/console`; anything else
 becomes `/console`.
 
@@ -137,20 +155,30 @@ Single logout uses `/auth/saml/{slug}/slo`, advertised in the SP metadata
 for the HTTP-Redirect and HTTP-POST bindings:
 
 - **SP-initiated.** `POST /auth/logout` on a SAML session deletes the local
-  session first. Then, if the IdP metadata lists an HTTP-Redirect
-  SingleLogoutService, it redirects the browser there with a LogoutRequest
-  (NameID and SessionIndex from the session) signed in the query string
-  (RSA-SHA256). The IdP's LogoutResponse at the SLO URL must verify (see
-  below) and report success; the browser then lands on the login page with
-  "You have signed out." Anything else gets a generic error page. The local
-  session is gone either way. Without an IdP SLO endpoint, logout is local
-  only.
+  session first. Then, if the IdP metadata lists a SingleLogoutService, it
+  sends a signed LogoutRequest carrying the NameID with the `Format`,
+  `NameQualifier` and `SPNameQualifier` from the login assertion (stored
+  with the session; strict IdPs such as ADFS match on them) and the
+  SessionIndex. HTTP-Redirect is preferred: the browser is redirected with
+  the request signed in the query string (RSA-SHA256). If the IdP has only
+  an HTTP-POST endpoint, the browser gets a page whose form posts the
+  request, signed with an enveloped XML signature, to the IdP;
+  `/console/static/autosubmit.js` submits it, and a Continue button does
+  the same without JavaScript (the endpoint must be `https:`, which the
+  CSP `form-action` allows). The request ID is recorded as a
+  `saml-logout` flow bound to the browser's flow cookie (10 minutes). The
+  IdP's LogoutResponse at the SLO URL must verify (see below), report
+  success, and have an `InResponseTo` matching a pending request from this
+  browser for this connection; the record is consumed on first use, match
+  or not. The browser then lands on the login page with "You have signed
+  out." Anything else gets a generic error page. The local session is gone
+  either way. Without an IdP SLO endpoint, logout is local only.
 - **IdP-initiated.** A LogoutRequest at the SLO URL ends the connection's
   sessions with that SessionIndex or, if it has none, that NameID. It is
-  audited as `logout.saml_slo` and answered with a LogoutResponse (Success,
-  RelayState echoed) signed in the query and sent by redirect to the IdP's
-  SLO endpoint (`ResponseLocation` if given). Request IDs are recorded to
-  refuse replays.
+  audited as `logout.saml_slo` and answered with a signed LogoutResponse
+  (Success, RelayState echoed) on the IdP's SLO endpoint
+  (`ResponseLocation` if given), by redirect or, for a POST-only IdP, by the
+  same auto-submitting form. Request IDs are recorded to refuse replays.
 
 Inbound logout messages must be signed by a signing certificate in the IdP
 metadata, either on the redirect query (RSA-SHA256/384/512 over the
@@ -158,7 +186,11 @@ parameters as sent) or as an enveloped XML signature on the message; only
 the signed element is read. The issuer must be the IdP entity ID,
 `Destination` must be the SLO URL, `IssueInstant` must fall within the issue
 window above (plus skew), and a request's `NotOnOrAfter` must not have
-passed. Anything else is a 400 that touches no session. Bodies and inflated
+passed. Anything else is a 400 that touches no session and is audited as
+`logout.saml_rejected` with a short reason code (`malformed`, `unsigned`,
+`bad_signature`, `wrong_issuer`, `wrong_destination`, `stale`, `expired`,
+`status_not_success`, `replay`, `unsolicited_response`, ...) and never the
+message. Bodies and inflated
 messages are capped at 1 MiB, and messages are never logged. For IdPs
 without SLO, use SCIM deprovisioning or short session lifetimes for prompt
 revocation.
@@ -176,7 +208,10 @@ into a user:
    only if they have no access outside this org (no other org except their
    own personal workspace, not a platform admin); otherwise deny, because the
    org's IdP decides what email it asserts. Pending invites from this org
-   are accepted. Multi-tenant Entra issuers (`common`, `organizations`,
+   (and only this org) are accepted. A user the org's SCIM has deactivated
+   (`scim_users.active = 0`) is denied (`scim_inactive`), so SSO, JIT and
+   group mappings cannot bring them back until SCIM reactivates them.
+   Multi-tenant Entra issuers (`common`, `organizations`,
    `consumers`) are refused on org connections, and changing a connection's
    issuer, client ID or SAML metadata drops its linked identities and
    sessions.
@@ -186,14 +221,19 @@ into a user:
    one (when `AUGEO_AUTH_SIGNUP=open`, or when an invite or bootstrap entry
    exists). If the email is **not** trusted and a user with that email already
    exists, deny: linking on an unverified email is how accounts get taken over.
+   A platform sign-in never accepts invites; they wait for the person to
+   accept them in the console (see "Invites").
 4. **Status.** Suspended or deprovisioned users are denied.
    Bootstrap admins are promoted once, when their account is created; a
    later revocation sticks.
 5. **Group mappings.** For org connections with mappings, the member's role
    becomes the highest role whose group appears in the assertion; with no
-   match, the org's default role (JIT) or the existing manual role.
-6. A brand-new user with no membership gets a personal org where they are
-   owner, so a self-signup user can create keys at once.
+   match, the org's default role (JIT) or the existing manual role. The
+   IdP's groups are only known at sign-in, so adding or removing an SSO
+   mapping changes members' roles at their next sign-in, not at once.
+6. A user with no membership gets a personal org where they are owner, so
+   a self-signup user can create keys at once. Someone with a pending
+   invite gets none until they have decided on it.
 
 ### Sessions
 
@@ -213,8 +253,8 @@ into a user:
 - `POST /auth/logout` deletes the session. For OIDC connections that publish
   `end_session_endpoint`, the browser is redirected there with
   `id_token_hint` and `post_logout_redirect_uri`. For SAML connections whose
-  IdP has an SLO endpoint, it is redirected there with a signed
-  LogoutRequest; IdP-initiated SAML logout arrives at
+  IdP has an SLO endpoint, it is sent there with a signed
+  LogoutRequest (redirect, or an auto-submitted POST form); IdP-initiated SAML logout arrives at
   `/auth/saml/{id}/slo` (see "SAML 2.0").
 - **Back-channel logout** (OIDC): `POST /auth/oidc/{id}/backchannel-logout`
   with a `logout_token` form field. The token is verified against the
@@ -267,18 +307,32 @@ are accepted and ignored.
 - Creating a user whose email already exists links that user (409
   `uniqueness` if already provisioned in this org) and adds an org
   membership with source `scim` and the role from SCIM group mappings, else
-  the org default role. An existing membership (e.g. manual) is kept as is.
+  the org default role. An existing membership (e.g. manual, invite, JIT) is
+  kept as is. Only an account with no access outside this org (no other org
+  except its own personal workspace, not a platform admin) can be linked;
+  the check and the link run in one transaction that takes the write lock
+  first.
+- The SCIM linkage is the `scim_users` row, not the membership's `source`
+  (an SSO group-mapped sign-in rewrites that to `group`). A linked user is
+  under the org's SCIM control whatever their membership's source.
 - The SCIM `id` is a random UUID (`scim_users.scim_id`), never the database
   user ID. Name parts, `displayName`, `externalId`, emails and `active` are
   stored per org in `scim_users` and returned as sent.
 - The global user row (`users.email`, `users.name`) only changes when the
   user belongs to no other org and is not a platform admin; changing
   `userName` for a shared user is 400 `mutability`.
-- `active: false` or `DELETE` removes the org membership (any source) and
-  deletes all the user's sessions; a user left with no memberships and no
-  platform role is marked deprovisioned. `active: true` (or re-creating
-  after delete) restores the membership and reactivates a deprovisioned
-  user. Removing the org's last owner is 400 and changes nothing.
+- `active: false` or `DELETE` ends the user's access to the org at once:
+  the org membership goes whatever its source (manual, invite, jit, group,
+  scim); sessions created through any of the org's connections are deleted;
+  the org's connections are removed from the proofs (`session_proofs`) of
+  the user's other sessions, so none of them still satisfies the org's SSO
+  enforcement. Sessions that never touched the org are kept. A user left
+  with no memberships who is not a platform admin is then marked
+  deprovisioned and signed out everywhere. While deactivated, sign-in
+  through the org's connections is denied (`scim_inactive`). `active: true`
+  (or re-creating after delete) restores the membership and reactivates a
+  deprovisioned user. Removing the org's last owner is 400 and changes
+  nothing.
 - Group members must be SCIM users of the same org (400 otherwise). After any
   group change the affected users' roles are recomputed from SCIM group
   mappings (matched on `displayName`): highest mapped role, else the org
@@ -288,7 +342,13 @@ are accepted and ignored.
 - Tokens are shown once, stored hashed, revocable, and every SCIM write is
   audited with actor `scim` (`scim.user.create`, `.update`, `.deactivate`,
   `.reactivate`, `.delete`, `scim.group.create`, `.update`, `.delete`).
-  Mapping edits in the console apply at the next SCIM change for each user.
+- Adding or removing a SCIM group mapping in the console recomputes the role
+  of every SCIM-sourced membership in the org at once, under the same rules
+  (manual and invite memberships untouched). If that would demote the last
+  owner the mapping change is refused and the console says so.
+- `PATCH` on a user or group is one transaction: the store takes SQLite's
+  write lock, reads the resource, applies the operations and writes it back,
+  so concurrent PATCHes from an IdP are serialised and none is lost.
 
 ## API: bearer tokens
 
@@ -304,9 +364,31 @@ contains the configured audience; `exp`/`nbf` with 60 s skew; scopes from
 `scope` (space-separated) or `scp` (array), with the prefix stripped, must
 include the endpoint's scope (`search` or `batch`).
 
+Registrations are unique per org on `(issuer, audience)`, not globally, so
+no org can register a shared issuer's audience first and lock its real
+owner out. The registration is chosen by the token's audience; when two
+orgs have registered the same issuer and audience, the token could belong
+to either and is refused (`audience`). **The audience must therefore be
+specific to the org** (its own app registration or API identifier, e.g.
+Entra's application ID URI), never a value other tenants of the same IdP
+also receive. The console's OAuth tokens page warns when another org has
+registered the same pair, without saying which org.
+
 The principal is `jwt:<issuer id>:<sub>`. Rate limits apply per principal;
 the daily row quota is charged to the org at the org's tier. A request with
 both `X-Api-Key` and `Authorization` is a 400.
+
+Cost controls on the bearer path:
+
+- Before a token is parsed, the client IP takes a token from a per-IP
+  bucket (at the keyed default rate), so a flood of forged tokens from one
+  address is refused with 429 before any signature check or lookup.
+- Keys are cached per issuer registration. A token is verified against the
+  cached keys first; the JWKS is fetched again only when the token's `kid`
+  is not in the cache, and at most once per 30 s per key set (a failed
+  fetch counts too). A token with a known `kid` and a bad signature never
+  causes a fetch.
+- An org can register at most 10 issuers.
 
 ## API keys
 
@@ -316,7 +398,17 @@ prefix index and constant-time comparison. New:
 - Keys created in the console belong to an org (`org_id`), record their
   creator, take the org's tier and can carry an expiry. Their raw value is
   shown once.
+- When a platform admin moves an org off the batch tier, the batch scope is
+  removed from all of the org's keys in the same transaction. A key whose
+  only scope was `batch` is left with the scope `none` (no endpoint), never
+  the empty set, which would default to `search`. `/batch` also checks the
+  caller's tier on every request.
 - Revocation in the console updates the in-memory index at once.
+- Deleting an org revokes its keys in the same transaction as the org's
+  delete, and issuing an org key checks inside its own transaction (after
+  the insert, under SQLite's write lock) that the org still exists. A key
+  created while its org is being deleted is therefore either revoked by the
+  delete or never created. The in-memory index is updated after the commit.
 - `keygen` still issues operator keys with no org; those are unchanged.
 
 T6's "no HTTP issuance endpoint" is replaced by: issuance only through an
@@ -334,17 +426,53 @@ origin checks, and an audit event.
 | `AUGEO_AUTH_SESSION_IDLE` | `28800` | Seconds |
 | `AUGEO_AUTH_SESSION_MAX` | `604800` | Seconds |
 | `AUGEO_AUTH_PROVIDERS_FILE` | | JSON list of platform connections to upsert at boot (see below) |
-| `AUGEO_SMTP_HOST` | (unset: no invite emails) | SMTP submission server for invite emails. STARTTLS is required unless the host is `localhost` or a loopback address |
-| `AUGEO_SMTP_PORT` | `587` | SMTP port (STARTTLS; implicit TLS on 465 is not supported) |
+| `AUGEO_AUTH_RATE_RPS` | `1` | Per-client-IP refill rate (requests/second) on the anonymous sign-in endpoints; `0` turns the limit off |
+| `AUGEO_AUTH_RATE_BURST` | `20` | Bucket size for the above |
+| `AUGEO_AUTH_MAX_ORGS_PER_USER` | `10` | Non-personal orgs one user may create and keep (deleting one frees a slot); `0` is no cap. Platform admins are exempt |
+| `AUGEO_AUTH_DEFAULT_ORG_TIER` | `demo` | Quota tier new orgs (including personal workspaces) start on: `demo`, `standard` or `batch` |
+| `AUGEO_SMTP_HOST` | (unset: no invite emails) | SMTP submission server for invite emails. With `starttls`, STARTTLS is required unless the host is `localhost` or a loopback address |
+| `AUGEO_SMTP_PORT` | `587` | SMTP port |
+| `AUGEO_SMTP_TLS` | `starttls` (`implicit` on port 465) | `starttls` upgrades a plain connection; `implicit` speaks TLS from the first byte (SMTPS, port 465). The certificate must be valid for the host |
 | `AUGEO_SMTP_USERNAME` | | Enables SMTP PLAIN auth (only over TLS, or to localhost) |
 | `AUGEO_SMTP_PASSWORD` / `_FILE` | | SMTP password; redacted in the boot log |
 | `AUGEO_SMTP_FROM` | (required with host) | Sender, `noreply@geo.example.com` or `Geocoder <noreply@geo.example.com>` |
 
+### Invite emails
+
 When SMTP is configured, inviting someone emails them a plain-text message
 naming the inviter, organisation, role, the `{AUGEO_PUBLIC_URL}/auth/login`
-link and the expiry. A failed send never fails the invite: the console says
-the email could not be sent and logs `invite_email_failed` with the org ID and
-the error, never the recipient's address.
+link and the expiry. The inviter's and organisation's names are chosen by
+users, so they appear in double quotes, on one line, with anything a mail
+client could turn into a link removed (`scheme://`, `www.`, and the dots of
+host-like tokens, so `login.evil.example` becomes `login evil example`); the
+message says the names are user-chosen. The sign-in link is the only link,
+on its own line, and always the platform's. Sending is off the request
+path:
+
+- The invite handler writes the message to the `mail_outbox` table in app.db
+  and returns; the console says "We are emailing them a sign-in link".
+- A background worker (started at boot when SMTP is configured, stopped on
+  shutdown) sends due messages every 30 seconds and at once after an
+  enqueue. A failed attempt is retried after 1 minute, 5 minutes, 30
+  minutes, 2 hours and 2 hours; after the sixth attempt, or at once for a
+  permanent failure (a 5xx reply to MAIL, RCPT or DATA, or an invalid
+  address), the message is marked `failed`. A send cut off by shutdown stays
+  pending and does not count as an attempt.
+- Recipient and body are blanked when a message is sent or finally fails.
+  `last_error` holds only a short code such as `dial`, `starttls`,
+  `rcpt_550` or `tls_timeout`. Finished rows (no address, no body, a salted
+  HMAC of the address, keyed from `AUGEO_SECRET_KEY`) are deleted after 48
+  hours.
+- Logs (`mail_sent`, `mail_retry`, `mail_failed`) carry the outbox ID, org ID,
+  attempt and code, never the recipient's address.
+- Rate limits: an org may queue 50 invite emails per hour and 3 per day to
+  any one address; one address receives at most 20 per day from all orgs
+  together; one inviting user may queue at most 20 per day across all
+  their orgs. Over any limit the invite is
+  still created (or renewed) but no email is queued, and the console tells
+  the inviter to send the sign-in link themselves.
+- A failure never fails the invite. An invite deleted before its email goes
+  out does not cancel the email.
 
 Platform connections can be managed in the admin console or declared in the
 providers file so deployments are reproducible:
@@ -399,13 +527,51 @@ labels, never secrets, raw tokens or queries.
 | A9 | SCIM token theft | Hashed at rest, org-scoped, revocable, audited; SCIM can only touch its own org |
 | A10 | Stolen session cookie | `__Host-`, `HttpOnly`, `Secure`, `SameSite=Lax`; idle and absolute expiry; user-visible session list |
 | A11 | Secrets exposure via DB copy | Client secrets and SAML keys sealed with `AUGEO_SECRET_KEY`; tokens hashed |
+| A12 | Sign-in endpoint flooding (DB growth, IdP metadata fetches, mail bombing) | Per-IP token buckets on anonymous auth endpoints; cap on unexpired `auth_flows`; per-org, per-recipient and per-inviter invite email limits |
+| A13 | Forced org join (an attacker invites a victim, who is joined at sign-in and then cannot be linked by their employer) | Invites accepted only explicitly in the console, except an org connection's own org |
+| A14 | SCIM offboarding leaving access (membership source rewritten, sessions in the org kept) | Deactivation keyed on the `scim_users` link: membership removed whatever its source, the org's sessions and proofs dropped, sign-in through the org denied |
+| A15 | Quota multiplication through many orgs; JWT audience squatting | Per-user org creation cap; per-org `(issuer, audience)` uniqueness with ambiguous pairs refused and flagged in the console |
+| A16 | Forged bearer tokens forcing JWKS fetches | Per-IP bucket before verification; cached keys checked first; refetch only for an unknown `kid`, at most once per 30 s per key set; 10 issuers per org |
 
 ## Invites
 
 An invite is always a pending row, even for an email that already has an
-account: the person joins when they next sign in with a trusted address, so
-nobody is added to an org without acting, and the response never reveals
-whether an account exists. Invites expire after 14 days.
+account, and the response never reveals whether an account exists. Invites
+expire after 14 days.
+
+- **Acceptance is explicit.** Signing in through a platform connection
+  never accepts an invite: the person's console home page lists their
+  pending invites (organisation, role, inviter, expiry) with Accept and
+  Decline buttons (CSRF-checked POSTs to `/console/invites/{id}/accept` and
+  `/decline`, audited as `invite.accept` / `invite.decline`). Only the
+  account whose email the invite names can accept or decline it. Otherwise
+  anyone could pull a stranger into their org, even as owner, and that
+  membership would then block the stranger's employer from linking them
+  through SSO or SCIM (an account with access elsewhere is not linkable).
+- **Exception:** signing in through an org connection accepts that org's
+  own invites (never another org's). The org's IdP vouches for the address
+  and the linkability rule already bounds whom it can sign in.
+- Accepting never lowers an existing role. An invite, once accepted or
+  declined, is gone.
+- Admins can create, renew and delete invites for viewer, developer and
+  admin; only owners can invite owners, and only owners can delete an owner
+  invite or re-invite its address with another role (the same rule as
+  changing members).
+
+## Org limits
+
+Each org has its own daily row quota at its tier, so the quota one person
+can use grows with the orgs they own (demo-tier quota is per org, not per
+user). Two limits bound that:
+
+- A user may create at most `AUGEO_AUTH_MAX_ORGS_PER_USER` (default 10)
+  non-personal orgs that still exist (`orgs.created_by`); platform admins
+  are exempt. The count and the insert share one transaction.
+- New orgs start on `AUGEO_AUTH_DEFAULT_ORG_TIER` (default `demo`); a
+  platform admin raises an org's tier.
+
+Personal workspaces are created only at sign-in, one per user with no
+membership.
 
 ## Linking sign-in methods
 
@@ -436,6 +602,14 @@ session (break-glass). Because the check runs per request, sessions that
 predate enforcement do not survive it, and guests at other domains need an
 identity in the org's IdP (linked as above).
 
+A session remembers every connection it has signed in through (session
+proofs). Signing in again as the same person, for example into a second
+enforced org's SSO, rotates the session ID but carries the earlier proofs
+across with their original times, so one browser can work in several
+enforced orgs. Proofs count only within the session lifetime they were
+earned under, never move between different people's sessions, and are
+dropped when the connection is deleted or unlinked.
+
 Separately, platform IdP logins for an address in an enforced org's
 verified domain are refused at sign-in. An owner can only turn enforcement
 on from a session that already satisfies it, so they cannot lock
@@ -457,3 +631,27 @@ themselves out.
   needs GroupMember.Read.All consented). If that fails, the sign-in still
   works and the person's role is left unchanged rather than recomputed from
   an empty list.
+
+## Org-scoped sessions
+
+A session that came only through org connections (no platform connection,
+no passkey, no platform proof) is scoped: it reaches only the orgs whose
+connections it signed in through, never platform admin, and it cannot link
+another sign-in method or register a passkey. An org's IdP admin controls
+what that IdP asserts, so a linked subject must not become a key to the
+person's whole account. Signing in with a platform connection or a passkey
+gives general access; proofs from both are carried as described above.
+
+Further session-proof rules:
+
+- OIDC back-channel logout and SAML IdP-initiated logout also revoke proofs
+  carried into later sessions from the logged-out IdP session.
+- A disabled connection's sessions and proofs end at once, and its proofs
+  never satisfy enforcement.
+- Owner break-glass: a passkey records the org connections of the session
+  it was registered from. A passkey sign-in gets proofs only for those orgs,
+  and only where the person is still an owner. A passkey registered from a
+  platform session never satisfies an org's enforcement.
+- A user's own link and passkey-registration ceremonies replace their
+  unfinished earlier ones, and both start endpoints share the sign-in rate
+  limit.

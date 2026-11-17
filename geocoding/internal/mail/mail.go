@@ -1,6 +1,7 @@
 // Package mail sends plain-text notification email (console invites).
 //
-// The SMTP sender requires STARTTLS unless the server is on localhost, uses
+// The SMTP sender speaks implicit TLS (port 465) or requires STARTTLS
+// unless the server is on localhost, uses
 // PLAIN auth only when a username is set, and refuses CR or LF in the
 // recipient and subject so callers cannot inject headers.
 package mail
@@ -18,6 +19,7 @@ import (
 	"net"
 	"net/mail"
 	"net/smtp"
+	"net/textproto"
 	"strconv"
 	"strings"
 	"time"
@@ -48,7 +50,16 @@ type Config struct {
 	Username string
 	Password string
 	From     string // bare address or "Name <addr>"
+	// TLS is TLSStartTLS or TLSImplicit. Empty: implicit on port 465,
+	// STARTTLS otherwise.
+	TLS string
 }
+
+// TLS modes.
+const (
+	TLSStartTLS = "starttls"
+	TLSImplicit = "implicit"
+)
 
 // Timeout bounds a whole delivery: dial, TLS, auth and data.
 const Timeout = 10 * time.Second
@@ -74,6 +85,16 @@ func NewSMTP(cfg Config) (*SMTP, error) {
 	}
 	if cfg.Port < 1 || cfg.Port > 65535 {
 		return nil, errors.New("mail: bad SMTP port")
+	}
+	switch cfg.TLS {
+	case "":
+		cfg.TLS = TLSStartTLS
+		if cfg.Port == 465 {
+			cfg.TLS = TLSImplicit
+		}
+	case TLSStartTLS, TLSImplicit:
+	default:
+		return nil, errors.New("mail: TLS must be implicit or starttls")
 	}
 	from, err := ParseFrom(cfg.From)
 	if err != nil {
@@ -107,6 +128,58 @@ func validRecipient(to string) bool {
 	return err == nil && a.Address == to && a.Name == ""
 }
 
+// SendError is a failed delivery: the protocol stage that failed and the
+// underlying error. Stage is safe to log and store; Err may echo addresses.
+type SendError struct {
+	Stage string // dial, tls, greeting, hello, starttls, auth, mail, rcpt, data
+	Err   error
+}
+
+func (e *SendError) Error() string { return "mail: " + e.Stage + ": " + e.Err.Error() }
+func (e *SendError) Unwrap() error { return e.Err }
+
+func stageErr(stage string, err error) error { return &SendError{Stage: stage, Err: err} }
+
+// ErrorCode is a short, address-free label for a send error, for logs and
+// the outbox: "invalid", "disabled", "timeout", or the failed stage, with
+// the SMTP reply code when there is one (for example "rcpt_550").
+func ErrorCode(err error) string {
+	var se *SendError
+	switch {
+	case err == nil:
+		return ""
+	case errors.Is(err, ErrInvalid):
+		return "invalid"
+	case errors.Is(err, ErrDisabled):
+		return "disabled"
+	case !errors.As(err, &se):
+		return "other"
+	}
+	var tp *textproto.Error
+	if errors.As(err, &tp) {
+		return se.Stage + "_" + strconv.Itoa(tp.Code)
+	}
+	var ne net.Error
+	if errors.As(err, &ne) && ne.Timeout() || errors.Is(err, context.DeadlineExceeded) {
+		return se.Stage + "_timeout"
+	}
+	return se.Stage
+}
+
+// Permanent reports whether retrying err cannot help: a rejected address or
+// header, or a 5xx reply to MAIL, RCPT or DATA.
+func Permanent(err error) bool {
+	if errors.Is(err, ErrInvalid) {
+		return true
+	}
+	var se *SendError
+	var tp *textproto.Error
+	if errors.As(err, &se) && errors.As(err, &tp) && tp.Code >= 500 {
+		return se.Stage == "mail" || se.Stage == "rcpt" || se.Stage == "data"
+	}
+	return false
+}
+
 func isLocal(host string) bool {
 	if host == "localhost" {
 		return true
@@ -128,59 +201,77 @@ func (s *SMTP) Send(ctx context.Context, to, subject, textBody string) error {
 	defer cancel()
 	conn, err := s.dial(ctx, net.JoinHostPort(s.cfg.Host, strconv.Itoa(s.cfg.Port)))
 	if err != nil {
-		return fmt.Errorf("mail: dial: %w", err)
+		return stageErr("dial", err)
 	}
 	defer conn.Close()
 	dl, _ := ctx.Deadline()
 	conn.SetDeadline(dl)
-	// Cancelling ctx (for example the client went away) aborts the exchange.
+	// Cancelling ctx (for example shutdown) aborts the exchange.
 	stop := context.AfterFunc(ctx, func() { conn.SetDeadline(time.Unix(1, 0)) })
 	defer stop()
 
+	implicit := s.cfg.TLS == TLSImplicit
+	if implicit {
+		tc := tls.Client(conn, s.tlsFor())
+		if err := tc.HandshakeContext(ctx); err != nil {
+			return stageErr("tls", err)
+		}
+		// smtp.NewClient sees the *tls.Conn and treats the session as
+		// encrypted, so PlainAuth will send credentials.
+		conn = tc
+	}
 	c, err := smtp.NewClient(conn, s.cfg.Host)
 	if err != nil {
-		return fmt.Errorf("mail: greeting: %w", err)
+		return stageErr("greeting", err)
 	}
 	defer c.Close()
 	if err := c.Hello("localhost"); err != nil {
-		return fmt.Errorf("mail: hello: %w", err)
+		return stageErr("hello", err)
 	}
-	if ok, _ := c.Extension("STARTTLS"); ok {
-		tc := s.tlsConfig
-		if tc == nil {
-			tc = &tls.Config{ServerName: s.cfg.Host, MinVersion: tls.VersionTLS12}
+	if !implicit {
+		if ok, _ := c.Extension("STARTTLS"); ok {
+			if err := c.StartTLS(s.tlsFor()); err != nil {
+				return stageErr("starttls", err)
+			}
+		} else if !isLocal(s.cfg.Host) {
+			return stageErr("starttls", errors.New("server does not offer STARTTLS"))
 		}
-		if err := c.StartTLS(tc); err != nil {
-			return fmt.Errorf("mail: starttls: %w", err)
-		}
-	} else if !isLocal(s.cfg.Host) {
-		return errors.New("mail: server does not offer STARTTLS")
 	}
 	if s.cfg.Username != "" {
 		// PlainAuth itself refuses to send credentials over an unencrypted
 		// connection to anything but localhost.
 		if err := c.Auth(smtp.PlainAuth("", s.cfg.Username, s.cfg.Password, s.cfg.Host)); err != nil {
-			return fmt.Errorf("mail: auth: %w", err)
+			return stageErr("auth", err)
 		}
 	}
 	if err := c.Mail(s.from.Address); err != nil {
-		return fmt.Errorf("mail: MAIL FROM: %w", err)
+		return stageErr("mail", err)
 	}
 	if err := c.Rcpt(to); err != nil {
-		return fmt.Errorf("mail: RCPT TO: %w", err)
+		return stageErr("rcpt", err)
 	}
 	wc, err := c.Data()
 	if err != nil {
-		return fmt.Errorf("mail: DATA: %w", err)
+		return stageErr("data", err)
 	}
 	if _, err := wc.Write(msg); err != nil {
 		wc.Close()
-		return fmt.Errorf("mail: write: %w", err)
+		return stageErr("data", err)
 	}
 	if err := wc.Close(); err != nil {
-		return fmt.Errorf("mail: DATA end: %w", err)
+		return stageErr("data", err)
 	}
-	return c.Quit()
+	// The message is accepted once DATA ends; a failed QUIT is not a
+	// failed delivery (and must not cause a duplicate on retry).
+	c.Quit()
+	return nil
+}
+
+func (s *SMTP) tlsFor() *tls.Config {
+	if s.tlsConfig != nil {
+		return s.tlsConfig
+	}
+	return &tls.Config{ServerName: s.cfg.Host, MinVersion: tls.VersionTLS12}
 }
 
 func (s *SMTP) build(to, subject, body string) ([]byte, error) {

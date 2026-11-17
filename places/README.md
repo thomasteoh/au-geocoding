@@ -40,6 +40,58 @@ go build -o auplaces-load ./cmd/buildaddr
 The server is a single static binary (CGO-free, `modernc.org/sqlite`). It embeds
 the demo UI and docs.
 
+## Aliases, levels and postcodes
+
+`buildaddr` carries each address's level (`level_number`, digits, set only for
+a plain LEVEL or FLOOR; `level_type` names the type), so "Level 2, 12 Collins
+St" picks the row on level 2. It also builds `alias_locality` and
+`alias_street` from G-NAF's alias tables (`loadreal` loads them; on an
+existing dataset `go run ./cmd/loadreal -aliases-only -db ... -base ...`
+adds just those): an alias such as JOLIMONT (EAST MELBOURNE) or LITTLE
+LATROBE STREET (LITTLE LA TROBE STREET) is answered as the official name.
+Aliases that are official names themselves, or that name several places, are
+left out.
+
+`go run ./cmd/loadpostcode -db ... -shp POA_2021_AUST_GDA2020.shp -dbf
+POA_2021_AUST_GDA2020.dbf` loads ABS Postal Areas: postcode answers stay at
+the centre of the postcode's addresses unless that point falls outside the
+postal area, when the area's representative point (inside it) is used.
+PO-box-only postcodes (3001, 8001) have neither addresses nor an area;
+`internal/postbox/pobox_postcodes.tsv` maps the ones checked against
+Australia Post to their delivery locality. Add a row only with the URL it was
+read from.
+
+## Accuracy checks
+
+`testdata/golden.tsv` holds real Victorian addresses as people type them
+(units, "St" as Saint, 4-digit street numbers, multi-word localities,
+misspellings), streets and localities with no number, and text /resolve must
+decline. `go test ./...` runs it in CI against `testdata/golden_fixture.tsv.gz`,
+about 25K real rows around those addresses. Before changing the parser,
+generation or scoring, also run it against a full dataset:
+
+```
+# golden set through /search and /resolve
+AUPLACES_GOLDEN_DB=/path/to/vic.db go test ./internal/api -run Golden -v
+
+# 500 misspelt addresses; reports the match rate
+go run ./cmd/gen -real -db /path/to/vic.db -corpus testdata/corpus_real.tsv -cap 200
+
+# both services end to end, golden set through augeo's /geocode
+../scripts/smoke-real.sh /path/to/vic.db
+```
+
+After adding a street or locality to the golden set, rebuild the fixture:
+`go run ./cmd/goldenfixture -db /path/to/vic.db`.
+
+Full-dataset checks open the dataset read-only. A dataset built before
+`idx_addr_pid` was added to `buildaddr` needs
+`CREATE UNIQUE INDEX idx_addr_pid ON address(gnaf_pid)`, or every address query
+scans the whole table. One built before `flat_number` and `lot_number` were
+added still serves street addresses, but cannot tell units or lots apart
+("7/12 Collins St" is any row at 12 Collins St; "Lot 14 Old Sydney Rd" is any
+address on the street): rebuild `address` with `buildaddr`.
+
 ## Run (self-host)
 
 ```

@@ -10,6 +10,7 @@ import (
 	"database/sql"
 	"fmt"
 	"strings"
+	"sync"
 )
 
 // Query is a normalised user query: tokens split, reliable vs score sets.
@@ -18,12 +19,18 @@ import (
 type Query struct {
 	Reliable []string // locality, state, postcode, street number — anchors
 	Score    []string // full normalised token set, includes misspelled ones
-	Fields   []string // per-score-token field tag (locality/state/postcode/street_name/street_number)
+	// Fields tags each score token: locality_name, state, postcode,
+	// street_name, street_number, street_type, flat_number, lot_number,
+	// level_number, or postal_delivery (which only routes the query; it is never scored).
+	Fields []string
 }
 
 // Candidate is a generated row, unscored.
 type Candidate struct {
 	PID            string
+	FlatNumber     string // "" for an address with no unit
+	LotNumber      string
+	LevelNumber    string // "" for an address with no level
 	StreetNumber   string
 	StreetName     string
 	StreetType     string
@@ -51,10 +58,12 @@ func Generate(ctx context.Context, db *sql.DB, q Query, fs *FuzzySet, cap int) (
 	// the score set instead. This is the design-relevant finding: street
 	// numbers are not trigram anchors.
 	var phrases []string
+	seen := map[string]bool{}
 	for _, t := range q.Reliable {
-		if t == "" || len(t) < 3 {
+		if t == "" || len(t) < 3 || seen[t] {
 			continue
 		}
+		seen[t] = true
 		// Escape double quotes for FTS5 phrase syntax.
 		phrases = append(phrases, `"`+strings.ReplaceAll(t, `"`, `""`)+`"`)
 	}
@@ -74,12 +83,23 @@ func Generate(ctx context.Context, db *sql.DB, q Query, fs *FuzzySet, cap int) (
 	match := strings.Join(phrases, " AND ")
 
 	// Try full AND first.
-	cands, err := generateMatch(ctx, db, match, cap)
+	cands, err := generateMatch(ctx, db, q, match, cap)
 	if err != nil {
 		return nil, err
 	}
 	if len(cands) > 0 {
 		return cands, nil
+	}
+
+	// Zero rows with a known locality: the street is misspelt or in the wrong
+	// place. Try the nearest street that exists in that locality before any
+	// global correction, which would keep a misspelling that happens to be a
+	// real street elsewhere and then drop the locality to find it.
+	street, locality := q.Field("street_name"), q.Field("locality_name")
+	if fs != nil && street != "" && locality != "" {
+		if near, sim := fs.NearestStreetIn(street, locality); near != "" && near != street && sim >= nearStreetInLocality {
+			return Generate(ctx, db, q.withStreet(street, near), fs, cap)
+		}
 	}
 
 	// Zero rows: try fuzzy generation — resolve each reliable token to its
@@ -92,7 +112,7 @@ func Generate(ctx context.Context, db *sql.DB, q Query, fs *FuzzySet, cap int) (
 	// No fuzzy set: fall back to dropping anchors (old behaviour).
 	for i := len(phrases) - 1; i > 0; i-- {
 		relaxed := strings.Join(phrases[:i], " AND ")
-		cands, err := generateMatch(ctx, db, relaxed, cap)
+		cands, err := generateMatch(ctx, db, q, relaxed, cap)
 		if err != nil {
 			return nil, err
 		}
@@ -103,21 +123,57 @@ func Generate(ctx context.Context, db *sql.DB, q Query, fs *FuzzySet, cap int) (
 	return nil, nil
 }
 
-func generateMatch(ctx context.Context, db *sql.DB, match string, cap int) ([]Candidate, error) {
-	// cap <= 0 means uncapped (legacy behaviour). The design's INV-8 wants a
-	// bounded generation set; a cap makes cost tractable at 15.9M-row scale.
+// innerCap bounds the trigram match set read before ordering, so a very broad
+// anchor (a locality on its own) cannot pull the whole table into one query.
+// It is far above any single street-in-locality: Collins St, Melbourne, the
+// largest, is about 10K rows.
+const innerCap = 50000
+
+// generateMatch runs one trigram MATCH and returns up to cap rows, best first.
+// The order matters because the cap truncates: rows at the query's street
+// number (or lot) come first, then rows whose street and locality match
+// exactly. Without it the cap kept whatever rows SQLite produced first, and on
+// a long street the asked-for number was usually not among them.
+//
+// Within one street address G-NAF has a row per unit (157 Fitzroy St, St
+// Kilda has about 200), so the asked-for unit comes next, then the asked-for
+// level (with no unit asked for, the level's own row, which has no unit).
+// After that rows stay
+// grouped by street address, in order of each address's first row, and the
+// primary row leads its address: with no unit in the query the base address
+// is the answer when it exists, and Score ties keep this order. Ranking the
+// addresses by their first row rather than putting every primary row first
+// keeps ties between different addresses ("133 WARRAGUL", no street) going
+// the way they did before units were read.
+func generateMatch(ctx context.Context, db *sql.DB, q Query, match string, cap int) ([]Candidate, error) {
 	limit := ""
 	if cap > 0 {
 		limit = fmt.Sprintf(" LIMIT %d", cap)
 	}
+	number, street, locality := q.field("street_number"), q.field("street_name"), q.field("locality_name")
+	flat, lot, level := q.field("flat_number"), q.field("lot_number"), q.field("level_number")
+	flatCol, lotCol, levelCol := `a.flat_number`, `a.lot_number`, levelColumn(ctx, db)
+	if !hasUnitColumns(ctx, db) {
+		flatCol, lotCol = `''`, `''`
+	}
+	// A level with no unit ("Level 2, 12 Collins St") asks for the level's
+	// own row; a unit on that level is no better than the base address.
+	levelOrder := levelCol + ` = ? DESC`
+	if flat == nil && level != nil {
+		levelOrder = `(` + levelCol + ` = ? AND ` + flatCol + ` = '') DESC`
+	}
 	rows, err := db.QueryContext(ctx, `
-		SELECT gnaf_pid, street_number, street_name, street_type,
+		SELECT gnaf_pid, `+flatCol+`, `+lotCol+`, `+levelCol+`, street_number, street_name, street_type,
 		       locality_name, state, postcode, latitude, longitude, confidence, geocode_rel
 		FROM address a
 		WHERE a.gnaf_pid IN (
-			SELECT gnaf_pid FROM addr_trgm WHERE addr_trgm MATCH ?`+limit+`
+			SELECT gnaf_pid FROM addr_trgm WHERE addr_trgm MATCH ? LIMIT `+fmt.Sprint(innerCap)+`
 		)
-	`, match)
+		ORDER BY CAST(a.street_number AS TEXT) = ? DESC, `+lotCol+` = ? DESC,
+			a.street_name = ? DESC, a.locality_name = ? DESC, `+flatCol+` = ? DESC, `+levelOrder+`,
+			MIN(a.rowid) OVER (PARTITION BY a.street_number, a.street_name, a.street_type, a.locality_name),
+			a.primary_sec <> 'S' DESC, a.rowid`+limit,
+		match, number, lot, street, locality, flat, level)
 	if err != nil {
 		return nil, err
 	}
@@ -126,7 +182,7 @@ func generateMatch(ctx context.Context, db *sql.DB, match string, cap int) ([]Ca
 	var out []Candidate
 	for rows.Next() {
 		var c Candidate
-		if err := rows.Scan(&c.PID, &c.StreetNumber, &c.StreetName, &c.StreetType,
+		if err := rows.Scan(&c.PID, &c.FlatNumber, &c.LotNumber, &c.LevelNumber, &c.StreetNumber, &c.StreetName, &c.StreetType,
 			&c.Locality, &c.State, &c.Postcode, &c.Lat, &c.Lon, &c.Confidence, &c.GeocodeRel); err != nil {
 			return nil, err
 		}
@@ -134,6 +190,67 @@ func generateMatch(ctx context.Context, db *sql.DB, match string, cap int) ([]Ca
 	}
 	return out, rows.Err()
 }
+
+// unitColumns records, per dataset, whether address has flat_number and
+// lot_number. A dataset built before buildaddr added them still serves street
+// addresses, with units and lots unmatched, instead of failing every query.
+var unitColumns sync.Map // *sql.DB -> bool
+
+func hasUnitColumns(ctx context.Context, db *sql.DB) bool {
+	if v, ok := unitColumns.Load(db); ok {
+		return v.(bool)
+	}
+	var n int
+	err := db.QueryRowContext(ctx, `SELECT count(*) FROM pragma_table_info('address')
+		WHERE name IN ('flat_number', 'lot_number')`).Scan(&n)
+	if err != nil {
+		return false // not cached: a cancelled request must not decide for the dataset
+	}
+	unitColumns.Store(db, n == 2)
+	return n == 2
+}
+
+// field returns the first score token tagged with field, or nil when there is
+// none (so an SQL equality against it never matches).
+func (q Query) field(name string) any {
+	if v := q.Field(name); v != "" {
+		return v
+	}
+	return nil
+}
+
+// Field returns the first score token tagged with name, or "".
+func (q Query) Field(name string) string {
+	for i, f := range q.Fields {
+		if f == name && i < len(q.Score) {
+			return q.Score[i]
+		}
+	}
+	return ""
+}
+
+// withStreet returns a copy of q with its street name replaced everywhere it
+// appears (anchors and scoring tokens).
+func (q Query) withStreet(from, to string) Query {
+	out := Query{Fields: q.Fields}
+	for _, t := range q.Reliable {
+		if t == from {
+			t = to
+		}
+		out.Reliable = append(out.Reliable, t)
+	}
+	for i, t := range q.Score {
+		if t == from && i < len(q.Fields) && q.Fields[i] == "street_name" {
+			t = to
+		}
+		out.Score = append(out.Score, t)
+	}
+	return out
+}
+
+// nearStreetInLocality is how close a misspelt street must be to a street in
+// the query's locality to be corrected to it.
+const nearStreetInLocality = 0.75
 
 // Score computes edit-distance similarity between a query token and a row token.
 // The design scores against the full query, not just the reliable set.
@@ -155,6 +272,9 @@ func Score(q Query, row Candidate) float64 {
 		"street_name":   row.StreetName,
 		"street_number": row.StreetNumber,
 		"street_type":   row.StreetType,
+		"flat_number":   row.FlatNumber,
+		"lot_number":    row.LotNumber,
+		"level_number":  row.LevelNumber,
 	}
 	// Weight per field: locality and state are anchors — an exact match there
 	// strongly signals the right address, so they outweigh street similarity.
@@ -165,6 +285,13 @@ func Score(q Query, row Candidate) float64 {
 		"street_name":   1.0,
 		"street_number": 2.0, // number is decisive when present
 		"street_type":   0.5,
+		// The unit picks a row within the street address; it must not pull
+		// in the same unit number at a neighbouring street number.
+		"flat_number": 0.5,
+		// A lot stands in for the street number, and is as decisive.
+		"lot_number": 2.0,
+		// The level picks a row within the street address, after the unit.
+		"level_number": 0.5,
 	}
 
 	total := 0.0
@@ -173,17 +300,35 @@ func Score(q Query, row Candidate) float64 {
 		if qt == "" {
 			continue
 		}
+		if i < len(q.Fields) && q.Fields[i] == "postal_delivery" {
+			continue
+		}
 		sim := 0.0
 		w := 1.0
 		if i < len(q.Fields) {
 			tag := q.Fields[i]
 			val, ok := fieldMap[tag]
-			if ok {
+			switch {
+			case ok && tag == "level_number":
+				// As the unit; with no unit asked for, only the level's
+				// own row (no unit on it) is that level.
+				if qt == val && (row.FlatNumber == "" || q.Field("flat_number") != "") {
+					sim = 1
+				}
+				w = fieldWeight[tag]
+			case ok && (tag == "flat_number" || tag == "lot_number"):
+				// An identifier, not a word: unit 9 is no nearer unit 99
+				// than unit 40 is, so only the exact row scores.
+				if qt == val {
+					sim = 1
+				}
+				w = fieldWeight[tag]
+			case ok:
 				sim = levenshteinSim(qt, val)
 				if tw, ok := fieldWeight[tag]; ok {
 					w = tw
 				}
-			} else {
+			default:
 				sim = bestAcrossFields(qt, row)
 			}
 		} else {
@@ -216,6 +361,9 @@ func bestAcrossFields(qt string, row Candidate) float64 {
 
 // levenshteinSim is normalised edit-distance similarity in [0,1].
 // 1.0 when equal; falls off with distance. Case-insensitive, already normalised.
+// The distance is optimal string alignment: Levenshtein plus adjacent
+// transposition as one edit, so "WINSDOR" is one edit from WINDSOR, not two.
+// Swapped letters are among the commonest typing errors.
 func levenshteinSim(a, b string) float64 {
 	if a == b {
 		return 1.0
@@ -224,7 +372,8 @@ func levenshteinSim(a, b string) float64 {
 	if la == 0 || lb == 0 {
 		return 0
 	}
-	// Levenshtein distance (DP, O(la*lb)).
+	// OSA distance (DP over three rows, O(la*lb)).
+	prev2 := make([]int, lb+1)
 	prev := make([]int, lb+1)
 	cur := make([]int, lb+1)
 	for j := 0; j <= lb; j++ {
@@ -244,9 +393,14 @@ func levenshteinSim(a, b string) float64 {
 			if v := cur[j-1] + 1; v < m {
 				m = v
 			}
+			if i > 1 && j > 1 && a[i-1] == b[j-2] && a[i-2] == b[j-1] {
+				if v := prev2[j-2] + 1; v < m {
+					m = v
+				}
+			}
 			cur[j] = m
 		}
-		prev, cur = cur, prev
+		prev2, prev, cur = prev, cur, prev2
 	}
 	dist := prev[lb]
 	// Normalise: similarity = 1 - dist/maxLen, clamped.
@@ -263,3 +417,7 @@ func max(a, b int) int {
 	}
 	return b
 }
+
+// Similarity is the normalised edit-distance similarity used for scoring and
+// fuzzy correction, in [0,1].
+func Similarity(a, b string) float64 { return levenshteinSim(a, b) }

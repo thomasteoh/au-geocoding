@@ -34,7 +34,7 @@ file auplaces-server   # statically linked
 ```
 
 The DB must already exist (built by `auplaces-load`). The server opens it
-read-only (`PRAGMA query_only=ON`) and refuses to start if the `address` table
+read-only (`mode=ro` and `query_only` on every pooled connection) and refuses to start if the `address` table
 is missing (D-020 fail-fast).
 
 ## Run (Docker)
@@ -131,8 +131,30 @@ AUGEO_CTRL_TOKEN=$TOKEN ./cmd/activate -db data/vic.db.new -version gnaf-aug26+o
 
 The token is a secret — never pass it as a flag (it would leak into shell
 history); the tool reads it from `AUGEO_CTRL_TOKEN`. The server also refuses
-arbitrary DB paths: the requested file must resolve under the serving data dir
-(absolute paths and `..` traversal are rejected).
+arbitrary DB paths: the requested file (relative to the server's working
+directory, symlinks resolved) must be a regular file inside the directory
+holding the boot dataset, and it is opened by that resolved path, read-only.
+
+Activation also requires a passing `cmd/verify` report beside the file
+(`<db>.verify.json`, `"ok": true`) whose `sha256` matches the file as it is
+now; otherwise it returns 409 and the old dataset keeps serving. The served
+`dataset_version` is the file's own `address.dataset_version` (set by
+`buildaddr -version`, default `gnaf-YYYY-MM` from the G-NAF release); a
+`version` in the request is optional and must match it. The replaced pool is
+closed after a drain delay (longer than the server's write timeout).
+
+### Loaders never write a served file
+
+The server holds a shared advisory lock (`flock`) on every dataset it serves;
+`buildaddr`, `assertapply`, `loadboundary`, `loadoscdiff` and `oscchain` take
+an exclusive one and refuse to start while a server holds the file. Build into
+a staging copy (`data/vic.db.new`), run `cmd/verify` on it, then activate it.
+Loaders set `busy_timeout`; WAL is deliberately not enabled, since a WAL file
+opened `mode=ro` needs write access to its `-shm` file, which the server's
+read-only mount does not give it.
+
+`buildaddr`, `assertapply` and `loadboundary` each replace their tables in a
+single transaction, so an interrupted run leaves the previous tables intact.
 
 ## Licence compliance (D-018)
 

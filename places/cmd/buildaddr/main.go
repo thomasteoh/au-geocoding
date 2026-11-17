@@ -2,6 +2,14 @@
 // ADDRESS_VIEW. This is the real-data swap for the matcher: the synthetic
 // address table is replaced by the real flattened view, and the trigram index
 // is built over the real data. After this, the matcher runs unchanged.
+//
+// The rebuild is one transaction: drop, materialise, index, addr_trgm and
+// addr_rt either all land or none do. Run outside a transaction, a crash after
+// the DROPs left a DB with no address table at all.
+//
+// address.dataset_version is the dataset's single version label: the server
+// reports it at boot and on activation, and every response carries it. Set it
+// with -version; by default it is derived from the G-NAF release.
 package main
 
 import (
@@ -11,18 +19,61 @@ import (
 	"log"
 
 	_ "modernc.org/sqlite"
+
+	"auplaces/internal/schema"
 )
 
 func main() {
-	dbPath := flag.String("db", "data/vic.db", "SQLite DB path")
+	dbPath := flag.String("db", "data/vic.db", "SQLite DB path; refused while a server has it open (build a staging copy, then activate it)")
+	version := flag.String("version", "", "dataset version label stored in address.dataset_version (default: gnaf-YYYY-MM from the G-NAF release)")
+	aliasesOnly := flag.Bool("aliases-only", false, "rebuild only the alias tables from G-NAF's (address must already be built)")
 	flag.Parse()
 
-	db, err := sql.Open("sqlite", *dbPath)
+	db, release, err := schema.OpenWriter(*dbPath)
 	if err != nil {
 		log.Fatalf("open: %v", err)
 	}
+	defer release()
 	defer db.Close()
 
+	if *aliasesOnly {
+		tx, err := db.Begin()
+		if err != nil {
+			log.Fatalf("begin: %v", err)
+		}
+		buildAliases(tx)
+		if err := tx.Commit(); err != nil {
+			log.Fatalf("commit: %v", err)
+		}
+		fmt.Println("committed")
+		return
+	}
+
+	if *version == "" {
+		v, err := releaseVersion(db)
+		if err != nil {
+			log.Fatalf("derive dataset version (pass -version): %v", err)
+		}
+		*version = v
+	}
+	fmt.Printf("dataset version: %s\n", *version)
+
+	tx, err := db.Begin()
+	if err != nil {
+		log.Fatalf("begin: %v", err)
+	}
+	// A log.Fatalf inside build exits without committing; SQLite rolls the
+	// hot journal back on the next open, so the previous tables survive.
+	build(tx, *version)
+	if err := tx.Commit(); err != nil {
+		log.Fatalf("commit: %v", err)
+	}
+	fmt.Println("committed")
+}
+
+// build replaces address, addr_trgm and addr_rt inside the caller's
+// transaction. The parameter is named db so the statements read as before.
+func build(db *sql.Tx, version string) {
 	// Drop any existing synthetic address/addr_trgm (re-runs).
 	for _, s := range []string{
 		`DROP TABLE IF EXISTS addr_trgm`,
@@ -39,7 +90,24 @@ func main() {
 		CREATE TABLE address AS
 		SELECT
 			ADDRESS_DETAIL_PID AS gnaf_pid,
-			COALESCE(CAST(NUMBER_FIRST AS INTEGER), '') AS street_number,
+			-- An empty NUMBER_FIRST casts to 0, which made every lot-only
+			-- address street number 0; it stays empty.
+			CASE WHEN COALESCE(NUMBER_FIRST, '') = '' THEN ''
+				ELSE CAST(NUMBER_FIRST AS INTEGER) END AS street_number,
+			-- The unit and lot as the parser reads them: digits only, so
+			-- "UNIT 3A" and FLAT_NUMBER 3 with suffix A meet at "3". G-NAF
+			-- stores FLAT_NUMBER as a real ("3.0").
+			CASE WHEN COALESCE(FLAT_NUMBER, '') = '' THEN ''
+				ELSE CAST(CAST(FLAT_NUMBER AS INTEGER) AS TEXT) END AS flat_number,
+			TRIM(COALESCE(LOT_NUMBER, '')) AS lot_number,
+			-- The level as the parser reads it ("LEVEL 2", "2ND FLOOR"):
+			-- digits, and only for a plain level or floor, so "Level 1" does
+			-- not pick basement 1 or a ground-floor "LG" level.
+			CASE WHEN COALESCE(LEVEL_NUMBER, '') <> ''
+					AND COALESCE(LEVEL_TYPE, '') IN ('', 'LEVEL', 'FLOOR')
+					AND COALESCE(LEVEL_NUMBER_PREFIX, '') IN ('', 'L', 'FL')
+				THEN CAST(CAST(LEVEL_NUMBER AS INTEGER) AS TEXT) ELSE '' END AS level_number,
+			COALESCE(LEVEL_TYPE, '') AS level_type,
 			STREET_NAME AS street_name,
 			-- STREET_TYPE_CODE is the street type (STREET, ROAD, AVENUE).
 			-- STREET_CLASS_TYPE is a CONFIRMED/UNCONFIRMED status flag and was
@@ -69,7 +137,10 @@ func main() {
 				WHEN 'LOCALITY'                       THEN 1
 				ELSE 0
 			END AS geocode_rel,
-			COALESCE(PRIMARY_SECONDARY, 'P') AS primary_sec,
+			-- Most standalone addresses carry an empty PRIMARY_SECONDARY, not
+			-- NULL; both mean primary. Generation prefers primary rows when the
+			-- query names no unit, so a secondary must be exactly 'S'.
+			COALESCE(NULLIF(PRIMARY_SECONDARY, ''), 'P') AS primary_sec,
 			COALESCE(BUILDING_NAME, '') AS address_alias,
 			'' AS mb_2026,
 			'real-gnaf-2026' AS dataset_version
@@ -77,10 +148,20 @@ func main() {
 	`); err != nil {
 		log.Fatalf("materialise address: %v", err)
 	}
+	// The SELECT above writes a placeholder label; stamp the real one. Done as
+	// an UPDATE so the column list stays a plain mapping from ADDRESS_VIEW, and
+	// before the indexes exist so it rewrites only the table.
+	if _, err := db.Exec(`UPDATE address SET dataset_version = ?`, version); err != nil {
+		log.Fatalf("stamp dataset version: %v", err)
+	}
 	fmt.Println("address materialised from ADDRESS_VIEW")
 
 	// Indexes.
 	for _, s := range []string{
+		// Generation looks rows up by PID (gnaf_pid IN (trigram match)), and
+		// CREATE TABLE AS carries no key: without this index every address
+		// query scans all 4M rows.
+		`CREATE UNIQUE INDEX IF NOT EXISTS idx_addr_pid ON address(gnaf_pid)`,
 		`CREATE INDEX IF NOT EXISTS idx_addr_locality ON address(locality_name)`,
 		`CREATE INDEX IF NOT EXISTS idx_addr_state     ON address(state)`,
 		`CREATE INDEX IF NOT EXISTS idx_addr_postcode ON address(postcode)`,
@@ -130,6 +211,8 @@ func main() {
 	}
 	fmt.Println("addr_rt reverse index built")
 
+	buildAliases(db)
+
 	// Verify.
 	var n int
 	if err := db.QueryRow(`SELECT count(*) FROM address`).Scan(&n); err != nil {
@@ -141,4 +224,21 @@ func main() {
 		log.Fatalf("count addr_rt: %v", err)
 	}
 	fmt.Printf("addr_rt rows: %d\n", rt)
+}
+
+// releaseVersion derives the default version label from the G-NAF release
+// loaded into ADDRESS_DETAIL: a quarterly release carries edits up to shortly
+// before publication, so the newest created/modified date names its month
+// (the AUGUST 2026 release's newest edit is 2026-08-04, giving gnaf-2026-08).
+func releaseVersion(db *sql.DB) (string, error) {
+	var newest sql.NullString
+	if err := db.QueryRow(`
+		SELECT max(max(coalesce(date_last_modified, '')), max(coalesce(date_created, '')))
+		FROM ADDRESS_DETAIL`).Scan(&newest); err != nil {
+		return "", err
+	}
+	if len(newest.String) < 7 {
+		return "", fmt.Errorf("ADDRESS_DETAIL has no dates")
+	}
+	return "gnaf-" + newest.String[:7], nil
 }

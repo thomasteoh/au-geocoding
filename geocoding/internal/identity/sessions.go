@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/subtle"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"time"
 )
@@ -17,7 +18,8 @@ type Session struct {
 	Method       string // oidc, github, saml, passkey
 	IdPSID       string
 	IdPSub       string
-	IDToken      string // opened; for RP-initiated logout id_token_hint
+	IdPSubQual   NameIDQualifiers // SAML NameID format and qualifiers, for LogoutRequest
+	IDToken      string           // opened; for RP-initiated logout id_token_hint
 	UserAgent    string
 	Created      time.Time
 	LastSeen     time.Time
@@ -37,8 +39,33 @@ type NewSession struct {
 	Method       string
 	IdPSID       string
 	IdPSub       string
+	IdPSubQual   NameIDQualifiers
 	IDToken      string
 	UserAgent    string
+}
+
+// NameIDQualifiers are the SAML NameID attributes an IdP may require to be
+// echoed in a LogoutRequest (SAML core 2.2.2, 3.7.1). Stored as JSON.
+type NameIDQualifiers struct {
+	Format          string `json:"format,omitempty"`
+	NameQualifier   string `json:"nq,omitempty"`
+	SPNameQualifier string `json:"spnq,omitempty"`
+}
+
+func (q NameIDQualifiers) encode() string {
+	if q == (NameIDQualifiers{}) {
+		return ""
+	}
+	b, _ := json.Marshal(q)
+	return string(b)
+}
+
+func decodeQualifiers(s string) NameIDQualifiers {
+	var q NameIDQualifiers
+	if s != "" {
+		json.Unmarshal([]byte(s), &q)
+	}
+	return q
 }
 
 // CreateSession stores a session and returns the raw ID for the cookie. The
@@ -57,9 +84,9 @@ func (s *Store) CreateSession(ctx context.Context, n NewSession, p SessionPolicy
 	}
 	t := clock()
 	sess = Session{IDHash: HashToken(raw), UserID: n.UserID, CSRF: RandomToken(32), ConnectionID: n.ConnectionID, Method: n.Method,
-		IdPSID: n.IdPSID, IdPSub: n.IdPSub, IDToken: n.IDToken, UserAgent: ua, Created: t, LastSeen: t, Expires: t.Add(p.Max)}
-	_, err = s.db.ExecContext(ctx, `INSERT INTO sessions(id_hash, user_id, csrf, connection_id, method, idp_sid, idp_sub, id_token_enc, user_agent, created, last_seen, expires)
-		VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`, sess.IDHash, n.UserID, sess.CSRF, nullID(n.ConnectionID), n.Method, n.IdPSID, n.IdPSub, tok, ua,
+		IdPSID: n.IdPSID, IdPSub: n.IdPSub, IdPSubQual: n.IdPSubQual, IDToken: n.IDToken, UserAgent: ua, Created: t, LastSeen: t, Expires: t.Add(p.Max)}
+	_, err = s.db.ExecContext(ctx, `INSERT INTO sessions(id_hash, user_id, csrf, connection_id, method, idp_sid, idp_sub, idp_sub_qual, id_token_enc, user_agent, created, last_seen, expires)
+		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`, sess.IDHash, n.UserID, sess.CSRF, nullID(n.ConnectionID), n.Method, n.IdPSID, n.IdPSub, n.IdPSubQual.encode(), tok, ua,
 		ts(t), ts(t), ts(sess.Expires))
 	if err != nil {
 		return "", sess, err
@@ -68,18 +95,19 @@ func (s *Store) CreateSession(ctx context.Context, n NewSession, p SessionPolicy
 	return raw, sess, nil
 }
 
-const sessCols = `id_hash, user_id, csrf, COALESCE(connection_id,0), method, idp_sid, idp_sub, id_token_enc, user_agent, created, last_seen, expires`
+const sessCols = `id_hash, user_id, csrf, COALESCE(connection_id,0), method, idp_sid, idp_sub, idp_sub_qual, id_token_enc, user_agent, created, last_seen, expires`
 
 func (s *Store) scanSession(sc interface{ Scan(...any) error }) (Session, error) {
 	var x Session
-	var tok, c, l, e string
-	if err := sc.Scan(&x.IDHash, &x.UserID, &x.CSRF, &x.ConnectionID, &x.Method, &x.IdPSID, &x.IdPSub, &tok, &x.UserAgent, &c, &l, &e); err != nil {
+	var qual, tok, c, l, e string
+	if err := sc.Scan(&x.IDHash, &x.UserID, &x.CSRF, &x.ConnectionID, &x.Method, &x.IdPSID, &x.IdPSub, &qual, &tok, &x.UserAgent, &c, &l, &e); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return x, ErrNotFound
 		}
 		return x, err
 	}
 	x.Created, x.LastSeen, x.Expires = parseTS(c), parseTS(l), parseTS(e)
+	x.IdPSubQual = decodeQualifiers(qual)
 	if tok != "" && s.box != nil {
 		x.IDToken, _ = s.open(tok)
 	}
@@ -175,22 +203,34 @@ func (s *Store) DeleteUserSessions(ctx context.Context, userID int64, keep []byt
 func (s *Store) DeleteIdPSessions(ctx context.Context, connectionID int64, sid, sub string) (int64, error) {
 	var res sql.Result
 	var err error
+	col, val := "idp_sid", sid
 	switch {
 	case sid != "":
-		res, err = s.db.ExecContext(ctx, `DELETE FROM sessions WHERE connection_id=? AND idp_sid=?`, connectionID, sid)
 	case sub != "":
-		res, err = s.db.ExecContext(ctx, `DELETE FROM sessions WHERE connection_id=? AND idp_sub=?`, connectionID, sub)
+		col, val = "idp_sub", sub
 	default:
 		return 0, ErrInvalid
 	}
+	// The IdP session may also live on as a proof carried into a later
+	// session; revoke that too (the later session keeps any other access).
+	pr, err := s.db.ExecContext(ctx, `DELETE FROM session_proofs WHERE connection_id=? AND `+col+`=?`, connectionID, val)
 	if err != nil {
 		return 0, err
 	}
-	return res.RowsAffected()
+	res, err = s.db.ExecContext(ctx, `DELETE FROM sessions WHERE connection_id=? AND `+col+`=?`, connectionID, val)
+	if err != nil {
+		return 0, err
+	}
+	n, _ := res.RowsAffected()
+	p, _ := pr.RowsAffected()
+	return n + p, nil
 }
 
 // DeleteConnectionSessions ends every session created through a connection.
 func (s *Store) DeleteConnectionSessions(ctx context.Context, connectionID int64) error {
+	if _, err := s.db.ExecContext(ctx, `DELETE FROM session_proofs WHERE connection_id=?`, connectionID); err != nil {
+		return err
+	}
 	_, err := s.db.ExecContext(ctx, `DELETE FROM sessions WHERE connection_id=?`, connectionID)
 	return err
 }
@@ -224,15 +264,46 @@ type Flow struct {
 // FlowTTL bounds how long a user has to complete a login at the IdP.
 const FlowTTL = 10 * time.Minute
 
+// MaxFlows caps unexpired login flows so anonymous sign-in starts cannot
+// grow app.db without bound. Past it StartFlow returns ErrTooManyFlows.
+var MaxFlows = 100000
+
+// ErrTooManyFlows: MaxFlows unexpired flows exist.
+var ErrTooManyFlows = errors.New("too many sign-in attempts in progress")
+
 // StartFlow stores a flow and returns the state (sent to the IdP) and the
 // binding (set as the flow cookie).
 func (s *Store) StartFlow(ctx context.Context, f Flow) (state, binding string, err error) {
 	state, binding = RandomToken(32), RandomToken(32)
-	s.db.ExecContext(ctx, `DELETE FROM auth_flows WHERE expires<?`, now())
-	_, err = s.db.ExecContext(ctx, `INSERT INTO auth_flows(state_hash, binding, kind, connection_id, nonce, pkce_verifier, request_id, return_to, data, user_id, expires)
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return "", "", err
+	}
+	defer tx.Rollback()
+	// The prune is a write, so the count below runs under the write lock.
+	if _, err := tx.ExecContext(ctx, `DELETE FROM auth_flows WHERE expires<?`, now()); err != nil {
+		return "", "", err
+	}
+	// A user's own ceremonies (link, passkey registration) replace their
+	// earlier unfinished ones, so one account cannot pile up flows.
+	if f.UserID != 0 {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM auth_flows WHERE user_id=? AND kind=?`, f.UserID, f.Kind); err != nil {
+			return "", "", err
+		}
+	}
+	var n int
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM auth_flows`).Scan(&n); err != nil {
+		return "", "", err
+	}
+	if n >= MaxFlows {
+		return "", "", ErrTooManyFlows
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO auth_flows(state_hash, binding, kind, connection_id, nonce, pkce_verifier, request_id, return_to, data, user_id, expires)
 		VALUES (?,?,?,?,?,?,?,?,?,?,?)`, HashToken(state), binding, f.Kind, nullID(f.ConnectionID), f.Nonce, f.PKCEVerifier, f.RequestID, f.ReturnTo,
-		f.Data, nullID(f.UserID), ts(clock().Add(FlowTTL)))
-	return state, binding, err
+		f.Data, nullID(f.UserID), ts(clock().Add(FlowTTL))); err != nil {
+		return "", "", err
+	}
+	return state, binding, tx.Commit()
 }
 
 // TakeFlow consumes a flow by state. The binding from the browser's flow
@@ -254,6 +325,43 @@ func (s *Store) TakeFlow(ctx context.Context, state, binding string) (Flow, erro
 	var b, exp string
 	err = tx.QueryRowContext(ctx, `SELECT binding, kind, COALESCE(connection_id,0), nonce, pkce_verifier, request_id, return_to, data, COALESCE(user_id,0), expires
 		FROM auth_flows WHERE state_hash=?`, h).Scan(&b, &f.Kind, &f.ConnectionID, &f.Nonce, &f.PKCEVerifier, &f.RequestID, &f.ReturnTo, &f.Data, &f.UserID, &exp)
+	if errors.Is(err, sql.ErrNoRows) {
+		return Flow{}, ErrNotFound
+	}
+	if err != nil {
+		return Flow{}, err
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM auth_flows WHERE state_hash=?`, h); err != nil {
+		return Flow{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return Flow{}, err
+	}
+	if subtle.ConstantTimeCompare([]byte(b), []byte(binding)) != 1 || !clock().Before(parseTS(exp)) {
+		return Flow{}, ErrNotFound
+	}
+	return f, nil
+}
+
+// TakeFlowByRequest consumes the flow of kind for a connection whose request
+// ID is requestID, for messages that answer a request by ID rather than by
+// state (SAML LogoutResponse InResponseTo). Like TakeFlow, the row is
+// deleted whether or not the browser binding matches.
+func (s *Store) TakeFlowByRequest(ctx context.Context, kind string, connectionID int64, requestID, binding string) (Flow, error) {
+	if kind == "" || requestID == "" {
+		return Flow{}, ErrNotFound
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return Flow{}, err
+	}
+	defer tx.Rollback()
+	var f Flow
+	var h []byte
+	var b, exp string
+	err = tx.QueryRowContext(ctx, `SELECT state_hash, binding, kind, COALESCE(connection_id,0), nonce, pkce_verifier, request_id, return_to, data, COALESCE(user_id,0), expires
+		FROM auth_flows WHERE kind=? AND connection_id=? AND request_id=?`, kind, connectionID, requestID).
+		Scan(&h, &b, &f.Kind, &f.ConnectionID, &f.Nonce, &f.PKCEVerifier, &f.RequestID, &f.ReturnTo, &f.Data, &f.UserID, &exp)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Flow{}, ErrNotFound
 	}
