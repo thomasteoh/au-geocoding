@@ -45,18 +45,26 @@ jobs:
         run: go test -race ./...
 
   # INV-1: no raw query text is ever logged or emitted as telemetry. Decoding
-  # the body is fine; logging r.Body or RawQuery is a violation.
+  # the body is fine; logging it is a violation. shared/cmd/inv1lint parses
+  # every logging call (log.*, logger.*, s.Log.*, fmt.Print*, ...) and fails on
+  # arguments that reach request input (Body, RawQuery, Query(), Form, the
+  # whole URL, or values/keys named body/query/q/prefix/...). The skipped
+  # directories are offline fixture tools that never see request input.
   inv1:
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: shared
+    env:
+      GOWORK: "off"
     steps:
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8
+      - uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5
+        with:
+          go-version: "1.26"
+          cache-dependency-path: shared/go.sum
       - name: INV-1 check
-        run: |
-          if grep -rnE "log\.[A-Za-z]+\(.*r\.Body|log\.[A-Za-z]+\(.*RawQuery|logger\.(Info|Error|Warn)\(.*r\.Body|logger\.(Info|Error|Warn)\(.*RawQuery|fmt\.Print.*r\.Body|fmt\.Print.*RawQuery" \
-              --include="*.go" geocoding/cmd geocoding/internal places/cmd places/internal shared; then
-            echo "INV-1 violation: raw body/query text logged"; exit 1
-          fi
-          echo "INV-1 ok"
+        run: go run ./cmd/inv1lint -skip ../places/cmd/gen,../places/cmd/goldenfixture ../geocoding ../places ../shared
 
   # Corpus-subset smoke (R9.3): cmd/gen seeds a synthetic fixture DB and runs
   # the committed corpus subset against it.

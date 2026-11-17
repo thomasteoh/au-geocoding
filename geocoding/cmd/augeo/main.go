@@ -187,8 +187,27 @@ func main() {
 	// The ladder: rungs 1–4 deterministic + rung 5 LLM (queued) when configured.
 	l := buildLadder(resolver, cfg, llmClient, log)
 
-	// Metrics: in-memory counters, no query-derived labels (runtime.md).
-	met := metrics.New("augeo")
+	// Metrics: in-memory counters, no query-derived labels (runtime.md). The
+	// endpoint label set is fixed; anything else is recorded as "other".
+	met := metrics.New("augeo", "/search", "/geocode", "/reverse", "/poi", "/parse", "/suggest")
+
+	// /metrics on the public listener is gated by the control token. For an
+	// unauthenticated scrape (Prometheus on a private network), set
+	// AUGEO_METRICS_ADDR to a listen address that is not published; that
+	// listener serves /metrics only.
+	var metricsSrv *http.Server
+	if addr := os.Getenv("AUGEO_METRICS_ADDR"); addr != "" {
+		mm := http.NewServeMux()
+		mm.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) { met.Render(w) })
+		metricsSrv = &http.Server{Addr: addr, Handler: mm, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 5 * time.Second, WriteTimeout: 10 * time.Second}
+		go func() {
+			log.Info("metrics_listening", "addr", addr)
+			if err := metricsSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				log.Error("metrics_server_failed", "error", err.Error())
+				os.Exit(1)
+			}
+		}()
+	}
 
 	// WriteTimeout must cover the batch path: Batch.MaxDuration (D-034) allows
 	// a batch to run up to 600s, but the default 20s WriteTimeout would cut any
@@ -219,6 +238,9 @@ func main() {
 		ctx, cancel := context.WithTimeout(context.Background(), time.Duration(cfg.Server.ShutdownGrace)*time.Second)
 		defer cancel()
 		_ = srv.Shutdown(ctx)
+		if metricsSrv != nil {
+			_ = metricsSrv.Shutdown(ctx)
+		}
 		// Stop background workers; a send in flight is abandoned and left
 		// pending for the next start.
 		bgStop()
@@ -298,7 +320,7 @@ func newMux(l *ladder.Ladder, store *publicapi.Store, authn *apiauth.Authenticat
 	mux.HandleFunc("/suggest", handleSuggest(resolver, store, authn, cfg, log, met))
 	mux.HandleFunc("/healthz", handleHealthz())
 	mux.HandleFunc("/readyz", handleReadyz(resolver, cfg, log))
-	mux.HandleFunc("/metrics", handleMetrics(met))
+	mux.HandleFunc("/metrics", handleMetrics(met, ctrlToken))
 	mux.HandleFunc("/ctrl/llm", handleCtrlLLM(llmHolder, ctrlToken, log))
 
 	return mux
@@ -1111,8 +1133,19 @@ func handleCtrlLLM(h *llm.Holder, ctrlToken string, log *slog.Logger) http.Handl
 	}
 }
 
-func handleMetrics(met *metrics.Collector) http.HandlerFunc {
+// handleMetrics serves /metrics on the public listener, gated by the control
+// token (X-Augeo-Ctrl-Token or Authorization: Bearer). Empty token => endpoint
+// disabled (fail closed); use AUGEO_METRICS_ADDR for an internal scrape port.
+func handleMetrics(met *metrics.Collector, ctrlToken string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		tok := r.Header.Get("X-Augeo-Ctrl-Token")
+		if b, ok := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer "); ok && tok == "" {
+			tok = b
+		}
+		if ctrlToken == "" || subtle.ConstantTimeCompare([]byte(tok), []byte(ctrlToken)) != 1 {
+			writeJSONError(w, http.StatusUnauthorized, "unauthorized")
+			return
+		}
 		met.Render(w)
 	}
 }
