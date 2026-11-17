@@ -31,7 +31,7 @@ export GOWORK=off
 export AUGEO_APP_DB="$work/app.db"
 key="$("$work/keygen" -app-db "$AUGEO_APP_DB" -label smoke -tier standard | sed -n 's/^key=//p')"
 [ -n "$key" ] || { echo "FAIL keygen printed no key"; exit 1; }
-(cd "$work" && AUGEO_DB= "$work/places" -db "$db" -addr "127.0.0.1:$places_port" >"$work/places.log" 2>&1) & pids+=($!)
+(cd "$work" && AUGEO_DB= exec "$work/places" -db "$db" -addr "127.0.0.1:$places_port" >"$work/places.log" 2>&1) & pids+=($!)
 "$work/augeo" -addr "127.0.0.1:$augeo_port" -places-url "http://127.0.0.1:$places_port" >"$work/augeo.log" 2>&1 & pids+=($!)
 
 t0=$(date +%s)

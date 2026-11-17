@@ -285,7 +285,7 @@ func resolveReverse(ctx context.Context, db *sql.DB, req contract.ResolveRequest
 	if limit <= 0 {
 		limit = 5
 	}
-	res, err := match.Reverse(ctx, db, req.Anchor.Lon, req.Anchor.Lat, limit)
+	res, err := match.ReverseWithin(ctx, db, req.Anchor.Lon, req.Anchor.Lat, limit, float64(req.MaxRadiusM))
 	if err != nil {
 		return contract.ResolveResponse{}, err
 	}
