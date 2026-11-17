@@ -24,6 +24,7 @@ import (
 	"regexp"
 	"strings"
 
+	"ausystem/shared/postal"
 	"ausystem/shared/streettype"
 )
 
@@ -39,24 +40,34 @@ var Alias = map[string]string{
 	"MT":       "MOUNT",
 }
 
-// unitWords introduce a unit, flat, shop or level number ("UNIT 3", "LVL 2").
-// G-NAF scores street addresses here, so the unit is recognised and dropped.
+// unitWords introduce a unit, flat, shop or suite number ("UNIT 3", "SHOP
+// 2"), all of which G-NAF keeps as FLAT_NUMBER.
 var unitWords = map[string]bool{
 	"UNIT": true, "U": true, "FLAT": true, "F": true, "APARTMENT": true,
-	"APT": true, "SUITE": true, "SHOP": true, "LEVEL": true, "LVL": true,
-	"L": true,
+	"APT": true, "SUITE": true, "SHOP": true,
 }
 
+// levelWords introduce a floor ("LEVEL 2", "L2"). G-NAF keeps the level apart
+// from the flat and the address table does not carry it, so a level is read
+// only so that it is not taken for the unit, and dropped.
+var levelWords = map[string]bool{"LEVEL": true, "LVL": true, "L": true}
+
 var (
-	stripRe    = regexp.MustCompile(`[^A-Z0-9'/\-\s]`)
-	numberRe   = regexp.MustCompile(`^([0-9]+)[A-Z]?$`)
-	unitWordRe = regexp.MustCompile(`^(UNIT|APT|SHOP|LVL|U|F|L)([0-9]+)[A-Z]?$`)
+	stripRe     = regexp.MustCompile(`[^A-Z0-9'/\-\s]`)
+	numberRe    = regexp.MustCompile(`^([0-9]+)[A-Z]?$`)
+	unitWordRe  = regexp.MustCompile(`^(UNIT|APT|SHOP|U|F)([0-9]+)[A-Z]?$`)
+	levelWordRe = regexp.MustCompile(`^(LVL|L)([0-9]+)[A-Z]?$`)
 )
 
 // Parsed is a free-text address split into its parts.
 type Parsed struct {
-	Unit       string
-	Number     string
+	Unit   string // flat number, digits only
+	Lot    string // lot number: stands in for the street number on lots
+	Number string
+	// POBox is a postal delivery point the text opens with ("PO BOX 123",
+	// "LOCKED BAG 5"). G-NAF has no location for one: the answer is the
+	// locality or postcode that follows it.
+	POBox      string
 	Street     string // street name, words joined with single spaces
 	StreetType string // canonical full form (STREET, ROAD, ...)
 	Locality   string
@@ -97,11 +108,29 @@ func Parse(input string, maxTokens int, localitySet map[string]bool, nearest Nea
 
 	var p Parsed
 	i := 0
+	if pd, n := postal.Parse(toks); n > 0 {
+		p.POBox, i = pd, n
+	}
 	// Unit and street number. Accepts "UNIT 3 15", "U3 15", "3/15", "15-17"
-	// (a range: the first number is G-NAF's number_first) and "15A".
+	// (a range: the first number is G-NAF's number_first) and "15A", plus
+	// "LOT 5" and a level, which is skipped.
 	for i < len(toks) {
 		t := toks[i]
-		if unitWords[t] && i+1 < len(toks) && numberRe.MatchString(toks[i+1]) {
+		next := i+1 < len(toks) && numberRe.MatchString(toks[i+1])
+		if t == "LOT" && next {
+			p.Lot = numberRe.FindStringSubmatch(toks[i+1])[1]
+			i += 2
+			continue
+		}
+		if levelWords[t] && next {
+			i += 2
+			continue
+		}
+		if levelWordRe.MatchString(t) {
+			i++
+			continue
+		}
+		if unitWords[t] && next {
 			p.Unit = numberRe.FindStringSubmatch(toks[i+1])[1]
 			i += 2
 			continue
@@ -141,7 +170,7 @@ func Parse(input string, maxTokens int, localitySet map[string]bool, nearest Nea
 	}
 	if len(words) == 0 {
 		// A lone four-digit number is a postcode, not a street number.
-		if p.Unit == "" && isPostcode(p.Number) {
+		if p.Unit == "" && p.Lot == "" && isPostcode(p.Number) {
 			p.Postcode, p.Number = p.Number, ""
 		}
 		return p
@@ -235,7 +264,7 @@ func fuzzyLocality(words []string, start, end int, nearest NearestLocality, p *P
 	if start >= 0 {
 		for k := 2; k >= 1; k-- {
 			s := start - k
-			if s < 1 {
+			if s < 1 || streetTypeAt(words, s) {
 				continue
 			}
 			name, sim := nearest(strings.Join(words[s:end], " "))
@@ -263,6 +292,21 @@ func fuzzyLocality(words []string, start, end int, nearest NearestLocality, p *P
 	}
 	p.Locality = best
 	return bestStart, len(words)
+}
+
+// streetTypeAt reports whether words[s] is the street's type: a type word with
+// no other after the first word before it. Extending a locality over it would
+// read "COLLINS ST MELBOURNE" as COLLINS in EAST MELBOURNE.
+func streetTypeAt(words []string, s int) bool {
+	if !streettype.IsStreetType(words[s]) {
+		return false
+	}
+	for j := 1; j < s; j++ {
+		if streettype.IsStreetType(words[j]) {
+			return false
+		}
+	}
+	return true
 }
 
 // Tokenise parses text and returns the matcher's inputs: reliable tokens
@@ -297,6 +341,11 @@ func (p Parsed) Tokens() (reliable []string, score []string, fields []string) {
 	add(p.Locality, "locality_name", true)
 	add(p.Postcode, "postcode", true)
 	add(p.Number, "street_number", true)
+	// The unit, lot and postal box only order and score rows: addr_trgm
+	// does not index them, so they cannot anchor generation.
+	add(p.Unit, "flat_number", false)
+	add(p.Lot, "lot_number", false)
+	add(p.POBox, "postal_delivery", false)
 	add(p.StreetType, "street_type", false)
 	add(p.State, "state", false)
 	for _, r := range p.Rest {

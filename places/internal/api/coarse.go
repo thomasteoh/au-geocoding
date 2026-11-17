@@ -69,6 +69,43 @@ func resolveCoarse(ctx context.Context, db *sql.DB, sets *matchSets, q match.Que
 	return resp, nil
 }
 
+// resolvePostal answers a postal delivery point: a PO box, GPO box, locked
+// bag or private bag. G-NAF has no location for one, so the answer is the
+// centre of the locality it is addressed to, or of its postcode when no known
+// locality is named, with Candidate.PostalDelivery set so the caller can tell
+// a postal box from a street that could not be found. The locality goes first
+// because PO box postcodes (3001, 8001) often hold no street address at all;
+// a postcode that does not match the locality is ignored, as in
+// localityLevel. Other words are ignored too: a postal box has no street.
+func resolvePostal(ctx context.Context, db *sql.DB, sets *matchSets, q match.Query, box string, limit int) (contract.ResolveResponse, error) {
+	locality, postcode := q.Field("locality_name"), q.Field("postcode")
+	var cands []contract.Candidate
+	var err error
+	switch {
+	case sets.localities[locality]:
+		cands, err = localityLevel(ctx, db, locality, postcode)
+	case postcode != "":
+		cands, err = postcodeLevel(ctx, db, postcode)
+	}
+	if err != nil {
+		return contract.ResolveResponse{}, err
+	}
+	if len(cands) == 0 {
+		return contract.ResolveResponse{}, &resolveError{errNoCandidates}
+	}
+	for i := range cands {
+		cands[i].PostalDelivery = box
+	}
+	resp := contract.ResolveResponse{GeneratedCount: len(cands), TotalMatched: len(cands)}
+	if len(cands) > limit {
+		resp.Truncated = true
+		cands = cands[:limit]
+	}
+	resp.Candidates = cands
+	resp.DatasetVersion = datasetVersion(ctx, db)
+	return resp, nil
+}
+
 // streetLevel returns the centre of the named street in locality, one
 // candidate per street type ("COLLINS STREET" and "COLLINS WAY" are different
 // streets), the asked-for type first.

@@ -165,9 +165,18 @@ func resolveAddress(ctx context.Context, db *sql.DB, req contract.ResolveRequest
 	if limit <= 0 {
 		limit = 20
 	}
+	// A postal box with no street address beside it has no G-NAF row: answer
+	// at the locality or postcode it is addressed to, marked as a postal box.
+	number := qm.Field("street_number")
+	if number == "" {
+		number = qm.Field("lot_number") // a lot stands in for the number
+	}
+	if box := qm.Field("postal_delivery"); box != "" && number == "" {
+		return resolvePostal(ctx, db, sets, qm, box, limit)
+	}
 	// No street number, or no street: answer at street, locality or postcode
 	// precision, or not at all.
-	if qm.Field("street_number") == "" || qm.Field("street_name") == "" {
+	if number == "" || qm.Field("street_name") == "" {
 		return resolveCoarse(ctx, db, sets, qm, limit)
 	}
 	cands, _ := match.Generate(ctx, db, qm, sets.fuzzy, generateCap)
@@ -401,6 +410,8 @@ func componentTokens(c contract.AddressComponents) (reliable, sc, fields []strin
 		fields = append(fields, field)
 	}
 	add(c.StreetNumber, "street_number")
+	add(leadingDigits(c.Unit), "flat_number")
+	add(leadingDigits(c.Lot), "lot_number")
 	add(c.StreetName, "street_name")
 	add(c.StreetType, "street_type")
 	add(c.Locality, "locality_name")
@@ -418,6 +429,21 @@ func componentTokens(c contract.AddressComponents) (reliable, sc, fields []strin
 	return reliable, sc, fields
 }
 
+// leadingDigits reduces a unit or lot to the digits the dataset stores ("3A"
+// is unit 3), the same reading the free-text parser gives it. A value with no
+// leading digits is kept, so it still scores against the column.
+func leadingDigits(v string) string {
+	v = strings.TrimSpace(v)
+	n := 0
+	for n < len(v) && v[n] >= '0' && v[n] <= '9' {
+		n++
+	}
+	if n == 0 {
+		return v
+	}
+	return v[:n]
+}
+
 // contractTokens maps the contract's free-text token sets into the matcher's
 // Query. Score is the geocoder's full normalised token list, in query order;
 // the parts of an address are known by position, so the tokens are parsed as
@@ -430,11 +456,17 @@ func contractTokens(gen, score []string, sets *matchSets) (reliable, sc, fields 
 	return normalise.Tokenise(strings.Join(toks, " "), maxTokens, sets.localities, sets.fuzzy.NearestLocality)
 }
 
-// formatCandidateText builds the display address text for a candidate.
+// formatCandidateText builds the display address text for a candidate. A unit
+// row reads "2/36 COLLINS STREET", a lot "LOT 14 OLD SYDNEY ROAD".
 func formatCandidateText(c match.Candidate) string {
 	parts := []string{}
-	if c.StreetNumber != "" {
+	switch {
+	case c.FlatNumber != "" && c.StreetNumber != "":
+		parts = append(parts, c.FlatNumber+"/"+c.StreetNumber)
+	case c.StreetNumber != "":
 		parts = append(parts, c.StreetNumber)
+	case c.LotNumber != "":
+		parts = append(parts, "LOT "+c.LotNumber)
 	}
 	if c.StreetName != "" {
 		parts = append(parts, c.StreetName)

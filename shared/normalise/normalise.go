@@ -9,6 +9,7 @@ import (
 	"strings"
 	"unicode"
 
+	"ausystem/shared/postal"
 	"ausystem/shared/streettype"
 )
 
@@ -16,14 +17,18 @@ import (
 // used for matching. The reverse (full→abbrev) is unnecessary: generation and
 // scoring both work from the expanded form.
 
-// unitPrefixes introduce a unit, flat, shop or level number at the start of an
-// address ("unit 3", "lvl 2"). G-NAF is matched at the street address, so the
-// unit is recorded in Result.Unit and kept out of the tokens.
+// unitPrefixes introduce a unit, flat, shop or suite number at the start of an
+// address ("unit 3", "shop 2"). G-NAF keeps these as FLAT_NUMBER, so the unit
+// is recorded in Result.Unit and passed on as "unit N" (see Result.Tokens).
 var unitPrefixes = map[string]bool{
 	"unit": true, "u": true, "flat": true, "f": true, "apartment": true,
-	"apt": true, "suite": true, "su": true, "shop": true, "level": true,
-	"l": true, "lvl": true,
+	"apt": true, "suite": true, "su": true, "shop": true,
 }
+
+// levelPrefixes introduce a floor ("level 2", "lvl 2", "l2"). G-NAF keeps the
+// level apart from the flat number and the address table does not carry it,
+// so the level is read only so that it is not taken for a unit, and dropped.
+var levelPrefixes = map[string]bool{"level": true, "lvl": true, "l": true}
 
 // stateCodes maps state abbreviations to the full name.
 var stateCodes = map[string]string{
@@ -34,19 +39,28 @@ var stateCodes = map[string]string{
 
 // Result is the normalised form of one query.
 type Result struct {
-	Tokens     []string // full normalised token set, in query order — scoring
-	Generate   []string // reliable tokens — candidate generation
-	State      string   // hint, "" if absent
-	Postcode   string   // hint, "" if absent
-	Unit       string   // unit/flat number, "" if absent; not in Tokens
-	IsPOI      bool     // no numeric street number → likely a named place
+	// Tokens is the full normalised token set, in query order — scoring. A
+	// unit, lot or postal delivery point opens it in canonical words ("unit
+	// 3", "lot 5", "po box 123") so places reads it by position like the rest
+	// of the address; none of those words is in Generate.
+	Tokens   []string
+	Generate []string // reliable tokens — candidate generation
+	State    string   // hint, "" if absent
+	Postcode string   // hint, "" if absent
+	Unit     string   // unit/flat number, "" if absent
+	Lot      string   // lot number, "" if absent
+	// POBox is the postal delivery point the address opens with ("po box
+	// 123", "locked bag 5"), "" if none. G-NAF has no location for one.
+	POBox      string
+	IsPOI      bool // no street number, lot or postal box → likely a named place
 	HadNumbers bool
 	HadStreet  bool
 }
 
 var (
-	numberRe     = regexp.MustCompile(`^([0-9]+)[a-z]?$`)
-	unitPrefixRe = regexp.MustCompile(`^(unit|apt|shop|lvl|u|f|l)([0-9]+)[a-z]?$`)
+	numberRe      = regexp.MustCompile(`^([0-9]+)[a-z]?$`)
+	unitPrefixRe  = regexp.MustCompile(`^(unit|apt|shop|u|f)([0-9]+)[a-z]?$`)
+	levelPrefixRe = regexp.MustCompile(`^(lvl|l)([0-9]+)[a-z]?$`)
 )
 
 // Normalise folds case, strips punctuation, expands abbreviations, and pulls
@@ -60,7 +74,10 @@ var (
 // kilda rd" stays "st kilda road") and a second "st" after the street type
 // begins the locality ("fitzroy st st kilda" is "fitzroy street st kilda").
 // Unit forms "3/15", "unit 3 15" and "u3 15" give unit 3, number 15; a range
-// "15-17" gives 15, G-NAF's first number; "15a" gives 15.
+// "15-17" gives 15, G-NAF's first number; "15a" gives 15. "lot 5" is a lot
+// number, which stands in for the street number on rural and new-estate
+// addresses, and a level ("level 2", "l2") is skipped. A postal delivery point
+// ("PO Box 123", "GPO Box", "Locked Bag") is recognised only at the start.
 func Normalise(raw string) Result {
 	s := strings.ToLower(raw)
 	// Strip punctuation, keep alphanumerics and spaces (T3: no operator chars
@@ -84,10 +101,28 @@ func Normalise(raw string) Result {
 	var out Result
 	var number string
 	i := 0
-	// Leading unit and street number.
+	if pd, n := postal.Parse(toks); n > 0 {
+		out.POBox = strings.ToLower(pd)
+		i = n
+	}
+	// Leading unit, lot, level and street number.
 	for i < len(toks) {
 		t := toks[i]
-		if unitPrefixes[t] && i+1 < len(toks) && numberRe.MatchString(toks[i+1]) {
+		next := i+1 < len(toks) && numberRe.MatchString(toks[i+1])
+		if t == "lot" && next {
+			out.Lot = numberRe.FindStringSubmatch(toks[i+1])[1]
+			i += 2
+			continue
+		}
+		if levelPrefixes[t] && next {
+			i += 2
+			continue
+		}
+		if levelPrefixRe.MatchString(t) {
+			i++
+			continue
+		}
+		if unitPrefixes[t] && next {
 			out.Unit = numberRe.FindStringSubmatch(toks[i+1])[1]
 			i += 2
 			continue
@@ -121,12 +156,22 @@ func Normalise(raw string) Result {
 		}
 	}
 	// A lone four-digit number is a postcode, not a street number.
-	if number != "" && len(words) == 0 && isPostcode(number) && out.Unit == "" {
+	if number != "" && len(words) == 0 && isPostcode(number) && out.Unit == "" && out.Lot == "" {
 		out.Postcode, number = number, ""
 		words = []string{out.Postcode}
 	}
 
 	var keep []string
+	if out.POBox != "" {
+		keep = append(keep, strings.Fields(out.POBox)...)
+	}
+	if out.Unit != "" {
+		keep = append(keep, "unit", out.Unit)
+	}
+	if out.Lot != "" {
+		keep = append(keep, "lot", out.Lot)
+	}
+	qualifiers := len(keep)
 	if number != "" {
 		keep = append(keep, number)
 	}
@@ -149,14 +194,14 @@ func Normalise(raw string) Result {
 	out.Tokens = keep
 	// Generate = reliable tokens only: words, street type, postcode, state.
 	// The street number and other bare numbers are weak alone.
-	for _, t := range keep {
+	for _, t := range keep[qualifiers:] {
 		if t == out.Postcode || !isNumber(t) {
 			out.Generate = append(out.Generate, t)
 		}
 	}
 	out.State = stateCodes[state]
-	out.IsPOI = number == ""
-	out.HadNumbers = number != ""
+	out.IsPOI = number == "" && out.Lot == "" && out.POBox == ""
+	out.HadNumbers = number != "" || out.Lot != ""
 	out.HadStreet = hasStreet
 	return out
 }

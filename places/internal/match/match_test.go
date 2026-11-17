@@ -95,3 +95,50 @@ func TestLevenshteinSimTransposition(t *testing.T) {
 		t.Errorf("transposition similarity = %.2f, want one edit (>= 0.85)", got)
 	}
 }
+
+// unitsDB holds a building at 10 SMITH STREET with 60 units listed before its
+// base row, unit 5 at the next number, and lot 5 on SMITH STREET, which has no
+// street number.
+func unitsDB(t *testing.T) *sql.DB {
+	t.Helper()
+	db := longStreetDB(t)
+	add := func(pid, num, flat, lot, sec string) {
+		if _, err := db.Exec(`INSERT INTO address (gnaf_pid, street_number, flat_number, lot_number, primary_sec,
+			street_name, street_type, locality_name, state, postcode, latitude, longitude, confidence, geocode_rel)
+			VALUES (?, ?, ?, ?, ?, 'SMITH', 'STREET', 'PRESTON', 'VIC', '3072', -37.7, 145.0, 2, 6)`,
+			pid, num, flat, lot, sec); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for u := 1; u <= 60; u++ {
+		add(fmt.Sprintf("U%d-10", u), "10", fmt.Sprint(u), "", "S")
+	}
+	add("BASE-10", "10", "", "", "P")
+	add("U5-12", "12", "5", "", "S")
+	add("LOT-5", "", "", "5", "P")
+	add("NUM-5", "5", "", "", "P")
+	if _, err := db.Exec(`DELETE FROM addr_trgm`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO addr_trgm (gnaf_pid, street_number, street_name, locality_name, state, postcode)
+		SELECT gnaf_pid, street_number, street_name, locality_name, state, postcode FROM address`); err != nil {
+		t.Fatal(err)
+	}
+	return db
+}
+
+func TestUnitsAndLots(t *testing.T) {
+	db := unitsDB(t)
+	for _, c := range []struct{ q, want string }{
+		{"10 Smith St Preston", "BASE-10"},      // no unit: the base address
+		{"45/10 Smith St Preston", "U45-10"},    // the asked-for unit, past the cap
+		{"Unit 5 10 Smith St Preston", "U5-10"}, // not unit 5 at number 12
+		{"99/10 Smith St Preston", "BASE-10"},   // no such unit: still number 10
+		{"Lot 5 Smith St Preston", "LOT-5"},     // not number 5
+		{"5 Smith St Preston", "NUM-5"},         // not lot 5
+	} {
+		if got := best(t, db, c.q, 20); got != c.want {
+			t.Errorf("%q: got %q, want %q", c.q, got, c.want)
+		}
+	}
+}

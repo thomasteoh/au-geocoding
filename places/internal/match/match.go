@@ -10,6 +10,7 @@ import (
 	"database/sql"
 	"fmt"
 	"strings"
+	"sync"
 )
 
 // Query is a normalised user query: tokens split, reliable vs score sets.
@@ -18,12 +19,17 @@ import (
 type Query struct {
 	Reliable []string // locality, state, postcode, street number — anchors
 	Score    []string // full normalised token set, includes misspelled ones
-	Fields   []string // per-score-token field tag (locality/state/postcode/street_name/street_number)
+	// Fields tags each score token: locality_name, state, postcode,
+	// street_name, street_number, street_type, flat_number, lot_number, or
+	// postal_delivery (which only routes the query; it is never scored).
+	Fields []string
 }
 
 // Candidate is a generated row, unscored.
 type Candidate struct {
 	PID            string
+	FlatNumber     string // "" for an address with no unit
+	LotNumber      string
 	StreetNumber   string
 	StreetName     string
 	StreetType     string
@@ -124,24 +130,41 @@ const innerCap = 50000
 
 // generateMatch runs one trigram MATCH and returns up to cap rows, best first.
 // The order matters because the cap truncates: rows at the query's street
-// number come first, then rows whose street and locality match exactly. Without
-// it the cap kept whatever rows SQLite produced first, and on a long street the
-// asked-for number was usually not among them.
+// number (or lot) come first, then rows whose street and locality match
+// exactly. Without it the cap kept whatever rows SQLite produced first, and on
+// a long street the asked-for number was usually not among them.
+//
+// Within one street address G-NAF has a row per unit (157 Fitzroy St, St
+// Kilda has about 200), so the asked-for unit comes next. After that rows stay
+// grouped by street address, in order of each address's first row, and the
+// primary row leads its address: with no unit in the query the base address
+// is the answer when it exists, and Score ties keep this order. Ranking the
+// addresses by their first row rather than putting every primary row first
+// keeps ties between different addresses ("133 WARRAGUL", no street) going
+// the way they did before units were read.
 func generateMatch(ctx context.Context, db *sql.DB, q Query, match string, cap int) ([]Candidate, error) {
 	limit := ""
 	if cap > 0 {
 		limit = fmt.Sprintf(" LIMIT %d", cap)
 	}
 	number, street, locality := q.field("street_number"), q.field("street_name"), q.field("locality_name")
+	flat, lot := q.field("flat_number"), q.field("lot_number")
+	flatCol, lotCol := `a.flat_number`, `a.lot_number`
+	if !hasUnitColumns(ctx, db) {
+		flatCol, lotCol = `''`, `''`
+	}
 	rows, err := db.QueryContext(ctx, `
-		SELECT gnaf_pid, street_number, street_name, street_type,
+		SELECT gnaf_pid, `+flatCol+`, `+lotCol+`, street_number, street_name, street_type,
 		       locality_name, state, postcode, latitude, longitude, confidence, geocode_rel
 		FROM address a
 		WHERE a.gnaf_pid IN (
 			SELECT gnaf_pid FROM addr_trgm WHERE addr_trgm MATCH ? LIMIT `+fmt.Sprint(innerCap)+`
 		)
-		ORDER BY CAST(a.street_number AS TEXT) = ? DESC, a.street_name = ? DESC, a.locality_name = ? DESC, a.rowid`+limit,
-		match, number, street, locality)
+		ORDER BY CAST(a.street_number AS TEXT) = ? DESC, `+lotCol+` = ? DESC,
+			a.street_name = ? DESC, a.locality_name = ? DESC, `+flatCol+` = ? DESC,
+			MIN(a.rowid) OVER (PARTITION BY a.street_number, a.street_name, a.street_type, a.locality_name),
+			a.primary_sec <> 'S' DESC, a.rowid`+limit,
+		match, number, lot, street, locality, flat)
 	if err != nil {
 		return nil, err
 	}
@@ -150,13 +173,32 @@ func generateMatch(ctx context.Context, db *sql.DB, q Query, match string, cap i
 	var out []Candidate
 	for rows.Next() {
 		var c Candidate
-		if err := rows.Scan(&c.PID, &c.StreetNumber, &c.StreetName, &c.StreetType,
+		if err := rows.Scan(&c.PID, &c.FlatNumber, &c.LotNumber, &c.StreetNumber, &c.StreetName, &c.StreetType,
 			&c.Locality, &c.State, &c.Postcode, &c.Lat, &c.Lon, &c.Confidence, &c.GeocodeRel); err != nil {
 			return nil, err
 		}
 		out = append(out, c)
 	}
 	return out, rows.Err()
+}
+
+// unitColumns records, per dataset, whether address has flat_number and
+// lot_number. A dataset built before buildaddr added them still serves street
+// addresses, with units and lots unmatched, instead of failing every query.
+var unitColumns sync.Map // *sql.DB -> bool
+
+func hasUnitColumns(ctx context.Context, db *sql.DB) bool {
+	if v, ok := unitColumns.Load(db); ok {
+		return v.(bool)
+	}
+	var n int
+	err := db.QueryRowContext(ctx, `SELECT count(*) FROM pragma_table_info('address')
+		WHERE name IN ('flat_number', 'lot_number')`).Scan(&n)
+	if err != nil {
+		return false // not cached: a cancelled request must not decide for the dataset
+	}
+	unitColumns.Store(db, n == 2)
+	return n == 2
 }
 
 // field returns the first score token tagged with field, or nil when there is
@@ -221,6 +263,8 @@ func Score(q Query, row Candidate) float64 {
 		"street_name":   row.StreetName,
 		"street_number": row.StreetNumber,
 		"street_type":   row.StreetType,
+		"flat_number":   row.FlatNumber,
+		"lot_number":    row.LotNumber,
 	}
 	// Weight per field: locality and state are anchors — an exact match there
 	// strongly signals the right address, so they outweigh street similarity.
@@ -231,6 +275,11 @@ func Score(q Query, row Candidate) float64 {
 		"street_name":   1.0,
 		"street_number": 2.0, // number is decisive when present
 		"street_type":   0.5,
+		// The unit picks a row within the street address; it must not pull
+		// in the same unit number at a neighbouring street number.
+		"flat_number": 0.5,
+		// A lot stands in for the street number, and is as decisive.
+		"lot_number": 2.0,
 	}
 
 	total := 0.0
@@ -239,17 +288,28 @@ func Score(q Query, row Candidate) float64 {
 		if qt == "" {
 			continue
 		}
+		if i < len(q.Fields) && q.Fields[i] == "postal_delivery" {
+			continue
+		}
 		sim := 0.0
 		w := 1.0
 		if i < len(q.Fields) {
 			tag := q.Fields[i]
 			val, ok := fieldMap[tag]
-			if ok {
+			switch {
+			case ok && (tag == "flat_number" || tag == "lot_number"):
+				// An identifier, not a word: unit 9 is no nearer unit 99
+				// than unit 40 is, so only the exact row scores.
+				if qt == val {
+					sim = 1
+				}
+				w = fieldWeight[tag]
+			case ok:
 				sim = levenshteinSim(qt, val)
 				if tw, ok := fieldWeight[tag]; ok {
 					w = tw
 				}
-			} else {
+			default:
 				sim = bestAcrossFields(qt, row)
 			}
 		} else {
