@@ -5,9 +5,12 @@
 # is a correct answer. A fifth part names the row instead: "unit N", "lot N"
 # for a lot with no street number, or empty for the base address (no unit).
 # Coarser answers are the candidate ID (street:..., locality:...,
-# postcode:...), prefixed "BOX@" for a postal box (PO BOX 1@locality:...), and
-# (none) means /resolve must decline so the ladder moves on to POI search.
-# Coarse, postal and (none) rows are /resolve only.
+# postcode:..., intersection:STREET A|STREET B|LOCALITY with the streets
+# sorted), prefixed "BOX@" for a postal box (PO BOX 1@locality:...), (none)
+# means /resolve must decline so the ladder moves on to POI search, and
+# (out_of_scope) means /resolve must refuse the query as being for a state the
+# dataset does not cover. Coarse, postal, (none) and (out_of_scope) rows are
+# /resolve only.
 #
 # CI runs this against testdata/golden_fixture.tsv.gz (built by
 # cmd/goldenfixture). For the full dataset:
@@ -97,6 +100,15 @@ Level 2, 12 Collins St Melbourne	12|COLLINS|STREET|MELBOURNE|
 95 Bell St Coburg VIC 3058	95|BELL|STREET|COBURG|
 570 Lygon St Carlton	570|LYGON|STREET|CARLTON|
 #
+# positional descriptors before the number are not street words
+Ground Floor 36 Collins St Melbourne	36|COLLINS|STREET|MELBOURNE
+Rear 36 Collins St Melbourne	36|COLLINS|STREET|MELBOURNE
+G/F 104 Barkly St St Kilda	104|BARKLY|STREET|ST KILDA|
+Basement, 469 St Kilda Rd Melbourne VIC 3004	469|ST KILDA|ROAD|MELBOURNE
+Upper Ground Floor, 12 Collins St Melbourne	12|COLLINS|STREET|MELBOURNE|
+Front 95 Bell St Coburg	95|BELL|STREET|COBURG
+Mezzanine 570 Lygon St Carlton	570|LYGON|STREET|CARLTON
+#
 # lots with no street number (2 Wellington St, Wallan is also a street number)
 Lot 14 Old Sydney Rd Wallan	|OLD SYDNEY|ROAD|WALLAN|lot 14
 Lot 2 Wellington St Wallan VIC 3756	|WELLINGTON|STREET|WALLAN|lot 2
@@ -122,6 +134,27 @@ Box Hill North	locality:BOX HILL NORTH|VIC
 St Kilda VIC 3182	locality:ST KILDA|VIC
 133 Warragul VIC	locality:WARRAGUL|VIC
 3000	postcode:3000
+#
+# intersections: two streets that meet in the named (or only) locality
+Cnr Bourke St & Swanston St Melbourne	intersection:BOURKE STREET|SWANSTON STREET|MELBOURNE
+Corner of Flinders and Elizabeth Streets Melbourne	intersection:ELIZABETH STREET|FLINDERS STREET|MELBOURNE
+Bourke St and Swanston St, Melbourne	intersection:BOURKE STREET|SWANSTON STREET|MELBOURNE
+cnr Smith St/Johnston St Fitzroy	intersection:JOHNSTON STREET|SMITH STREET|FITZROY
+Cnr Chapel St & Toorak Rd South Yarra	intersection:CHAPEL STREET|TOORAK ROAD|SOUTH YARRA
+Sydney Rd and Bell St Coburg VIC 3058	intersection:BELL STREET|SYDNEY ROAD|COBURG
+# ...and not when they do not meet there, or the text only has the shape
+Cnr Collins St & Flinders St Melbourne	(none)
+Cnr Bourke St & Swanston St Richmond	(none)
+woolworths near doncaster and blackburn road	(none)
+coles corner of bourke and swanston streets melbourne	(none)
+#
+# states the dataset does not cover are refused, not matched to a VIC street;
+# a stray state token is outweighed by a VIC postcode and locality
+1 Smith St Sydney NSW 2000	(out_of_scope)
+12 George St Parramatta 2150	(out_of_scope)
+Sydney NSW 2000	(out_of_scope)
+High St Richmond NSW	(out_of_scope)
+36 Collins St, Melbourne NSW 3000	36|COLLINS|STREET|MELBOURNE
 #
 # not addresses: /resolve declines and the ladder moves on
 Melbourne Central	(none)

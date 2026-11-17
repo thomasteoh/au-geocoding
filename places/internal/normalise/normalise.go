@@ -52,6 +52,44 @@ var unitWords = map[string]bool{
 // only so that it is not taken for the unit, and dropped.
 var levelWords = map[string]bool{"LEVEL": true, "LVL": true, "L": true}
 
+// descriptorWords say where in a building or on a property the address is
+// ("GROUND FLOOR", "REAR", "BASEMENT"). They carry no number, G-NAF has no
+// column for them, and they are not street words: left in, "REAR 36 COLLINS
+// ST" reads as a street named REAR. A descriptor is skipped only before the
+// street number (or a unit, lot, level or another descriptor), so "UPPER
+// HEIDELBERG RD" and "FRONT ST" keep their names. The geocoder's normaliser
+// (ausystem/shared/normalise) drops the same words.
+var descriptorWords = map[string]bool{
+	"GROUND": true, "GF": true, "FRONT": true, "REAR": true, "UPPER": true,
+	"LOWER": true, "BASEMENT": true, "MEZZANINE": true,
+}
+
+// descriptorAt returns how many tokens a descriptor at toks[i] spans: "G / F"
+// (G/F after '/' is split out), "GROUND FLOOR", or one descriptor word. 0
+// means none starts there.
+func descriptorAt(toks []string, i int) int {
+	switch {
+	case i+2 < len(toks) && toks[i] == "G" && toks[i+1] == "/" && toks[i+2] == "F":
+		return 3
+	case toks[i] == "GROUND" && i+1 < len(toks) && (toks[i+1] == "FLOOR" || toks[i+1] == "FLR"):
+		return 2
+	case descriptorWords[toks[i]]:
+		return 1
+	}
+	return 0
+}
+
+// opensAddress reports whether toks[i] can begin the numbered part of an
+// address: a number, a unit, lot or level, or another descriptor.
+func opensAddress(toks []string, i int) bool {
+	if i >= len(toks) {
+		return false
+	}
+	t := toks[i]
+	return numberRe.MatchString(t) || unitWords[t] || levelWords[t] || t == "LOT" ||
+		unitWordRe.MatchString(t) || levelWordRe.MatchString(t) || descriptorAt(toks, i) > 0
+}
+
 var (
 	stripRe     = regexp.MustCompile(`[^A-Z0-9'/\-\s]`)
 	numberRe    = regexp.MustCompile(`^([0-9]+)[A-Z]?$`)
@@ -113,9 +151,14 @@ func Parse(input string, maxTokens int, localitySet map[string]bool, nearest Nea
 	}
 	// Unit and street number. Accepts "UNIT 3 15", "U3 15", "3/15", "15-17"
 	// (a range: the first number is G-NAF's number_first) and "15A", plus
-	// "LOT 5" and a level, which is skipped.
+	// "LOT 5"; a level and a positional descriptor ("GROUND FLOOR", "REAR")
+	// are skipped.
 	for i < len(toks) {
 		t := toks[i]
+		if n := descriptorAt(toks, i); n > 0 && p.Number == "" && opensAddress(toks, i+n) {
+			i += n
+			continue
+		}
 		next := i+1 < len(toks) && numberRe.MatchString(toks[i+1])
 		if t == "LOT" && next {
 			p.Lot = numberRe.FindStringSubmatch(toks[i+1])[1]
@@ -372,4 +415,132 @@ func isPostcode(f string) bool {
 		}
 	}
 	return true
+}
+
+// Intersection is a parsed street intersection: "CNR BOURKE ST & SWANSTON ST
+// MELBOURNE", "CORNER OF FLINDERS AND ELIZABETH STREETS", "SMITH ST/JOHNSTON
+// ST FITZROY".
+type Intersection struct {
+	A, B     CrossStreet
+	Locality string
+	State    string
+	Postcode string
+}
+
+// CrossStreet is one street of an intersection. Type is the canonical type,
+// or "" when the text gave none (the resolver then picks one).
+type CrossStreet struct{ Name, Type string }
+
+// cornerWords open an intersection: CNR, CRN, CORNER (OF), THE CORNER OF.
+var cornerWords = map[string]bool{"CNR": true, "CRN": true, "CORNER": true}
+
+// ParseIntersection reads text as two streets that meet:
+//
+//	[CNR | CORNER OF] street-a [type] (AND | & | /) street-b [type] [locality] [state] [postcode]
+//
+// The second street and what follows it are read by Parse. A plural type
+// after the second street ("FLINDERS AND ELIZABETH STREETS") is shared by
+// both. Without a corner word both streets must carry a type, or share a
+// plural one: "DONCASTER AND BLACKBURN" alone is too weak to be read as an
+// intersection here. Text that opens with anything else ("WOOLWORTHS NEAR
+// DONCASTER AND BLACKBURN ROAD", "COLES CORNER OF X AND Y") still parses when
+// it fits the shape, but its first street then holds the other words and the
+// resolver finds no such street, so it declines. Numbers anywhere before the
+// postcode mean an address, not an intersection.
+func ParseIntersection(input string, maxTokens int, localitySet map[string]bool, nearest NearestLocality) (Intersection, bool) {
+	up := strings.ReplaceAll(strings.ToUpper(input), "&", " AND ")
+	clean := stripRe.ReplaceAllString(up, " ")
+	clean = strings.NewReplacer("/", " / ", "-", " - ").Replace(clean)
+	toks := strings.Fields(clean)
+	if maxTokens > 0 && len(toks) > maxTokens {
+		toks = toks[:maxTokens]
+	}
+
+	corner := false
+	if len(toks) > 0 && toks[0] == "THE" && len(toks) > 1 && toks[1] == "CORNER" {
+		toks = toks[1:]
+	}
+	if len(toks) > 0 && cornerWords[toks[0]] {
+		corner = true
+		toks = toks[1:]
+		if len(toks) > 0 && toks[0] == "OF" {
+			toks = toks[1:]
+		}
+	}
+	k := -1
+	for j, t := range toks {
+		if t == "AND" || t == "/" {
+			k = j
+			break
+		}
+	}
+	if k < 1 || k == len(toks)-1 {
+		return Intersection{}, false
+	}
+	var left []string
+	for _, t := range toks[:k] {
+		if strings.ContainsAny(t, "0123456789") || t == "-" {
+			return Intersection{}, false
+		}
+		if canon, ok := Alias[t]; ok {
+			t = canon
+		}
+		left = append(left, t)
+	}
+	right := append([]string(nil), toks[k+1:]...)
+
+	var a CrossStreet
+	if n := len(left); n >= 2 && streettype.IsStreetType(left[n-1]) {
+		a = CrossStreet{strings.Join(left[:n-1], " "), streettype.Expand(left[n-1])}
+	} else if n >= 2 && pluralType(left[n-1]) != "" {
+		a = CrossStreet{strings.Join(left[:n-1], " "), streettype.Expand(pluralType(left[n-1]))}
+	} else {
+		a = CrossStreet{Name: strings.Join(left, " ")}
+	}
+
+	// A plural type on the second street ("ELIZABETH STREETS") is both streets'.
+	shared := false
+	for j := 1; j < len(right); j++ {
+		if streettype.IsStreetType(right[j]) {
+			break
+		}
+		if s := pluralType(right[j]); s != "" {
+			right[j], shared = s, true
+			break
+		}
+	}
+	p := Parse(strings.Join(right, " "), maxTokens, localitySet, nearest)
+	if p.Number != "" || p.Unit != "" || p.Lot != "" || p.POBox != "" || len(p.Rest) > 0 ||
+		p.Street == "" || p.uncertain {
+		return Intersection{}, false
+	}
+	if shared && a.Type == "" {
+		a.Type = p.StreetType
+	}
+	if !corner && !shared && (a.Type == "" || p.StreetType == "") {
+		return Intersection{}, false
+	}
+	if a.Name == "" || a.Name == "THE" {
+		return Intersection{}, false
+	}
+	return Intersection{
+		A:        a,
+		B:        CrossStreet{p.Street, p.StreetType},
+		Locality: p.Locality,
+		State:    p.State,
+		Postcode: p.Postcode,
+	}, true
+}
+
+// pluralType returns the singular street type of a plural one ("STREETS",
+// "STS", "RDS"), or "" when w is not one. A word that is itself a type
+// (GARDENS) is not plural.
+func pluralType(w string) string {
+	if len(w) < 3 || !strings.HasSuffix(w, "S") || streettype.IsStreetType(w) {
+		return ""
+	}
+	if s := w[:len(w)-1]; streettype.IsStreetType(s) {
+		return s
+	}
+	return ""
 }

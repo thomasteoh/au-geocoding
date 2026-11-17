@@ -14,6 +14,7 @@ package match
 import (
 	"context"
 	"database/sql"
+	"sort"
 	"strings"
 )
 
@@ -74,6 +75,17 @@ func LoadFuzzySet(ctx context.Context, db *sql.DB) (*FuzzySet, error) {
 // Localities returns the known locality names (upper case). The map is shared,
 // not copied: callers must not modify it.
 func (fs *FuzzySet) Localities() map[string]bool { return fs.localities }
+
+// LocalitiesOf returns the localities a street name (exact, upper case) is
+// in, sorted.
+func (fs *FuzzySet) LocalitiesOf(street string) []string {
+	out := make([]string, 0, len(fs.streetLocs[street]))
+	for l := range fs.streetLocs[street] {
+		out = append(out, l)
+	}
+	sort.Strings(out)
+	return out
+}
 
 // NearestLocality returns the known locality closest to name by edit distance,
 // and its similarity. It scans the locality names (a few thousand per state).

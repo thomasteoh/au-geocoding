@@ -26,6 +26,19 @@ func TestNormalise(t *testing.T) {
 		{"Level 2, 36 Collins St", []string{"36", "collins", "street"}, "", "", true, true},
 		{"L2 36 Collins St", []string{"36", "collins", "street"}, "", "", true, true},
 		{"Shop 4 Level 1 36 Collins St", []string{"unit", "4", "36", "collins", "street"}, "4", "", true, true},
+		{"Ground Floor 36 Collins St Melbourne", []string{"36", "collins", "street", "melbourne"}, "", "", true, true},
+		{"G/F, 36 Collins St", []string{"36", "collins", "street"}, "", "", true, true},
+		{"Rear 36 Collins St Melbourne", []string{"36", "collins", "street", "melbourne"}, "", "", true, true},
+		{"Upper Ground 2/36 Collins St", []string{"unit", "2", "36", "collins", "street"}, "2", "", true, true},
+		{"Basement, Shop 3 36 Collins St", []string{"unit", "3", "36", "collins", "street"}, "3", "", true, true},
+		{"Mezzanine 36 Collins St", []string{"36", "collins", "street"}, "", "", true, true},
+		// Descriptor words that name the street are kept.
+		{"12 Upper Heidelberg Rd", []string{"12", "upper", "heidelberg", "road"}, "", "", true, true},
+		{"Front St Mornington", []string{"front", "street", "mornington"}, "", "", false, true},
+		{"Lower Plenty Rd", []string{"lower", "plenty", "road"}, "", "", false, true},
+		// "&" and a slash between streets read as "and" (intersections).
+		{"Cnr Bourke St & Swanston St Melbourne", []string{"cnr", "bourke", "street", "and", "swanston", "st", "melbourne"}, "", "", false, true},
+		{"cnr Smith St/Johnston St Fitzroy", []string{"cnr", "smith", "street", "and", "johnston", "st", "fitzroy"}, "", "", false, true},
 		{"3000", []string{"3000"}, "", "3000", false, false},
 		{"woolworths", []string{"woolworths"}, "", "", false, false},
 	}

@@ -30,6 +30,43 @@ var unitPrefixes = map[string]bool{
 // so the level is read only so that it is not taken for a unit, and dropped.
 var levelPrefixes = map[string]bool{"level": true, "lvl": true, "l": true}
 
+// descriptorWords say where in a building or on a property the address is
+// ("ground floor", "rear", "basement"). They carry no number, G-NAF has no
+// column for them, and they are not street words: left in, "rear 36 collins
+// st" would be read as a street named REAR. A descriptor is skipped only
+// before the street number (or a unit, lot, level or another descriptor), so
+// "upper heidelberg rd" and "front st" keep their names.
+var descriptorWords = map[string]bool{
+	"ground": true, "gf": true, "front": true, "rear": true, "upper": true,
+	"lower": true, "basement": true, "mezzanine": true,
+}
+
+// descriptorAt returns how many tokens a descriptor at toks[i] spans: "g / f"
+// (G/F after '/' is split out), "ground floor", or one descriptor word. 0
+// means none starts there.
+func descriptorAt(toks []string, i int) int {
+	switch {
+	case i+2 < len(toks) && toks[i] == "g" && toks[i+1] == "/" && toks[i+2] == "f":
+		return 3
+	case toks[i] == "ground" && i+1 < len(toks) && (toks[i+1] == "floor" || toks[i+1] == "flr"):
+		return 2
+	case descriptorWords[toks[i]]:
+		return 1
+	}
+	return 0
+}
+
+// opensAddress reports whether toks[i] can begin the numbered part of an
+// address: a number, a unit, lot or level, or another descriptor.
+func opensAddress(toks []string, i int) bool {
+	if i >= len(toks) {
+		return false
+	}
+	t := toks[i]
+	return numberRe.MatchString(t) || unitPrefixes[t] || levelPrefixes[t] || t == "lot" ||
+		unitPrefixRe.MatchString(t) || levelPrefixRe.MatchString(t) || descriptorAt(toks, i) > 0
+}
+
 // stateCodes maps state abbreviations to the full name.
 var stateCodes = map[string]string{
 	"nsw": "new south wales", "vic": "victoria", "qld": "queensland",
@@ -78,6 +115,9 @@ var (
 // number, which stands in for the street number on rural and new-estate
 // addresses, and a level ("level 2", "l2") is skipped. A postal delivery point
 // ("PO Box 123", "GPO Box", "Locked Bag") is recognised only at the start.
+// A positional descriptor ("ground floor", "g/f", "rear") before the number is
+// dropped. "&" and a "/" between two words ("smith st/johnston st") become
+// "and", so places can read an intersection.
 func Normalise(raw string) Result {
 	s := strings.ToLower(raw)
 	// Strip punctuation, keep alphanumerics and spaces (T3: no operator chars
@@ -88,6 +128,8 @@ func Normalise(raw string) Result {
 		switch {
 		case unicode.IsLetter(r), unicode.IsDigit(r):
 			b.WriteRune(r)
+		case r == '&':
+			b.WriteString(" and ")
 		case r == '/', r == '-':
 			b.WriteByte(' ')
 			b.WriteRune(r)
@@ -108,6 +150,10 @@ func Normalise(raw string) Result {
 	// Leading unit, lot, level and street number.
 	for i < len(toks) {
 		t := toks[i]
+		if n := descriptorAt(toks, i); n > 0 && number == "" && opensAddress(toks, i+n) {
+			i += n
+			continue
+		}
 		next := i+1 < len(toks) && numberRe.MatchString(toks[i+1])
 		if t == "lot" && next {
 			out.Lot = numberRe.FindStringSubmatch(toks[i+1])[1]
@@ -150,7 +196,13 @@ func Normalise(raw string) Result {
 	}
 
 	var words []string
-	for _, t := range toks[i:] {
+	rest := toks[i:]
+	for j, t := range rest {
+		if t == "/" && j > 0 && j+1 < len(rest) && isWord(rest[j-1]) && isWord(rest[j+1]) {
+			// "smith st/johnston st": the slash joins two streets.
+			words = append(words, "and")
+			continue
+		}
 		if t != "/" && t != "-" {
 			words = append(words, t)
 		}
@@ -233,6 +285,11 @@ func isPostcode(t string) bool {
 		}
 	}
 	return true
+}
+
+// isWord reports a token with no digit in it.
+func isWord(t string) bool {
+	return t != "/" && t != "-" && strings.IndexFunc(t, unicode.IsDigit) < 0
 }
 
 func isNumber(t string) bool {

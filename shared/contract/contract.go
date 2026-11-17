@@ -49,8 +49,9 @@ type Candidate struct {
 	Source string      `json:"source"` // "gnaf" | "osm"
 	Text   string      `json:"text"`   // full address or POI name — what the caller scores against
 
-	// Precision says what Point locates: a single address, or the centre of a
-	// street, locality or postcode when the query named nothing finer. Empty
+	// Precision says what Point locates: a single address, the meeting point
+	// of two streets, or the centre of a street, locality or postcode when the
+	// query named nothing finer. Empty
 	// for POIs and from resolvers that predate the field.
 	Precision Precision `json:"precision,omitempty"`
 
@@ -90,6 +91,10 @@ const (
 	PrecisionStreet   Precision = "street"   // centre of a street within a locality
 	PrecisionLocality Precision = "locality" // centre of a locality's addresses
 	PrecisionPostcode Precision = "postcode" // centre of a postcode's addresses
+	// PrecisionIntersection is the point where two named streets meet ("cnr
+	// Bourke St & Swanston St"). Added within contract v1: a caller that does
+	// not know it sees an ordinary address-kind candidate.
+	PrecisionIntersection Precision = "intersection"
 )
 
 // Locality is a resolved locality name.

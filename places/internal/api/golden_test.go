@@ -39,7 +39,7 @@ func TestGolden(t *testing.T) {
 	cases := loadGolden(t, "../../testdata/golden.tsv")
 	var searchOK, searchN, resolveOK int
 	for _, c := range cases {
-		coarse := c.want == "(none)" || strings.Contains(c.want, ":")
+		coarse := c.want == "(none)" || c.want == "(out_of_scope)" || strings.Contains(c.want, ":")
 		if !coarse {
 			searchN++
 			got := ""
@@ -60,6 +60,9 @@ func TestGolden(t *testing.T) {
 				Kind: contract.KindAddress, Generate: n.Generate, Score: n.Tokens,
 				State: n.State, Postcode: n.Postcode, Limit: 20,
 			})
+			if err != nil && err.Error() == errOutOfScope {
+				got = "(out_of_scope)"
+			}
 			if err == nil && len(resp.Candidates) > 0 {
 				top := resp.Candidates[0]
 				switch {

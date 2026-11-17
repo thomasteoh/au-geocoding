@@ -151,6 +151,7 @@ func resolveAddress(ctx context.Context, db *sql.DB, req contract.ResolveRequest
 		return contract.ResolveResponse{}, err
 	}
 	var rel, score, fields []string
+	var text string // the free text, for the intersection reading
 	if req.Components != nil {
 		// The caller labelled every value, so no inference is needed or wanted.
 		// fieldOfToken has to guess from token shape and gets genuinely
@@ -159,12 +160,25 @@ func resolveAddress(ctx context.Context, db *sql.DB, req contract.ResolveRequest
 		// input exists precisely to remove that guess.
 		rel, score, fields = componentTokens(*req.Components)
 	} else {
-		rel, score, fields = contractTokens(req.Generate, req.Score, sets)
+		text = contractText(req.Generate, req.Score)
+		rel, score, fields = normalise.Tokenise(text, maxTokens, sets.localities, sets.fuzzy.NearestLocality)
 	}
 	qm := match.Query{Reliable: rel, Score: score, Fields: fields}
 	limit := req.Limit
 	if limit <= 0 {
 		limit = 20
+	}
+	// A query for a state this dataset does not cover is refused before any
+	// matching: fuzzy generation would find some street of the same name here.
+	// The parsed state wins over the caller's state hint. The postcode hint is
+	// not used: the geocoder's parser takes any later four-digit word for one,
+	// where this parser knows a street number by position.
+	state := qm.Field("state")
+	if state == "" {
+		state = req.State
+	}
+	if outOfScope(sets, state, qm.Field("postcode"), qm.Field("locality_name")) {
+		return contract.ResolveResponse{}, &resolveError{errOutOfScope}
 	}
 	// A postal box with no street address beside it has no G-NAF row: answer
 	// at the locality or postcode it is addressed to, marked as a postal box.
@@ -174,6 +188,16 @@ func resolveAddress(ctx context.Context, db *sql.DB, req contract.ResolveRequest
 	}
 	if box := qm.Field("postal_delivery"); box != "" && number == "" {
 		return resolvePostal(ctx, db, sets, qm, box, limit)
+	}
+	// Two streets that meet ("cnr Bourke St & Swanston St Melbourne"). Text
+	// that only looks like one falls through to the readings below.
+	if number == "" && text != "" {
+		if ix, ok := normalise.ParseIntersection(text, maxTokens, sets.localities, sets.fuzzy.NearestLocality); ok {
+			resp, err := resolveIntersection(ctx, db, sets, ix, limit)
+			if err != nil || len(resp.Candidates) > 0 {
+				return resp, err
+			}
+		}
 	}
 	// No street number, or no street: answer at street, locality or postcode
 	// precision, or not at all.
@@ -445,16 +469,16 @@ func leadingDigits(v string) string {
 	return v[:n]
 }
 
-// contractTokens maps the contract's free-text token sets into the matcher's
-// Query. Score is the geocoder's full normalised token list, in query order;
-// the parts of an address are known by position, so the tokens are parsed as
-// a sequence with the same parser as /search, not classified one at a time.
-func contractTokens(gen, score []string, sets *matchSets) (reliable, sc, fields []string) {
+// contractText is the free text the contract's token sets carry. Score is the
+// geocoder's full normalised token list, in query order; the parts of an
+// address are known by position, so the tokens are parsed as a sequence with
+// the same parser as /search, not classified one at a time.
+func contractText(gen, score []string) string {
 	toks := score
 	if len(toks) == 0 {
 		toks = gen
 	}
-	return normalise.Tokenise(strings.Join(toks, " "), maxTokens, sets.localities, sets.fuzzy.NearestLocality)
+	return strings.Join(toks, " ")
 }
 
 // formatCandidateText builds the display address text for a candidate. A unit
