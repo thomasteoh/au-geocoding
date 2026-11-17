@@ -38,6 +38,66 @@ func (s *Store) QuotaRemaining(p Principal) (int64, error) {
 	return left, nil
 }
 
+// ReserveRows takes up to want rows from the principal's remaining quota for
+// today, before the work that will produce them, and returns how many it got
+// (0 when none are left). The caller does no more work than the grant pays
+// for, then settles with RefundRows for whatever it did not use. Charging
+// after the work instead lets a caller near its ceiling have the work done
+// and then be refused — work done for free, repeatably.
+func (s *Store) ReserveRows(p Principal, want int64) (int64, error) {
+	if p.Anonymous() || p.Tier == TierAnonymous {
+		// Anonymous callers are reserved per IP (ReserveAnonRows); a key on
+		// the anonymous tier has no row quota to draw on.
+		return 0, nil
+	}
+	if p.UsageKey == "" {
+		return 0, errors.New("reserve: empty principal")
+	}
+	if want <= 0 {
+		return 0, nil
+	}
+	day := time.Now().UTC().Format("2006-01-02")
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	tx, err := s.db.Begin()
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+	var cur int64
+	err = tx.QueryRow(`SELECT rows FROM usage_principal WHERE principal=? AND day=?`, p.UsageKey, day).Scan(&cur)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return 0, err
+	}
+	grant := min(want, TierQuota[p.Tier]-cur)
+	if grant <= 0 {
+		return 0, nil
+	}
+	if _, err := tx.Exec(`INSERT INTO usage_principal(principal, day, rows) VALUES (?,?,?)
+		ON CONFLICT(principal, day) DO UPDATE SET rows=rows+excluded.rows`, p.UsageKey, day, grant); err != nil {
+		return 0, err
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	return grant, nil
+}
+
+// RefundRows returns n reserved-but-unused rows to today's quota. It never
+// takes the count below zero. A reservation made just before UTC midnight and
+// settled after it refunds into the new day's row, which is then clamped:
+// the caller loses at most the unused part of one request.
+func (s *Store) RefundRows(p Principal, n int64) error {
+	if n <= 0 || p.Anonymous() || p.Tier == TierAnonymous || p.UsageKey == "" {
+		return nil
+	}
+	day := time.Now().UTC().Format("2006-01-02")
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, err := s.db.Exec(`UPDATE usage_principal SET rows = MAX(rows - ?, 0) WHERE principal=? AND day=?`, n, p.UsageKey, day)
+	return err
+}
+
 // ChargeLLMCall counts one LLM-rung call against the principal's daily
 // usage_principal.llm_calls, refusing it once TierLLMQuota is reached. It
 // runs before the provider is called, so a refused call costs nothing.

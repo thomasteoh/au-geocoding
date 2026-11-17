@@ -226,6 +226,18 @@ func Load(args []string, filePath string) (Config, error) {
 	if cfg.Limits.MaxBodyBytes <= 0 {
 		cfg.Limits.MaxBodyBytes = 1 << 20
 	}
+	// These have no safe "unset" meaning, so 0 is an error rather than a
+	// default: a 0s request timeout expires every request on arrival, and a
+	// 0-deep LLM queue refuses every LLM call as "queue full".
+	if cfg.Limits.RequestTimeout <= 0 {
+		errs = append(errs, "request_timeout must be > 0 seconds")
+	}
+	if cfg.Queue.Depth <= 0 {
+		errs = append(errs, "queue depth must be > 0")
+	}
+	if cfg.LLM.Timeout < 0 {
+		errs = append(errs, "llm timeout must be >= 0 seconds")
+	}
 	proxies, err := ParseTrustedProxies(cfg.Server.TrustedProxy)
 	if err != nil {
 		errs = append(errs, err.Error())
@@ -383,6 +395,9 @@ func setDefaults(c *Config) {
 	c.Rate.KeyDefaultRPS = 20
 	c.Rate.KeyDefaultBurst = 40
 	c.Rate.KeyDefaultDaily = 10000
+	// Below RequestTimeout, so a slow provider fails as a provider error
+	// while the request still has time to answer.
+	c.LLM.Timeout = 20
 	c.AnonLLM.DailyPerIP = 10
 	c.AnonLLM.DailyGlobal = 1000
 	c.Queue.Depth = 53

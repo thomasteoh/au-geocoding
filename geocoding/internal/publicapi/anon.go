@@ -60,6 +60,43 @@ func (c *anonCounter) charge(ip string, n, perIP, global int64) bool {
 	return true
 }
 
+// reserve takes up to want for ip within perIP and global, returning the
+// grant (0 when there is no headroom or the IP table is full).
+func (c *anonCounter) reserve(ip string, want, perIP, global int64) int64 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.roll()
+	cur, seen := c.byIP[ip]
+	grant := min(want, perIP-cur)
+	if global > 0 {
+		grant = min(grant, global-c.total)
+	}
+	if grant <= 0 {
+		return 0
+	}
+	if !seen && c.max > 0 && len(c.byIP) >= c.max {
+		return 0
+	}
+	c.byIP[ip] = cur + grant
+	c.total += grant
+	return grant
+}
+
+// refund gives back n unused rows for ip. A day roll between reserve and
+// refund already reset the counter, so there is nothing to give back.
+func (c *anonCounter) refund(ip string, n int64) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.roll()
+	cur, ok := c.byIP[ip]
+	if !ok || n <= 0 {
+		return
+	}
+	n = min(n, cur)
+	c.byIP[ip] = cur - n
+	c.total -= n
+}
+
 // atCeiling reports whether ip (or the global total) has no headroom left.
 func (c *anonCounter) atCeiling(ip string, perIP, global int64) bool {
 	c.mu.Lock()
@@ -95,6 +132,27 @@ func (s *Store) ChargeAnonDaily(ip string, rows int64, perIP, global int64) (boo
 		return false, ErrQuotaExceeded
 	}
 	return true, nil
+}
+
+// ReserveAnonRows is ReserveRows for an anonymous caller: up to want rows
+// from ip's daily allowance and the global ceiling. perIP <= 0 means no
+// anonymous ceiling, so the whole want is granted.
+func (s *Store) ReserveAnonRows(ip string, want, perIP, global int64) int64 {
+	if want <= 0 {
+		return 0
+	}
+	if perIP <= 0 {
+		return want
+	}
+	return s.anonRows.reserve(ip, want, perIP, global)
+}
+
+// RefundAnonRows returns n reserved-but-unused anonymous rows for ip.
+func (s *Store) RefundAnonRows(ip string, n, perIP int64) {
+	if perIP <= 0 {
+		return
+	}
+	s.anonRows.refund(ip, n)
 }
 
 // AnonAtCeiling is the pre-flight check: true when ip cannot be charged
