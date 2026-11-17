@@ -20,8 +20,8 @@ type Query struct {
 	Reliable []string // locality, state, postcode, street number — anchors
 	Score    []string // full normalised token set, includes misspelled ones
 	// Fields tags each score token: locality_name, state, postcode,
-	// street_name, street_number, street_type, flat_number, lot_number, or
-	// postal_delivery (which only routes the query; it is never scored).
+	// street_name, street_number, street_type, flat_number, lot_number,
+	// level_number, or postal_delivery (which only routes the query; it is never scored).
 	Fields []string
 }
 
@@ -30,6 +30,7 @@ type Candidate struct {
 	PID            string
 	FlatNumber     string // "" for an address with no unit
 	LotNumber      string
+	LevelNumber    string // "" for an address with no level
 	StreetNumber   string
 	StreetName     string
 	StreetType     string
@@ -135,7 +136,9 @@ const innerCap = 50000
 // a long street the asked-for number was usually not among them.
 //
 // Within one street address G-NAF has a row per unit (157 Fitzroy St, St
-// Kilda has about 200), so the asked-for unit comes next. After that rows stay
+// Kilda has about 200), so the asked-for unit comes next, then the asked-for
+// level (with no unit asked for, the level's own row, which has no unit).
+// After that rows stay
 // grouped by street address, in order of each address's first row, and the
 // primary row leads its address: with no unit in the query the base address
 // is the answer when it exists, and Score ties keep this order. Ranking the
@@ -148,23 +151,29 @@ func generateMatch(ctx context.Context, db *sql.DB, q Query, match string, cap i
 		limit = fmt.Sprintf(" LIMIT %d", cap)
 	}
 	number, street, locality := q.field("street_number"), q.field("street_name"), q.field("locality_name")
-	flat, lot := q.field("flat_number"), q.field("lot_number")
-	flatCol, lotCol := `a.flat_number`, `a.lot_number`
+	flat, lot, level := q.field("flat_number"), q.field("lot_number"), q.field("level_number")
+	flatCol, lotCol, levelCol := `a.flat_number`, `a.lot_number`, levelColumn(ctx, db)
 	if !hasUnitColumns(ctx, db) {
 		flatCol, lotCol = `''`, `''`
 	}
+	// A level with no unit ("Level 2, 12 Collins St") asks for the level's
+	// own row; a unit on that level is no better than the base address.
+	levelOrder := levelCol + ` = ? DESC`
+	if flat == nil && level != nil {
+		levelOrder = `(` + levelCol + ` = ? AND ` + flatCol + ` = '') DESC`
+	}
 	rows, err := db.QueryContext(ctx, `
-		SELECT gnaf_pid, `+flatCol+`, `+lotCol+`, street_number, street_name, street_type,
+		SELECT gnaf_pid, `+flatCol+`, `+lotCol+`, `+levelCol+`, street_number, street_name, street_type,
 		       locality_name, state, postcode, latitude, longitude, confidence, geocode_rel
 		FROM address a
 		WHERE a.gnaf_pid IN (
 			SELECT gnaf_pid FROM addr_trgm WHERE addr_trgm MATCH ? LIMIT `+fmt.Sprint(innerCap)+`
 		)
 		ORDER BY CAST(a.street_number AS TEXT) = ? DESC, `+lotCol+` = ? DESC,
-			a.street_name = ? DESC, a.locality_name = ? DESC, `+flatCol+` = ? DESC,
+			a.street_name = ? DESC, a.locality_name = ? DESC, `+flatCol+` = ? DESC, `+levelOrder+`,
 			MIN(a.rowid) OVER (PARTITION BY a.street_number, a.street_name, a.street_type, a.locality_name),
 			a.primary_sec <> 'S' DESC, a.rowid`+limit,
-		match, number, lot, street, locality, flat)
+		match, number, lot, street, locality, flat, level)
 	if err != nil {
 		return nil, err
 	}
@@ -173,7 +182,7 @@ func generateMatch(ctx context.Context, db *sql.DB, q Query, match string, cap i
 	var out []Candidate
 	for rows.Next() {
 		var c Candidate
-		if err := rows.Scan(&c.PID, &c.FlatNumber, &c.LotNumber, &c.StreetNumber, &c.StreetName, &c.StreetType,
+		if err := rows.Scan(&c.PID, &c.FlatNumber, &c.LotNumber, &c.LevelNumber, &c.StreetNumber, &c.StreetName, &c.StreetType,
 			&c.Locality, &c.State, &c.Postcode, &c.Lat, &c.Lon, &c.Confidence, &c.GeocodeRel); err != nil {
 			return nil, err
 		}
@@ -265,6 +274,7 @@ func Score(q Query, row Candidate) float64 {
 		"street_type":   row.StreetType,
 		"flat_number":   row.FlatNumber,
 		"lot_number":    row.LotNumber,
+		"level_number":  row.LevelNumber,
 	}
 	// Weight per field: locality and state are anchors — an exact match there
 	// strongly signals the right address, so they outweigh street similarity.
@@ -280,6 +290,8 @@ func Score(q Query, row Candidate) float64 {
 		"flat_number": 0.5,
 		// A lot stands in for the street number, and is as decisive.
 		"lot_number": 2.0,
+		// The level picks a row within the street address, after the unit.
+		"level_number": 0.5,
 	}
 
 	total := 0.0
@@ -297,6 +309,13 @@ func Score(q Query, row Candidate) float64 {
 			tag := q.Fields[i]
 			val, ok := fieldMap[tag]
 			switch {
+			case ok && tag == "level_number":
+				// As the unit; with no unit asked for, only the level's
+				// own row (no unit on it) is that level.
+				if qt == val && (row.FlatNumber == "" || q.Field("flat_number") != "") {
+					sim = 1
+				}
+				w = fieldWeight[tag]
 			case ok && (tag == "flat_number" || tag == "lot_number"):
 				// An identifier, not a word: unit 9 is no nearer unit 99
 				// than unit 40 is, so only the exact row scores.

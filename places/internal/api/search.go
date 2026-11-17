@@ -174,7 +174,7 @@ func searchAddress(ctx context.Context, db *sql.DB, query string) SearchResponse
 	if err != nil {
 		return resp
 	}
-	rel, score, fields := normalise.Tokenise(query, 32, sets.localities, sets.fuzzy.NearestLocality)
+	rel, score, fields := sets.fuzzy.CanonicalTokens(normalise.Tokenise(query, 32, sets.localities, sets.fuzzy.NearestLocality))
 	qm := match.Query{Reliable: rel, Score: score, Fields: fields}
 	// The generation cap bounds the scoring scan, not the response: the
 	// address path returns one best match, so it uses the same cap as

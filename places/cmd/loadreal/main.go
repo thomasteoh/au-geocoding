@@ -22,6 +22,7 @@ import (
 func main() {
 	dbPath := flag.String("db", "data/vic.db", "SQLite DB path")
 	base := flag.String("base", "data/G-NAF", "G-NAF extraction root")
+	aliasesOnly := flag.Bool("aliases-only", false, "(re)load only the alias tables into an existing DB, leaving the rest as it is")
 	flag.Parse()
 
 	db, err := sql.Open("sqlite", *dbPath)
@@ -29,6 +30,13 @@ func main() {
 		log.Fatalf("open: %v", err)
 	}
 	defer db.Close()
+
+	if *aliasesOnly {
+		if err := loadAliases(db, *base); err != nil {
+			log.Fatalf("aliases: %v", err)
+		}
+		return
+	}
 
 	// Create schema. Drop existing tables first (the loader re-runs can leave
 	// partial data; the PK constraints then fail on reload).
@@ -78,6 +86,10 @@ func main() {
 		fmt.Printf("  loaded %s\n", t.table)
 	}
 
+	if err := loadAliases(db, *base); err != nil {
+		log.Fatalf("aliases: %v", err)
+	}
+
 	// Create the view port.
 	if _, err := db.Exec(schema.RealViewSQL); err != nil {
 		log.Fatalf("view: %v", err)
@@ -90,4 +102,33 @@ func main() {
 		log.Fatalf("view count: %v", err)
 	}
 	fmt.Printf("ADDRESS_VIEW rows: %d\n", n)
+}
+
+// aliasTables are the G-NAF alias PSVs, in DDL column order.
+var aliasTables = []struct{ dir, file, table, cols string }{
+	{"Authority Code", "Authority_Code_LOCALITY_ALIAS_TYPE_AUT_psv.psv", "LOCALITY_ALIAS_TYPE_AUT", "code,name,description"},
+	{"Authority Code", "Authority_Code_STREET_LOCALITY_ALIAS_TYPE_AUT_psv.psv", "STREET_LOCALITY_ALIAS_TYPE_AUT", "code,name,description"},
+	{"Authority Code", "Authority_Code_ADDRESS_ALIAS_TYPE_AUT_psv.psv", "ADDRESS_ALIAS_TYPE_AUT", "code,name,description"},
+	{"Standard", "VIC_LOCALITY_ALIAS_psv.psv", "LOCALITY_ALIAS", "locality_alias_pid,date_created,date_retired,locality_pid,name,postcode,alias_type_code,state_pid"},
+	{"Standard", "VIC_STREET_LOCALITY_ALIAS_psv.psv", "STREET_LOCALITY_ALIAS", "street_locality_alias_pid,date_created,date_retired,street_locality_pid,street_name,street_type_code,street_suffix_code,alias_type_code"},
+	{"Standard", "VIC_ADDRESS_ALIAS_psv.psv", "ADDRESS_ALIAS", "address_alias_pid,date_created,date_retired,principal_pid,alias_pid,alias_type_code,alias_comment"},
+}
+
+// loadAliases replaces the raw alias tables. buildaddr derives the serving
+// alias tables from them; a dataset loaded without them still builds, with no
+// aliases.
+func loadAliases(db *sql.DB, base string) error {
+	if _, err := db.Exec(schema.DropAliasRawSchemaSQL); err != nil {
+		return err
+	}
+	if _, err := db.Exec(schema.AliasRawSchemaSQL); err != nil {
+		return err
+	}
+	for _, t := range aliasTables {
+		p := filepath.Join(base, "G-NAF AUGUST 2026", t.dir, t.file)
+		if err := schema.LoadPSV(db, p, t.table, strings.Split(t.cols, ","), true); err != nil {
+			return fmt.Errorf("load %s: %w", t.table, err)
+		}
+	}
+	return nil
 }

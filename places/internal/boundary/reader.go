@@ -42,6 +42,7 @@ type Locality struct {
 	Name      string
 	LocClass  string
 	State     string
+	Attrs     map[string]string // every DBF attribute, by field name
 	ShapeType int
 }
 

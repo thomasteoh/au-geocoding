@@ -40,6 +40,27 @@ go build -o auplaces-load ./cmd/buildaddr
 The server is a single static binary (CGO-free, `modernc.org/sqlite`). It embeds
 the demo UI and docs.
 
+## Aliases, levels and postcodes
+
+`buildaddr` carries each address's level (`level_number`, digits, set only for
+a plain LEVEL or FLOOR; `level_type` names the type), so "Level 2, 12 Collins
+St" picks the row on level 2. It also builds `alias_locality` and
+`alias_street` from G-NAF's alias tables (`loadreal` loads them; on an
+existing dataset `go run ./cmd/loadreal -aliases-only -db ... -base ...`
+adds just those): an alias such as JOLIMONT (EAST MELBOURNE) or LITTLE
+LATROBE STREET (LITTLE LA TROBE STREET) is answered as the official name.
+Aliases that are official names themselves, or that name several places, are
+left out.
+
+`go run ./cmd/loadpostcode -db ... -shp POA_2021_AUST_GDA2020.shp -dbf
+POA_2021_AUST_GDA2020.dbf` loads ABS Postal Areas: postcode answers stay at
+the centre of the postcode's addresses unless that point falls outside the
+postal area, when the area's representative point (inside it) is used.
+PO-box-only postcodes (3001, 8001) have neither addresses nor an area;
+`internal/postbox/pobox_postcodes.tsv` maps the ones checked against
+Australia Post to their delivery locality. Add a row only with the URL it was
+read from.
+
 ## Accuracy checks
 
 `testdata/golden.tsv` holds real Victorian addresses as people type them

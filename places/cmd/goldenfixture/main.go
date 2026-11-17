@@ -30,20 +30,22 @@ import (
 	_ "modernc.org/sqlite"
 
 	"auplaces/internal/match"
+	"auplaces/internal/postbox"
 	"ausystem/shared/streettype"
 )
 
 // columns must match fixtureColumns in internal/api/golden_test.go.
 const columns = `gnaf_pid, street_number, street_name, COALESCE(street_type, ''), locality_name,
 	state, COALESCE(postcode, ''), latitude, longitude, confidence, geocode_rel,
-	flat_number, lot_number, primary_sec`
+	flat_number, lot_number, primary_sec, level_number`
 
-const ncolumns = 14
+const ncolumns = 15
 
 func main() {
 	dbPath := flag.String("db", "", "real dataset (opened read-only)")
 	golden := flag.String("golden", "testdata/golden.tsv", "golden set")
 	out := flag.String("out", "testdata/golden_fixture.tsv.gz", "fixture to write")
+	extraOut := flag.String("extra", "testdata/golden_fixture_extra.sql.gz", "alias and postcode tables to write")
 	perStreet := flag.Int("per-street", 250, "other numbers kept per golden street (above the generation cap)")
 	flag.Parse()
 	if *dbPath == "" {
@@ -88,6 +90,10 @@ func main() {
 			localities[loc] = true
 		case strings.HasPrefix(want, "postcode:"):
 			postcodes[strings.TrimPrefix(want, "postcode:")] = true
+			// A PO box postcode answers at the locality it is delivered at.
+			if e, ok := postbox.Lookup(strings.TrimPrefix(want, "postcode:")); ok {
+				localities[e.Locality] = true
+			}
 		case strings.Count(want, "|") >= 3:
 			// number|street|type|locality, optionally |unit N or |lot N.
 			p := strings.Split(want, "|")
@@ -223,4 +229,5 @@ func main() {
 	}
 	fmt.Printf("%d rows (%d golden streets, %d intersections, %d near-miss names, %d localities) -> %s\n",
 		len(pids), len(streets), len(crosses), len(near), len(localities), *out)
+	writeExtra(db, *extraOut, localities, postcodes)
 }

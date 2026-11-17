@@ -26,6 +26,7 @@ import (
 func main() {
 	dbPath := flag.String("db", "data/vic.db", "SQLite DB path; refused while a server has it open (build a staging copy, then activate it)")
 	version := flag.String("version", "", "dataset version label stored in address.dataset_version (default: gnaf-YYYY-MM from the G-NAF release)")
+	aliasesOnly := flag.Bool("aliases-only", false, "rebuild only the alias tables from G-NAF's (address must already be built)")
 	flag.Parse()
 
 	db, release, err := schema.OpenWriter(*dbPath)
@@ -34,6 +35,19 @@ func main() {
 	}
 	defer release()
 	defer db.Close()
+
+	if *aliasesOnly {
+		tx, err := db.Begin()
+		if err != nil {
+			log.Fatalf("begin: %v", err)
+		}
+		buildAliases(tx)
+		if err := tx.Commit(); err != nil {
+			log.Fatalf("commit: %v", err)
+		}
+		fmt.Println("committed")
+		return
+	}
 
 	if *version == "" {
 		v, err := releaseVersion(db)
@@ -86,6 +100,14 @@ func build(db *sql.Tx, version string) {
 			CASE WHEN COALESCE(FLAT_NUMBER, '') = '' THEN ''
 				ELSE CAST(CAST(FLAT_NUMBER AS INTEGER) AS TEXT) END AS flat_number,
 			TRIM(COALESCE(LOT_NUMBER, '')) AS lot_number,
+			-- The level as the parser reads it ("LEVEL 2", "2ND FLOOR"):
+			-- digits, and only for a plain level or floor, so "Level 1" does
+			-- not pick basement 1 or a ground-floor "LG" level.
+			CASE WHEN COALESCE(LEVEL_NUMBER, '') <> ''
+					AND COALESCE(LEVEL_TYPE, '') IN ('', 'LEVEL', 'FLOOR')
+					AND COALESCE(LEVEL_NUMBER_PREFIX, '') IN ('', 'L', 'FL')
+				THEN CAST(CAST(LEVEL_NUMBER AS INTEGER) AS TEXT) ELSE '' END AS level_number,
+			COALESCE(LEVEL_TYPE, '') AS level_type,
 			STREET_NAME AS street_name,
 			-- STREET_TYPE_CODE is the street type (STREET, ROAD, AVENUE).
 			-- STREET_CLASS_TYPE is a CONFIRMED/UNCONFIRMED status flag and was
@@ -188,6 +210,8 @@ func build(db *sql.Tx, version string) {
 		log.Fatalf("addr_rt populate: %v", err)
 	}
 	fmt.Println("addr_rt reverse index built")
+
+	buildAliases(db)
 
 	// Verify.
 	var n int

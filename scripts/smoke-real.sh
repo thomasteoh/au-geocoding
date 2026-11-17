@@ -53,12 +53,13 @@ while IFS=$'\t' read -r q want; do
   if [ "$(jq -r '.error // empty' <<<"$resp" 2>/dev/null)" = "out of scope" ]; then
     got="(out_of_scope)"
   elif [ "$precision" = address ]; then
-    # Key forms as in golden.tsv: a fifth part names the unit or lot row.
+    # Key forms as in golden.tsv: a fifth part names the unit, lot or level row.
     pid=$(jq -r '.candidates[0].gnaf_pid' <<<"$resp")
     row="street_number||'|'||street_name||'|'||ifnull(street_type,'')||'|'||locality_name"
     if [ "$(tr -cd '|' <<<"$want" | wc -c)" -ge 4 ]; then
       row="$row||'|'||CASE WHEN flat_number<>'' THEN 'unit '||flat_number
-        WHEN lot_number<>'' AND street_number='' THEN 'lot '||lot_number ELSE '' END"
+        WHEN lot_number<>'' AND street_number='' THEN 'lot '||lot_number
+        WHEN level_number<>'' THEN 'level '||level_number ELSE '' END"
     fi
     got=$(sqlite3 -readonly "file:$db?mode=ro" "SELECT $row FROM address WHERE gnaf_pid='${pid//\'/}'")
   elif [ -n "$precision" ]; then

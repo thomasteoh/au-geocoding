@@ -50,10 +50,13 @@ func (r *Reader) ReadAll() ([]Locality, error) {
 			return nil, fmt.Errorf("shp record %d payload: %w", recNum, err)
 		}
 
-		// Parse the polygon payload.
-		poly, err := parsePolygon(payload)
-		if err != nil {
-			return nil, fmt.Errorf("shp record %d polygon: %w", recNum, err)
+		// Parse the polygon payload. A null shape (an ABS area with no
+		// geography, such as "No usual address") has no polygon.
+		var poly Polygon
+		if len(payload) < 4 || binary.LittleEndian.Uint32(payload[0:4]) != ShapeTypeNull {
+			if poly, err = parsePolygon(payload); err != nil {
+				return nil, fmt.Errorf("shp record %d polygon: %w", recNum, err)
+			}
 		}
 
 		// Read the matching .dbf record.
@@ -69,6 +72,7 @@ func (r *Reader) ReadAll() ([]Locality, error) {
 			Name:      attrs["LOC_NAME"],
 			LocClass:  attrs["LOC_CLASS"],
 			State:     attrs["STATE"],
+			Attrs:     attrs,
 			ShapeType: ShapeTypePolygon,
 		})
 		recNum++
