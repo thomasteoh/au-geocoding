@@ -11,6 +11,8 @@ import (
 
 	"augeocoding/internal/config"
 	"augeocoding/internal/ladder"
+	"augeocoding/internal/llm"
+	"augeocoding/internal/placesclient"
 	"augeocoding/internal/publicapi"
 	"ausystem/shared/contract"
 	"ausystem/shared/slog"
@@ -88,28 +90,106 @@ func (lim *apiLimits) llmGate(p publicapi.Principal, ip string, store *publicapi
 	}
 }
 
-// preflight refuses a request whose caller has no row quota left today,
-// before any ladder work or LLM spend.
-func preflight(p publicapi.Principal, ip string, store *publicapi.Store, cfg config.Config) (bool, error) {
-	if p.Anonymous() {
-		return !store.AnonAtCeiling(ip, cfg.Rate.AnonDaily, cfg.Rate.AnonDailyGlobal), nil
-	}
-	left, err := store.QuotaRemaining(p)
-	if err != nil {
-		return false, err
-	}
-	return left > 0, nil
+// rowReservation is the row quota a request holds while it works (D-034:
+// quota is per result row). Rows are reserved before any resolver or LLM
+// work and the request is then limited to what it holds, so no work is done
+// that will not be paid for: charging afterwards let a caller near its
+// ceiling have the work done and then be refused, repeatably and for free.
+// settle returns the unused part once the real row count is known.
+type rowReservation struct {
+	p       publicapi.Principal
+	ip      string
+	store   *publicapi.Store
+	perIP   int64
+	granted int64
 }
 
-// chargeRows charges result rows after a successful request: keyed rows to
-// the usage table, anonymous rows to the in-memory per-IP counter (D-026).
-func chargeRows(p publicapi.Principal, ip string, rows int64, store *publicapi.Store, cfg config.Config) bool {
-	if !p.Anonymous() {
-		ok, _ := store.ChargePrincipal(p, rows)
-		return ok
+// reserveRows takes up to want rows from the caller's daily quota: keyed rows
+// from the usage table, anonymous rows from the in-memory per-IP counter
+// (D-026). A zero grant means the caller is at its ceiling. A store fault is
+// an error, never a quota refusal: a broken app.db must read as a 5xx, not
+// as "you are over quota".
+func reserveRows(p publicapi.Principal, ip string, want int64, store *publicapi.Store, cfg config.Config) (rowReservation, error) {
+	r := rowReservation{p: p, ip: ip, store: store, perIP: cfg.Rate.AnonDaily}
+	if p.Anonymous() {
+		r.granted = store.ReserveAnonRows(ip, want, cfg.Rate.AnonDaily, cfg.Rate.AnonDailyGlobal)
+		return r, nil
 	}
-	ok, _ := store.ChargeAnonDaily(ip, rows, cfg.Rate.AnonDaily, cfg.Rate.AnonDailyGlobal)
-	return ok
+	g, err := store.ReserveRows(p, want)
+	if err != nil {
+		return rowReservation{}, err
+	}
+	r.granted = g
+	return r, nil
+}
+
+// limit is the candidate cap the request may ask for: what it holds.
+func (r rowReservation) limit() int { return int(r.granted) }
+
+// settle refunds the rows reserved but not used. used never exceeds the
+// grant: callers trim results to limit() first.
+func (r rowReservation) settle(used int64) error {
+	unused := r.granted - used
+	if unused <= 0 {
+		return nil
+	}
+	if r.p.Anonymous() {
+		r.store.RefundAnonRows(r.ip, unused, r.perIP)
+		return nil
+	}
+	return r.store.RefundRows(r.p, unused)
+}
+
+// settleLogged settles and logs a failed refund (the caller is then
+// over-charged by the unused rows, never under-charged).
+func (r rowReservation) settleLogged(used int64, log *slog.Logger, endpoint string) {
+	if err := r.settle(used); err != nil && log != nil {
+		log.Warn("quota_refund_failed", "endpoint", endpoint, "err_type", fmt.Sprintf("%T", err))
+	}
+}
+
+// trimToLimit caps a result to the rows the request holds.
+func trimToLimit(res *ladder.Result, n int) {
+	if len(res.Response.Candidates) > n {
+		res.Response.Candidates = res.Response.Candidates[:n]
+		res.Response.Truncated = true
+	}
+}
+
+// batchLLMGate makes a batch's rung-5 admission wait for a slot instead of
+// failing. A batch runs Batch.Workers items at once, more than the caller's
+// Queue.PerKeyInflight, and its own items must not knock each other out with
+// llm_busy. Items queue behind at most PerKeyInflight of the batch's own LLM
+// calls; the shared per-key cap still applies on top, so a batch and the same
+// caller's single requests together stay within it.
+func batchLLMGate(ctx context.Context, g ladder.LLMGate, perKey int) ladder.LLMGate {
+	if perKey < 1 {
+		perKey = 1
+	}
+	slots := make(chan struct{}, perKey)
+	enter := g.Enter
+	g.Enter = func() (func(), error) {
+		select {
+		case slots <- struct{}{}:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+		var leave func()
+		if enter != nil {
+			var err error
+			if leave, err = enter(); err != nil {
+				<-slots
+				return nil, err
+			}
+		}
+		return func() {
+			if leave != nil {
+				leave()
+			}
+			<-slots
+		}, nil
+	}
+	return g
 }
 
 // billableRows is what a result costs: its row count, but at least one row
@@ -144,9 +224,22 @@ func errorResponse(err error) (status int, msg, reason string) {
 	case errors.Is(err, ladder.ErrLLMQuota):
 		return http.StatusTooManyRequests, "llm quota exceeded", "llm_quota"
 	case errors.Is(err, ladder.ErrLLMNotImplemented):
-		// The LLM rung is configured but not wired (or its output was
-		// unusable) — a server-side gap, not a client error.
+		// The LLM rung is configured but not wired — a server-side gap, not
+		// a client error.
 		return http.StatusNotImplemented, "llm not implemented", "llm_not_implemented"
+	case errors.Is(err, ladder.ErrLLMBadOutput), errors.Is(err, llm.ErrNoResult):
+		// The provider answered, but not with anything usable: an upstream
+		// fault, not a missing feature.
+		return http.StatusBadGateway, "llm returned an unusable answer", "llm_bad_output"
+	case errors.Is(err, llm.ErrProvider):
+		return http.StatusBadGateway, "llm provider error", "llm_provider"
+	case errors.Is(err, ladder.ErrLLMDegraded):
+		return http.StatusServiceUnavailable, "llm unavailable", "llm_degraded"
+	case errors.Is(err, llm.ErrDisabled):
+		// Switched off at runtime while the request was in flight.
+		return http.StatusServiceUnavailable, "llm not enabled", "llm_disabled"
+	case errors.Is(err, placesclient.ErrContractMismatch):
+		return http.StatusBadGateway, "upstream contract mismatch", "contract_mismatch"
 	case errors.Is(err, contract.ErrNotLoaded):
 		return http.StatusServiceUnavailable, "not loaded", "not_loaded"
 	case errors.Is(err, context.DeadlineExceeded):

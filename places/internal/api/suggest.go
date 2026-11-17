@@ -102,7 +102,7 @@ func SuggestHandler(p *DBProvider) http.HandlerFunc {
 		}
 		// INV-1 (PR-7.5): the prefix is never logged, never a metric label,
 		// never cached. Only the suggestion count is recorded.
-		resp := Suggest(context.Background(), p.Get(), req)
+		resp := Suggest(r.Context(), p.Get(), req)
 		// Echo the contract version so the caller can verify which wire
 		// format it got (UX review finding #3).
 		w.Header().Set(contractVersionHeader, contractVersion)

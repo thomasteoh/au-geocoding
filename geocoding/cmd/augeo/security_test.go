@@ -9,7 +9,6 @@ import (
 	"net/http/httptest"
 	"net/netip"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -85,14 +84,24 @@ type fakeResolver struct {
 	calls atomic.Int64
 	err   error
 	ready error
+	// n is how many candidates to answer with (default 1), regardless of
+	// the request's Limit, so tests can see the geocoder trim them.
+	n         int
+	lastLimit atomic.Int64
 }
 
 func (f *fakeResolver) Resolve(ctx context.Context, req contract.ResolveRequest) (contract.ResolveResponse, error) {
 	f.calls.Add(1)
+	f.lastLimit.Store(int64(req.Limit))
 	if f.err != nil {
 		return contract.ResolveResponse{}, f.err
 	}
-	return contract.ResolveResponse{Candidates: []contract.Candidate{{Source: "gnaf", MatchScore: 0.9}}}, nil
+	n := max(f.n, 1)
+	cs := make([]contract.Candidate, n)
+	for i := range cs {
+		cs[i] = contract.Candidate{Source: "gnaf", MatchScore: 0.9}
+	}
+	return contract.ResolveResponse{Candidates: cs}, nil
 }
 
 func (f *fakeResolver) Suggest(ctx context.Context, req contract.SuggestRequest) (contract.SuggestResponse, error) {
@@ -152,14 +161,14 @@ func newHarness(t *testing.T, tweak func(*config.Config)) *harness {
 	l := &ladder.Ladder{
 		Rungs: []ladder.Rung{ladder.NewCoordRung(), ladder.NewAddressRung(res)},
 		LLM: &ladder.LLMRung{Configured: true, Admit: func() bool { return true }, Release: func() {},
-			Singleflight: &sync.Map{}, Breaker: ladder.NewBreaker(100, time.Minute), Provider: prov},
+			Breaker: ladder.NewBreaker(100, time.Minute), Provider: prov},
 	}
 	authn := &apiauth.Authenticator{
 		Keys: store, KeyLimiter: publicapi.NewRateLimiter(1000, 1000), AnonLimiter: publicapi.NewRateLimiter(1000, 1000),
 		ClientIP: func(r *http.Request) string { return clientIP(r, cfg.Server.TrustedProxies) },
 	}
 	log := slog.New(io.Discard, slog.LevelError, nil)
-	h := newMux(l, store, authn, res, cfg, log, metrics.New("test"), llm.NewHolder(llm.Config{}), "", nil, nil)
+	h := newMux(l, store, authn, res, cfg, log, metrics.New("test"), llm.NewHolder(llm.Config{BaseURL: "http://llm.invalid", Enabled: true}), "", nil, nil)
 	return &harness{t: t, h: h, store: store, res: res, llm: prov, cfg: cfg}
 }
 

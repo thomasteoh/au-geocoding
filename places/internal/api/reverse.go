@@ -7,7 +7,6 @@ package api
 // locality polygon containing it via the boundary geopoly index.
 
 import (
-	"context"
 	"encoding/json"
 	"net/http"
 	"strings"
@@ -63,8 +62,8 @@ func ReverseHandler(p *DBProvider) http.HandlerFunc {
 		if req.Limit <= 0 {
 			req.Limit = 5
 		}
-		res, err := match.Reverse(context.Background(), p.Get(), req.Lon, req.Lat, req.Limit)
-		resp := ReverseResponse{Version: datasetVersion(context.Background(), p.Get())}
+		res, err := match.Reverse(r.Context(), p.Get(), req.Lon, req.Lat, req.Limit)
+		resp := ReverseResponse{Version: datasetVersion(r.Context(), p.Get())}
 		if err != nil {
 			writeJSONError(w, http.StatusInternalServerError, "reverse failed")
 			return
@@ -129,8 +128,8 @@ func LocalityHandler(p *DBProvider) http.HandlerFunc {
 		if req.Limit <= 0 {
 			req.Limit = 3
 		}
-		hits, err := match.LocalityAt(context.Background(), p.Get(), req.Lon, req.Lat, req.Limit)
-		resp := LocalityResponse{Version: datasetVersion(context.Background(), p.Get())}
+		hits, err := match.LocalityAt(r.Context(), p.Get(), req.Lon, req.Lat, req.Limit)
+		resp := LocalityResponse{Version: datasetVersion(r.Context(), p.Get())}
 		if err != nil {
 			writeJSONError(w, http.StatusInternalServerError, "locality failed")
 			return

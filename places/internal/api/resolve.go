@@ -31,13 +31,14 @@ import (
 	"ausystem/shared/contract"
 )
 
-// contractVersion is the wire-format version this side implements.
-// Must equal the geocoder's contract.Version ("v1").
-const contractVersion = "v1"
-
-// contractVersionHeader is the HTTP header carrying the contract version.
-// Must equal the geocoder's contract.ContractVersionHeader.
-const contractVersionHeader = "X-Augeo-Contract-Version"
+// The version this side implements and the header carrying it come from the
+// shared contract package, so the two services cannot drift apart: bumping
+// contract.Version moves both, and a deployment mixing old and new binaries
+// fails the version check instead of mis-reading the wire format.
+const (
+	contractVersion       = contract.Version
+	contractVersionHeader = contract.ContractVersionHeader
+)
 
 // Wire error strings mirror the geocoder's contract error taxonomy. The wire
 // protocol carries them as HTTP status + error string; the geocoder's
@@ -93,7 +94,7 @@ func ResolveHandler(p *DBProvider) http.HandlerFunc {
 		if len(req.Score) > maxTokens {
 			req.Score = req.Score[:maxTokens]
 		}
-		resp, err := Resolve(context.Background(), p.Get(), req)
+		resp, err := Resolve(r.Context(), p.Get(), req)
 		if err != nil {
 			writeResolveError(w, err)
 			return

@@ -49,6 +49,20 @@ var TierQuota = map[Tier]int64{
 	TierBatch:     100000,
 }
 
+// ErrUnknownTier is returned by ParseTier for a name that is not a tier.
+var ErrUnknownTier = errors.New("unknown quota tier")
+
+// ParseTier is QuotaTier for operator input: an unknown name is an error, not
+// a silent demo key. QuotaTier's fallback suits rows already stored; a typo
+// at issuance ("standrad") must not mint a key with a tenth of the quota.
+func ParseTier(s string) (Tier, error) {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "anonymous", "demo", "standard", "batch":
+		return QuotaTier(strings.TrimSpace(s)), nil
+	}
+	return 0, fmt.Errorf("%w: %q (want anonymous, demo, standard or batch)", ErrUnknownTier, s)
+}
+
 // QuotaTier returns the tier for a key's quota_tier string.
 func QuotaTier(s string) Tier {
 	switch strings.ToLower(s) {
@@ -658,7 +672,12 @@ func (s *Store) charge(principal string, tier Tier, rows int64) (bool, error) {
 		ON CONFLICT(principal, day) DO UPDATE SET rows=rows+excluded.rows`, principal, day, rows); err != nil {
 		return false, err
 	}
-	return true, tx.Commit()
+	// The charge exists only once committed: a failed commit must not report
+	// success, or the caller is served rows nobody paid for.
+	if err := tx.Commit(); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // LogRequest writes one request_log row (T9: no query text, no result contents).
