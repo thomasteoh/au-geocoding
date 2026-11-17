@@ -10,6 +10,7 @@ package main
 import (
 	"compress/gzip"
 	"database/sql"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -33,6 +34,9 @@ type state struct {
 	Timestamp string
 }
 
+// errNotFound is a 404 from the feed (or a missing file:// path).
+var errNotFound = errors.New("not found")
+
 // fetchState retrieves and parses the feed's state.txt. The geofabrik
 // sequenceNumber is the feed's own counter; timestamp is the as-of point
 // (colons escaped as \: in the file).
@@ -42,6 +46,9 @@ func fetchState(rawURL string) (state, error) {
 		return state{}, err
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNotFound {
+		return state{}, fmt.Errorf("fetch %s: %w", rawURL, errNotFound)
+	}
 	if resp.StatusCode != http.StatusOK {
 		return state{}, fmt.Errorf("fetch %s: status %d", rawURL, resp.StatusCode)
 	}
@@ -90,8 +97,13 @@ func fetchDiff(rawURL string) (*http.Response, error) {
 		}
 		return &http.Response{StatusCode: http.StatusOK, Body: f}, nil
 	}
-	return http.Get(rawURL)
+	return httpClient.Get(rawURL)
 }
+
+// httpClient bounds every feed request. http.Get has no timeout, so a stalled
+// connection to the feed hung the chain (and the build behind it) forever.
+// Daily Australian diffs are a few MB; two minutes is generous.
+var httpClient = &http.Client{Timeout: 2 * time.Minute}
 
 // replicationURL builds the OSM replication change-file path for a sequence
 // number. OSM splits the number into 3-digit groups from the right, then pads
@@ -99,6 +111,17 @@ func fetchDiff(rawURL string) (*http.Response, error) {
 // zero-padded): 1 -> 000/001, 100 -> 000/100, 1000 -> 001/000, 4913 ->
 // 000/004/913, 1234567 -> 001/234/567.
 func replicationURL(seq uint64) string {
+	return replicationPath(seq) + ".osc.gz"
+}
+
+// stateURL is the replication state file published beside each diff. Its
+// timestamp is the as-of point of that diff.
+func stateURL(seq uint64) string {
+	return replicationPath(seq) + ".state.txt"
+}
+
+// replicationPath is the shared stem of a sequence's .osc.gz and .state.txt.
+func replicationPath(seq uint64) string {
 	n := seq
 	var parts []string
 	for {
@@ -112,17 +135,22 @@ func replicationURL(seq uint64) string {
 	for len(parts)%3 != 0 {
 		parts = append([]string{"000"}, parts...)
 	}
-	return strings.Join(parts, "/") + ".osc.gz"
+	return strings.Join(parts, "/")
 }
 
 func main() {
-	dbPath := flag.String("db", "data/vic.db", "pipeline DB path")
+	dbPath := flag.String("db", "data/vic.db", "pipeline DB path; refused while a server has it open")
 	base := flag.String("base", "https://download.geofabrik.de/australia-oceania/australia-updates", "OSM replication base URL (default: geofabrik Australia regional feed)")
 	load := flag.String("load", "", "path to loadoscdiff binary (default: build it or use go run)")
 	max := flag.Int("max", 0, "max diffs to apply in one run (0 = until caught up)")
 	flag.Parse()
 
-	db, err := sql.Open("sqlite", *dbPath)
+	// Check rather than hold the writer lock: each diff is applied by a child
+	// loadoscdiff process, which takes the lock itself.
+	if err := schema.CheckNotServed(*dbPath); err != nil {
+		log.Fatalf("open db: %v", err)
+	}
+	db, err := sql.Open("sqlite", schema.WriterDSN(*dbPath))
 	if err != nil {
 		log.Fatalf("open db: %v", err)
 	}
@@ -184,6 +212,30 @@ func main() {
 			log.Fatalf("fetch %s: status %d", url, resp.StatusCode)
 		}
 
+		// The diff's as-of point is the timestamp in its own state file, not
+		// the time we happened to apply it: the anchor has to say what the
+		// data reflects, or catching up a week of diffs stamps all of them
+		// with today. The feed writes the state file after the diff, so a
+		// missing one means this diff is not finished publishing yet.
+		st, err := fetchState(*base + "/" + stateURL(next))
+		if errors.Is(err, errNotFound) {
+			resp.Body.Close()
+			break
+		}
+		if err != nil {
+			resp.Body.Close()
+			log.Fatalf("fetch state for seq %d: %v", next, err)
+		}
+		if st.Sequence != next || st.Timestamp == "" {
+			resp.Body.Close()
+			log.Fatalf("state for seq %d: got sequence %d timestamp %q", next, st.Sequence, st.Timestamp)
+		}
+		diffTS, err := time.Parse(time.RFC3339, st.Timestamp)
+		if err != nil {
+			resp.Body.Close()
+			log.Fatalf("state for seq %d: timestamp %q: %v", next, st.Timestamp, err)
+		}
+
 		// Download to a temp file (gzip), then gunzip to a plain .osc —
 		// loadoscdiff reads uncompressed OSC XML.
 		gzPath := filepath.Join(os.TempDir(), fmt.Sprintf("osc-%d.osc.gz", next))
@@ -218,8 +270,7 @@ func main() {
 		out.Close()
 		os.Remove(gzPath)
 
-		// The diff's as-of replication point is next (the file we fetched).
-		ts := time.Now().UTC().Format(time.RFC3339)
+		ts := diffTS.UTC().Format(time.RFC3339)
 		cmd := exec.Command(*load, "-db", *dbPath, "-osc", oscPath, "-seq", fmt.Sprintf("%d", next), "-ts", ts)
 		comb, err := cmd.CombinedOutput()
 		if err != nil {
