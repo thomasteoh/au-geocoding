@@ -187,7 +187,7 @@ func Simplify(p Polygon, opt Options) (Outline, error) {
 	// integer grid. Quantisation alone does substantial work: consecutive
 	// points that land on the same pixel collapse.
 	tol0 := opt.SubPixel / scale
-	grid, simplified, clean := buildRings(kept, tol0, scale, ox, oy)
+	grid, simplified, sources, clean := buildRings(kept, tol0, scale, ox, oy)
 
 	// R10.4 — retry at a finer tolerance. This is the right remedy when the
 	// cause is over-simplification pulling a concave section through itself,
@@ -196,8 +196,8 @@ func Simplify(p Polygon, opt Options) (Outline, error) {
 		tol := tol0
 		for attempt := 1; attempt <= maxSimplifyRetries; attempt++ {
 			tol /= 2
-			if g, sm, c := buildRings(kept, tol, scale, ox, oy); c {
-				grid, simplified, clean = g, sm, true
+			if g, sm, src, c := buildRings(kept, tol, scale, ox, oy); c {
+				grid, simplified, sources, clean = g, sm, src, true
 				break
 			}
 		}
@@ -262,8 +262,13 @@ func Simplify(p Polygon, opt Options) (Outline, error) {
 	// the implementation actually honours that bound. Quantisation error on
 	// top is bounded by half a grid cell by construction, and the grid is the
 	// display, so it is invisible by definition.
+	//
+	// Compare each simplified ring with its own source. buildRings skips rings
+	// that collapse on the grid, so simplified is not index-aligned with kept:
+	// pairing kept[i] with simplified[i] measured one ring against another and
+	// failed the gate on localities that were within tolerance.
 	for i := range simplified {
-		if d := maxDeviation(kept[i], simplified[i]) * scale; d > out.MaxDevPx {
+		if d := maxDeviation(sources[i], simplified[i]) * scale; d > out.MaxDevPx {
 			out.MaxDevPx = d
 		}
 	}
@@ -626,8 +631,10 @@ func crossf(o, a, b Point) float64 {
 
 // buildRings simplifies and quantises every ring at tol. clean reports whether
 // the result is free of self-intersections; the rings are returned either way,
-// because a pinched outline is still the one worth keeping.
-func buildRings(rings [][]Point, tol, scale, ox, oy float64) (grid [][]IPoint, simp [][]Point, clean bool) {
+// because a pinched outline is still the one worth keeping. src[i] is the input
+// ring that simp[i] and grid[i] came from: rings that collapse are skipped, so
+// the outputs are not index-aligned with rings.
+func buildRings(rings [][]Point, tol, scale, ox, oy float64) (grid [][]IPoint, simp, src [][]Point, clean bool) {
 	clean = true
 	for _, r := range rings {
 		s := simplifyRing(r, tol)
@@ -641,9 +648,10 @@ func buildRings(rings [][]Point, tol, scale, ox, oy float64) (grid [][]IPoint, s
 			clean = false
 		}
 		simp = append(simp, s)
+		src = append(src, r)
 		grid = append(grid, g)
 	}
-	return grid, simp, clean
+	return grid, simp, src, clean
 }
 
 // sourceSelfIntersects checks the projected rings at full float precision,
