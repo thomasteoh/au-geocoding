@@ -121,7 +121,7 @@ func SearchHandler(p *DBProvider) http.HandlerFunc {
 			req.Limit = maxResults
 		}
 
-		resp := Search(context.Background(), p.Get(), req)
+		resp := Search(r.Context(), p.Get(), req)
 		// Echo the contract version so the caller can verify which wire
 		// format it got (UX review finding #3).
 		w.Header().Set(contractVersionHeader, contractVersion)
