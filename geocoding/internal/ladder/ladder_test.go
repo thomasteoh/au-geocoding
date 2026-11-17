@@ -172,3 +172,19 @@ func TestQueryLimitReachesResolver(t *testing.T) {
 		}
 	}
 }
+
+// A postal box goes to places as an address, with the box leading Score, and
+// is never searched as a POI name when places cannot place it.
+func TestPostalBoxIsNotAPOI(t *testing.T) {
+	st := &stubResolver{err: contract.ErrNoCandidates}
+	l := &Ladder{Rungs: []Rung{NewAddressRung(st), NewPOIRung(declineResolver{})}}
+	q := "PO Box 123 Nowhere VIC 3001"
+	_, err := l.Walk(context.Background(), Query{Raw: q, Normal: normalise.Normalise(q)})
+	if !errors.Is(err, ErrNoRung) {
+		t.Errorf("walk: err %v, want ErrNoRung (no POI fallback)", err)
+	}
+	if st.got.Kind != contract.KindAddress || len(st.got.Score) < 3 ||
+		st.got.Score[0] != "po" || st.got.Score[1] != "box" || st.got.Score[2] != "123" {
+		t.Errorf("address request %+v, want Score opening po box 123", st.got)
+	}
+}

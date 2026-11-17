@@ -66,7 +66,10 @@ After adding a street or locality to the golden set, rebuild the fixture:
 Full-dataset checks open the dataset read-only. A dataset built before
 `idx_addr_pid` was added to `buildaddr` needs
 `CREATE UNIQUE INDEX idx_addr_pid ON address(gnaf_pid)`, or every address query
-scans the whole table.
+scans the whole table. One built before `flat_number` and `lot_number` were
+added still serves street addresses, but cannot tell units or lots apart
+("7/12 Collins St" is any row at 12 Collins St; "Lot 14 Old Sydney Rd" is any
+address on the street): rebuild `address` with `buildaddr`.
 
 ## Run (self-host)
 

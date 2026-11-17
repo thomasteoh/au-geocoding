@@ -76,7 +76,16 @@ func build(db *sql.Tx, version string) {
 		CREATE TABLE address AS
 		SELECT
 			ADDRESS_DETAIL_PID AS gnaf_pid,
-			COALESCE(CAST(NUMBER_FIRST AS INTEGER), '') AS street_number,
+			-- An empty NUMBER_FIRST casts to 0, which made every lot-only
+			-- address street number 0; it stays empty.
+			CASE WHEN COALESCE(NUMBER_FIRST, '') = '' THEN ''
+				ELSE CAST(NUMBER_FIRST AS INTEGER) END AS street_number,
+			-- The unit and lot as the parser reads them: digits only, so
+			-- "UNIT 3A" and FLAT_NUMBER 3 with suffix A meet at "3". G-NAF
+			-- stores FLAT_NUMBER as a real ("3.0").
+			CASE WHEN COALESCE(FLAT_NUMBER, '') = '' THEN ''
+				ELSE CAST(CAST(FLAT_NUMBER AS INTEGER) AS TEXT) END AS flat_number,
+			TRIM(COALESCE(LOT_NUMBER, '')) AS lot_number,
 			STREET_NAME AS street_name,
 			-- STREET_TYPE_CODE is the street type (STREET, ROAD, AVENUE).
 			-- STREET_CLASS_TYPE is a CONFIRMED/UNCONFIRMED status flag and was
@@ -106,7 +115,10 @@ func build(db *sql.Tx, version string) {
 				WHEN 'LOCALITY'                       THEN 1
 				ELSE 0
 			END AS geocode_rel,
-			COALESCE(PRIMARY_SECONDARY, 'P') AS primary_sec,
+			-- Most standalone addresses carry an empty PRIMARY_SECONDARY, not
+			-- NULL; both mean primary. Generation prefers primary rows when the
+			-- query names no unit, so a secondary must be exactly 'S'.
+			COALESCE(NULLIF(PRIMARY_SECONDARY, ''), 'P') AS primary_sec,
 			COALESCE(BUILDING_NAME, '') AS address_alias,
 			'' AS mb_2026,
 			'real-gnaf-2026' AS dataset_version

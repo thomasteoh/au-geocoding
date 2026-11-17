@@ -52,6 +52,8 @@ func (l *Ladder) ResolveStructured(ctx context.Context, c contract.AddressCompon
 	// nothing. The caller already told us which field is which, so applying
 	// the free-text guess here would throw that away and reintroduce exactly
 	// the ambiguity structured input removes.
+	unit := normalise.Fold(c.Unit)
+	lot := normalise.Fold(c.Lot)
 	num := normalise.Fold(c.StreetNumber)
 	name := normalise.Fold(c.StreetName)
 	typ := normalise.ExpandStreetType(c.StreetType)
@@ -79,7 +81,15 @@ func (l *Ladder) ResolveStructured(ctx context.Context, c contract.AddressCompon
 		}
 	}
 	// Score carries everything the caller gave us, including the short tokens.
+	// A unit or lot leads in the free-text form ("unit 3", "lot 5"), so a
+	// resolver that reads Score by position rather than Components finds it.
 	var score []string
+	if unit != "" {
+		score = append(score, "unit", unit)
+	}
+	if lot != "" {
+		score = append(score, "lot", lot)
+	}
 	for _, t := range []string{num, name, typ, loc, state, post} {
 		if t != "" {
 			score = append(score, t)
@@ -87,6 +97,8 @@ func (l *Ladder) ResolveStructured(ctx context.Context, c contract.AddressCompon
 	}
 
 	comps := contract.AddressComponents{
+		Unit:         unit,
+		Lot:          lot,
 		StreetNumber: num,
 		StreetName:   name,
 		StreetType:   typ,

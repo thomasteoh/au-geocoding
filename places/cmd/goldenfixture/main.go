@@ -7,7 +7,8 @@
 // exercised), the same street name in other localities, near-miss street names
 // statewide (the misspelling distractors), one row per street in each golden
 // locality, and one row per locality statewide (so locality recognition sees
-// the full set of names). Run it again when golden.tsv gains a street:
+// the full set of names). A lot is kept like a number; units need nothing
+// more, since every unit row at a golden number is kept. Run it again when golden.tsv gains a street:
 //
 //	go run ./cmd/goldenfixture -db /path/to/vic.db
 package main
@@ -29,8 +30,12 @@ import (
 	"ausystem/shared/streettype"
 )
 
+// columns must match fixtureColumns in internal/api/golden_test.go.
 const columns = `gnaf_pid, street_number, street_name, COALESCE(street_type, ''), locality_name,
-	state, COALESCE(postcode, ''), latitude, longitude, confidence, geocode_rel`
+	state, COALESCE(postcode, ''), latitude, longitude, confidence, geocode_rel,
+	flat_number, lot_number, primary_sec`
+
+const ncolumns = 14
 
 func main() {
 	dbPath := flag.String("db", "", "real dataset (opened read-only)")
@@ -47,7 +52,7 @@ func main() {
 	}
 	defer db.Close()
 
-	type pair struct{ street, locality, number string }
+	type pair struct{ street, locality, number, lot string }
 	var pairs []pair
 	localities, postcodes, streets := map[string]bool{}, map[string]bool{}, map[string]bool{}
 	f, err := os.Open(*golden)
@@ -61,18 +66,29 @@ func main() {
 			continue
 		}
 		_, want, _ := strings.Cut(line, "\t")
+		// A postal box answer names the place it fell back to after "@".
+		if _, place, ok := strings.Cut(want, "@"); ok {
+			want = place
+		}
 		switch {
 		case strings.HasPrefix(want, "street:"):
 			name, loc, _ := strings.Cut(strings.TrimPrefix(want, "street:"), "|")
-			pairs = append(pairs, pair{streettype.StripSuffix(name), loc, ""})
+			pairs = append(pairs, pair{streettype.StripSuffix(name), loc, "", ""})
 		case strings.HasPrefix(want, "locality:"):
 			loc, _, _ := strings.Cut(strings.TrimPrefix(want, "locality:"), "|")
 			localities[loc] = true
 		case strings.HasPrefix(want, "postcode:"):
 			postcodes[strings.TrimPrefix(want, "postcode:")] = true
-		case strings.Count(want, "|") == 3:
+		case strings.Count(want, "|") >= 3:
+			// number|street|type|locality, optionally |unit N or |lot N.
 			p := strings.Split(want, "|")
-			pairs = append(pairs, pair{p[1], p[3], p[0]})
+			pr := pair{p[1], p[3], p[0], ""}
+			if len(p) > 4 {
+				if lot, ok := strings.CutPrefix(p[4], "lot "); ok {
+					pr.lot = lot
+				}
+			}
+			pairs = append(pairs, pr)
 		}
 	}
 	f.Close()
@@ -89,15 +105,15 @@ func main() {
 		}
 		defer r.Close()
 		for r.Next() {
-			v := make([]sql.NullString, 11)
-			ptrs := make([]any, 11)
+			v := make([]sql.NullString, ncolumns)
+			ptrs := make([]any, ncolumns)
 			for i := range v {
 				ptrs[i] = &v[i]
 			}
 			if err := r.Scan(ptrs...); err != nil {
 				log.Fatal(err)
 			}
-			rec := make([]string, 11)
+			rec := make([]string, ncolumns)
 			for i, s := range v {
 				rec[i] = s.String
 			}
@@ -111,6 +127,9 @@ func main() {
 	for _, p := range pairs {
 		if p.number != "" {
 			add(`street_name = ? AND locality_name = ? AND CAST(street_number AS TEXT) = ?`, p.street, p.locality, p.number)
+		}
+		if p.lot != "" && p.lot != p.number {
+			add(`street_name = ? AND locality_name = ? AND lot_number = ?`, p.street, p.locality, p.lot)
 		}
 		add(`street_name = ? AND locality_name = ? ORDER BY gnaf_pid LIMIT ?`, p.street, p.locality, *perStreet)
 	}

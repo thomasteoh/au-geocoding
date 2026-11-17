@@ -44,7 +44,7 @@ func TestGolden(t *testing.T) {
 			searchN++
 			got := ""
 			if resp := Search(ctx, db, SearchRequest{Query: c.query}); len(resp.Candidates) > 0 {
-				got = streetKey(t, db, resp.Candidates[0].ID)
+				got = addressKey(t, db, resp.Candidates[0].ID, c.want)
 			}
 			if got == c.want {
 				searchOK++
@@ -62,9 +62,12 @@ func TestGolden(t *testing.T) {
 			})
 			if err == nil && len(resp.Candidates) > 0 {
 				top := resp.Candidates[0]
-				if top.Precision == contract.PrecisionAddress {
-					got = streetKey(t, db, top.GnafPID)
-				} else {
+				switch {
+				case top.Precision == contract.PrecisionAddress:
+					got = addressKey(t, db, top.GnafPID, c.want)
+				case top.PostalDelivery != "":
+					got = top.PostalDelivery + "@" + top.ID.PID
+				default:
 					got = top.ID.PID
 				}
 			}
@@ -103,16 +106,29 @@ func loadGolden(t *testing.T, path string) []goldenCase {
 	return out
 }
 
-// streetKey is the street-address key for a PID: number|street|type|locality.
-func streetKey(t *testing.T, db *sql.DB, pid string) string {
+// addressKey is the key for a PID in the form want uses. The street address
+// is number|street|type|locality, and any row there will do; a fifth part
+// names the row: "unit N", "lot N" for a lot with no street number, or empty
+// for the base address (no unit).
+func addressKey(t *testing.T, db *sql.DB, pid, want string) string {
 	t.Helper()
-	var num, name, typ, loc sql.NullString
-	err := db.QueryRow(`SELECT street_number, street_name, street_type, locality_name
-		FROM address WHERE gnaf_pid = ?`, pid).Scan(&num, &name, &typ, &loc)
+	var num, flat, lot, name, typ, loc sql.NullString
+	err := db.QueryRow(`SELECT street_number, flat_number, lot_number, street_name, street_type, locality_name
+		FROM address WHERE gnaf_pid = ?`, pid).Scan(&num, &flat, &lot, &name, &typ, &loc)
 	if err != nil {
 		return "(lookup " + pid + ": " + err.Error() + ")"
 	}
-	return num.String + "|" + name.String + "|" + typ.String + "|" + loc.String
+	key := num.String + "|" + name.String + "|" + typ.String + "|" + loc.String
+	if strings.Count(want, "|") < 4 {
+		return key
+	}
+	switch {
+	case flat.String != "":
+		return key + "|unit " + flat.String
+	case lot.String != "" && num.String == "":
+		return key + "|lot " + lot.String
+	}
+	return key + "|"
 }
 
 // fixtureDB loads a golden fixture (gzipped TSV of address rows, in the
@@ -143,13 +159,13 @@ func fixtureDB(t *testing.T, path string) *sql.DB {
 		t.Fatal(err)
 	}
 	stmt, err := tx.Prepare(`INSERT INTO address (` + fixtureColumns + `)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+		VALUES (?` + strings.Repeat(", ?", fixtureColumnCount-1) + `)`)
 	if err != nil {
 		t.Fatal(err)
 	}
 	r := csv.NewReader(zr)
 	r.Comma = '\t'
-	r.FieldsPerRecord = 11
+	r.FieldsPerRecord = fixtureColumnCount
 	for {
 		rec, err := r.Read()
 		if err == io.EOF {
@@ -179,4 +195,7 @@ func fixtureDB(t *testing.T, path string) *sql.DB {
 // fixtureColumns is the address column order in the golden fixture; it must
 // match cmd/goldenfixture.
 const fixtureColumns = `gnaf_pid, street_number, street_name, street_type, locality_name,
-	state, postcode, latitude, longitude, confidence, geocode_rel`
+	state, postcode, latitude, longitude, confidence, geocode_rel,
+	flat_number, lot_number, primary_sec`
+
+const fixtureColumnCount = 14

@@ -897,6 +897,8 @@ func structuredRequest(body string) (comps *contract.AddressComponents, hasQuery
 		Components *contract.AddressComponents `json:"components"`
 		// Components may also be supplied flat at the top level, which is what
 		// a caller mapping their own record shape will reach for first.
+		Unit         string `json:"unit"`
+		Lot          string `json:"lot"`
 		StreetNumber string `json:"street_number"`
 		StreetName   string `json:"street_name"`
 		StreetType   string `json:"street_type"`
@@ -912,6 +914,7 @@ func structuredRequest(body string) (comps *contract.AddressComponents, hasQuery
 
 	if obj.Components != nil && !obj.Components.Empty() {
 		flat := contract.AddressComponents{
+			Unit: obj.Unit, Lot: obj.Lot,
 			StreetNumber: obj.StreetNumber, StreetName: obj.StreetName,
 			StreetType: obj.StreetType, Locality: obj.Locality,
 			State: obj.State, Postcode: obj.Postcode,
@@ -922,6 +925,7 @@ func structuredRequest(body string) (comps *contract.AddressComponents, hasQuery
 		return obj.Components, hasQuery, nil
 	}
 	flat := contract.AddressComponents{
+		Unit: obj.Unit, Lot: obj.Lot,
 		StreetNumber: obj.StreetNumber, StreetName: obj.StreetName,
 		StreetType: obj.StreetType, Locality: obj.Locality,
 		State: obj.State, Postcode: obj.Postcode,
