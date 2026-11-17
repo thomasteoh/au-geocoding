@@ -25,10 +25,10 @@ var unitPrefixes = map[string]bool{
 	"apt": true, "suite": true, "su": true, "shop": true,
 }
 
-// levelPrefixes introduce a floor ("level 2", "lvl 2", "l2"). G-NAF keeps the
-// level apart from the flat number and the address table does not carry it,
-// so the level is read only so that it is not taken for a unit, and dropped.
-var levelPrefixes = map[string]bool{"level": true, "lvl": true, "l": true}
+// levelPrefixes introduce a floor ("level 2", "lvl 2", "l2", "floor 2"; "2nd
+// floor" is read by ordinalLevelRe). G-NAF keeps the level apart from the flat
+// number, so it is recorded in Result.Level and passed on as "level N".
+var levelPrefixes = map[string]bool{"level": true, "lvl": true, "l": true, "floor": true, "fl": true}
 
 // stateCodes maps state abbreviations to the full name.
 var stateCodes = map[string]string{
@@ -40,8 +40,8 @@ var stateCodes = map[string]string{
 // Result is the normalised form of one query.
 type Result struct {
 	// Tokens is the full normalised token set, in query order — scoring. A
-	// unit, lot or postal delivery point opens it in canonical words ("unit
-	// 3", "lot 5", "po box 123") so places reads it by position like the rest
+	// unit, lot, level or postal delivery point opens it in canonical words
+	// ("unit 3", "lot 5", "level 2", "po box 123") so places reads it by position like the rest
 	// of the address; none of those words is in Generate.
 	Tokens   []string
 	Generate []string // reliable tokens — candidate generation
@@ -49,6 +49,7 @@ type Result struct {
 	Postcode string   // hint, "" if absent
 	Unit     string   // unit/flat number, "" if absent
 	Lot      string   // lot number, "" if absent
+	Level    string   // level or floor number, "" if absent
 	// POBox is the postal delivery point the address opens with ("po box
 	// 123", "locked bag 5"), "" if none. G-NAF has no location for one.
 	POBox      string
@@ -60,7 +61,9 @@ type Result struct {
 var (
 	numberRe      = regexp.MustCompile(`^([0-9]+)[a-z]?$`)
 	unitPrefixRe  = regexp.MustCompile(`^(unit|apt|shop|u|f)([0-9]+)[a-z]?$`)
-	levelPrefixRe = regexp.MustCompile(`^(lvl|l)([0-9]+)[a-z]?$`)
+	levelPrefixRe = regexp.MustCompile(`^(lvl|l|fl)([0-9]+)[a-z]?$`)
+	// ordinalLevelRe is the number in "2nd floor", "1st level".
+	ordinalLevelRe = regexp.MustCompile(`^([0-9]+)(st|nd|rd|th)$`)
 )
 
 // Normalise folds case, strips punctuation, expands abbreviations, and pulls
@@ -76,7 +79,7 @@ var (
 // Unit forms "3/15", "unit 3 15" and "u3 15" give unit 3, number 15; a range
 // "15-17" gives 15, G-NAF's first number; "15a" gives 15. "lot 5" is a lot
 // number, which stands in for the street number on rural and new-estate
-// addresses, and a level ("level 2", "l2") is skipped. A postal delivery point
+// addresses, and a level ("level 2", "l2", "2nd floor") is a level number. A postal delivery point
 // ("PO Box 123", "GPO Box", "Locked Bag") is recognised only at the start.
 func Normalise(raw string) Result {
 	s := strings.ToLower(raw)
@@ -115,11 +118,18 @@ func Normalise(raw string) Result {
 			continue
 		}
 		if levelPrefixes[t] && next {
+			out.Level = numberRe.FindStringSubmatch(toks[i+1])[1]
 			i += 2
 			continue
 		}
-		if levelPrefixRe.MatchString(t) {
+		if m := levelPrefixRe.FindStringSubmatch(t); m != nil {
+			out.Level = m[2]
 			i++
+			continue
+		}
+		if m := ordinalLevelRe.FindStringSubmatch(t); m != nil && i+1 < len(toks) && levelPrefixes[toks[i+1]] && toks[i+1] != "l" {
+			out.Level = m[1]
+			i += 2
 			continue
 		}
 		if unitPrefixes[t] && next {
@@ -170,6 +180,9 @@ func Normalise(raw string) Result {
 	}
 	if out.Lot != "" {
 		keep = append(keep, "lot", out.Lot)
+	}
+	if out.Level != "" {
+		keep = append(keep, "level", out.Level)
 	}
 	qualifiers := len(keep)
 	if number != "" {

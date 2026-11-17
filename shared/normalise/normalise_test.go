@@ -23,9 +23,9 @@ func TestNormalise(t *testing.T) {
 		{"u3 15a High St", []string{"unit", "3", "15", "high", "street"}, "3", "", true, true},
 		{"15-17 Smith St", []string{"15", "smith", "street"}, "", "", true, true},
 		{"12 Collins Way Melbourne", []string{"12", "collins", "way", "melbourne"}, "", "", true, true},
-		{"Level 2, 36 Collins St", []string{"36", "collins", "street"}, "", "", true, true},
-		{"L2 36 Collins St", []string{"36", "collins", "street"}, "", "", true, true},
-		{"Shop 4 Level 1 36 Collins St", []string{"unit", "4", "36", "collins", "street"}, "4", "", true, true},
+		{"Level 2, 36 Collins St", []string{"level", "2", "36", "collins", "street"}, "", "", true, true},
+		{"L2 36 Collins St", []string{"level", "2", "36", "collins", "street"}, "", "", true, true},
+		{"Shop 4 Level 1 36 Collins St", []string{"unit", "4", "level", "1", "36", "collins", "street"}, "4", "", true, true},
 		{"3000", []string{"3000"}, "", "3000", false, false},
 		{"woolworths", []string{"woolworths"}, "", "", false, false},
 	}

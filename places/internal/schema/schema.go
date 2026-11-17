@@ -14,6 +14,8 @@ CREATE TABLE IF NOT EXISTS address (
   street_number  TEXT,                  -- ADDRESS_DETAIL.number_first (empty on a lot-only address)
   flat_number    TEXT NOT NULL DEFAULT '', -- ADDRESS_DETAIL.flat_number, digits; '' when no unit
   lot_number     TEXT NOT NULL DEFAULT '', -- ADDRESS_DETAIL.lot_number; '' when none
+  level_number   TEXT NOT NULL DEFAULT '', -- ADDRESS_DETAIL.level_number, digits, LEVEL/FLOOR only; '' otherwise
+  level_type     TEXT NOT NULL DEFAULT '', -- LEVEL_TYPE_AUT.name (LEVEL, FLOOR, BASEMENT, ...); '' when none
   street_name    TEXT NOT NULL,         -- STREET_LOCALITY.flat_name
   street_type    TEXT,                  -- STREET_LOCALITY.street_type (STREET/ROAD/...)
   locality_name  TEXT NOT NULL,         -- LOCALITY.flat_name (LOCALITY_ALIAS-resolved)

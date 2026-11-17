@@ -47,21 +47,25 @@ var unitWords = map[string]bool{
 	"APT": true, "SUITE": true, "SHOP": true,
 }
 
-// levelWords introduce a floor ("LEVEL 2", "L2"). G-NAF keeps the level apart
-// from the flat and the address table does not carry it, so a level is read
-// only so that it is not taken for the unit, and dropped.
-var levelWords = map[string]bool{"LEVEL": true, "LVL": true, "L": true}
+// levelWords introduce a floor ("LEVEL 2", "L2", "FLOOR 2"; "2ND FLOOR" is
+// read by ordinalLevelRe). G-NAF keeps the level apart from the flat, as
+// address.level_number, so it is read into Parsed.Level and picks the row
+// on that level.
+var levelWords = map[string]bool{"LEVEL": true, "LVL": true, "L": true, "FLOOR": true, "FL": true}
 
 var (
 	stripRe     = regexp.MustCompile(`[^A-Z0-9'/\-\s]`)
 	numberRe    = regexp.MustCompile(`^([0-9]+)[A-Z]?$`)
 	unitWordRe  = regexp.MustCompile(`^(UNIT|APT|SHOP|U|F)([0-9]+)[A-Z]?$`)
-	levelWordRe = regexp.MustCompile(`^(LVL|L)([0-9]+)[A-Z]?$`)
+	levelWordRe = regexp.MustCompile(`^(LVL|L|FL)([0-9]+)[A-Z]?$`)
+	// ordinalLevelRe is the number in "2ND FLOOR", "1ST LEVEL".
+	ordinalLevelRe = regexp.MustCompile(`^([0-9]+)(ST|ND|RD|TH)$`)
 )
 
 // Parsed is a free-text address split into its parts.
 type Parsed struct {
 	Unit   string // flat number, digits only
+	Level  string // level or floor number, digits only
 	Lot    string // lot number: stands in for the street number on lots
 	Number string
 	// POBox is a postal delivery point the text opens with ("PO BOX 123",
@@ -113,7 +117,7 @@ func Parse(input string, maxTokens int, localitySet map[string]bool, nearest Nea
 	}
 	// Unit and street number. Accepts "UNIT 3 15", "U3 15", "3/15", "15-17"
 	// (a range: the first number is G-NAF's number_first) and "15A", plus
-	// "LOT 5" and a level, which is skipped.
+	// "LOT 5" and a level ("LEVEL 2", "L2", "2ND FLOOR").
 	for i < len(toks) {
 		t := toks[i]
 		next := i+1 < len(toks) && numberRe.MatchString(toks[i+1])
@@ -123,11 +127,18 @@ func Parse(input string, maxTokens int, localitySet map[string]bool, nearest Nea
 			continue
 		}
 		if levelWords[t] && next {
+			p.Level = numberRe.FindStringSubmatch(toks[i+1])[1]
 			i += 2
 			continue
 		}
-		if levelWordRe.MatchString(t) {
+		if m := levelWordRe.FindStringSubmatch(t); m != nil {
+			p.Level = m[2]
 			i++
+			continue
+		}
+		if m := ordinalLevelRe.FindStringSubmatch(t); m != nil && i+1 < len(toks) && levelWords[toks[i+1]] && toks[i+1] != "L" {
+			p.Level = m[1]
+			i += 2
 			continue
 		}
 		if unitWords[t] && next {
@@ -345,6 +356,7 @@ func (p Parsed) Tokens() (reliable []string, score []string, fields []string) {
 	// does not index them, so they cannot anchor generation.
 	add(p.Unit, "flat_number", false)
 	add(p.Lot, "lot_number", false)
+	add(p.Level, "level_number", false)
 	add(p.POBox, "postal_delivery", false)
 	add(p.StreetType, "street_type", false)
 	add(p.State, "state", false)
