@@ -188,3 +188,46 @@ func TestPostalBoxIsNotAPOI(t *testing.T) {
 		t.Errorf("address request %+v, want Score opening po box 123", st.got)
 	}
 }
+
+// scopeResolver stands in for places over a VIC-only dataset: an address
+// request naming NSW and a NSW postcode is refused as out of scope, and
+// everything else has no candidates.
+type scopeResolver struct{ recordingResolver }
+
+func (r *scopeResolver) Resolve(ctx context.Context, req contract.ResolveRequest) (contract.ResolveResponse, error) {
+	r.mu.Lock()
+	r.reqs = append(r.reqs, req)
+	r.mu.Unlock()
+	if req.Kind != contract.KindAddress {
+		return contract.ResolveResponse{Candidates: []contract.Candidate{{Source: "osm", Name: "poi"}}}, nil
+	}
+	has := map[string]bool{}
+	for _, t := range req.Score {
+		has[t] = true
+	}
+	if has["nsw"] && has["2000"] {
+		return contract.ResolveResponse{}, contract.ErrOutOfScope
+	}
+	return contract.ResolveResponse{}, contract.ErrNoCandidates
+}
+
+func fullLadder(res contract.Resolver) *Ladder {
+	return &Ladder{Rungs: []Rung{NewCoordRung(), NewAddressRung(res), NewPOIAnchorRung(res), NewPOIRung(res)}}
+}
+
+// A street address in a state the dataset does not cover is refused, on
+// /geocode and /search alike, never matched to a street of the same name here
+// or handed on to the POI rungs.
+func TestGeocodeOutOfScopeState(t *testing.T) {
+	for _, kind := range []string{"geocode", "search"} {
+		res := &scopeResolver{}
+		q := "1 Smith St Sydney NSW 2000"
+		_, err := fullLadder(res).WalkKind(context.Background(), Query{Raw: q, Normal: normalise.Normalise(q)}, kind)
+		if !errors.Is(err, contract.ErrOutOfScope) {
+			t.Fatalf("%s %q: err %v, want ErrOutOfScope", kind, q, err)
+		}
+		if len(res.reqs) != 1 || res.reqs[0].Kind != contract.KindAddress {
+			t.Errorf("%s: resolver requests %+v, want the one address request", kind, res.reqs)
+		}
+	}
+}
