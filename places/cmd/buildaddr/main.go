@@ -2,6 +2,14 @@
 // ADDRESS_VIEW. This is the real-data swap for the matcher: the synthetic
 // address table is replaced by the real flattened view, and the trigram index
 // is built over the real data. After this, the matcher runs unchanged.
+//
+// The rebuild is one transaction: drop, materialise, index, addr_trgm and
+// addr_rt either all land or none do. Run outside a transaction, a crash after
+// the DROPs left a DB with no address table at all.
+//
+// address.dataset_version is the dataset's single version label: the server
+// reports it at boot and on activation, and every response carries it. Set it
+// with -version; by default it is derived from the G-NAF release.
 package main
 
 import (
@@ -11,18 +19,47 @@ import (
 	"log"
 
 	_ "modernc.org/sqlite"
+
+	"auplaces/internal/schema"
 )
 
 func main() {
-	dbPath := flag.String("db", "data/vic.db", "SQLite DB path")
+	dbPath := flag.String("db", "data/vic.db", "SQLite DB path; refused while a server has it open (build a staging copy, then activate it)")
+	version := flag.String("version", "", "dataset version label stored in address.dataset_version (default: gnaf-YYYY-MM from the G-NAF release)")
 	flag.Parse()
 
-	db, err := sql.Open("sqlite", *dbPath)
+	db, release, err := schema.OpenWriter(*dbPath)
 	if err != nil {
 		log.Fatalf("open: %v", err)
 	}
+	defer release()
 	defer db.Close()
 
+	if *version == "" {
+		v, err := releaseVersion(db)
+		if err != nil {
+			log.Fatalf("derive dataset version (pass -version): %v", err)
+		}
+		*version = v
+	}
+	fmt.Printf("dataset version: %s\n", *version)
+
+	tx, err := db.Begin()
+	if err != nil {
+		log.Fatalf("begin: %v", err)
+	}
+	// A log.Fatalf inside build exits without committing; SQLite rolls the
+	// hot journal back on the next open, so the previous tables survive.
+	build(tx, *version)
+	if err := tx.Commit(); err != nil {
+		log.Fatalf("commit: %v", err)
+	}
+	fmt.Println("committed")
+}
+
+// build replaces address, addr_trgm and addr_rt inside the caller's
+// transaction. The parameter is named db so the statements read as before.
+func build(db *sql.Tx, version string) {
 	// Drop any existing synthetic address/addr_trgm (re-runs).
 	for _, s := range []string{
 		`DROP TABLE IF EXISTS addr_trgm`,
@@ -76,6 +113,12 @@ func main() {
 		FROM ADDRESS_VIEW
 	`); err != nil {
 		log.Fatalf("materialise address: %v", err)
+	}
+	// The SELECT above writes a placeholder label; stamp the real one. Done as
+	// an UPDATE so the column list stays a plain mapping from ADDRESS_VIEW, and
+	// before the indexes exist so it rewrites only the table.
+	if _, err := db.Exec(`UPDATE address SET dataset_version = ?`, version); err != nil {
+		log.Fatalf("stamp dataset version: %v", err)
 	}
 	fmt.Println("address materialised from ADDRESS_VIEW")
 
@@ -145,4 +188,21 @@ func main() {
 		log.Fatalf("count addr_rt: %v", err)
 	}
 	fmt.Printf("addr_rt rows: %d\n", rt)
+}
+
+// releaseVersion derives the default version label from the G-NAF release
+// loaded into ADDRESS_DETAIL: a quarterly release carries edits up to shortly
+// before publication, so the newest created/modified date names its month
+// (the AUGUST 2026 release's newest edit is 2026-08-04, giving gnaf-2026-08).
+func releaseVersion(db *sql.DB) (string, error) {
+	var newest sql.NullString
+	if err := db.QueryRow(`
+		SELECT max(max(coalesce(date_last_modified, '')), max(coalesce(date_created, '')))
+		FROM ADDRESS_DETAIL`).Scan(&newest); err != nil {
+		return "", err
+	}
+	if len(newest.String) < 7 {
+		return "", fmt.Errorf("ADDRESS_DETAIL has no dates")
+	}
+	return "gnaf-" + newest.String[:7], nil
 }

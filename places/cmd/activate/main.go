@@ -11,6 +11,7 @@ package main
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
@@ -24,17 +25,13 @@ import (
 
 func main() {
 	newDB := flag.String("db", "data/vic.db.new", "new versioned dataset to activate")
-	version := flag.String("version", "", "dataset version label (e.g. gnaf-aug26+osm-vic-260914)")
+	version := flag.String("version", "", "expected dataset version (optional; the server checks it against the dataset's own)")
 	ctrlURL := flag.String("ctrl", "http://127.0.0.1:8080/ctrl/activate", "control endpoint")
 	flag.Parse()
 
-	if *version == "" {
-		log.Fatal("version is required (e.g. gnaf-aug26+osm-vic-260914)")
-	}
-
 	// R3.2: DatasetVersion is read from the open handle, never by stat'ing a
 	// path. Open the new file read-only and read the version from a query.
-	db, err := sql.Open("sqlite", *newDB)
+	db, err := sql.Open("sqlite", "file:"+*newDB+"?mode=ro")
 	if err != nil {
 		log.Fatalf("open new dataset: %v", err)
 	}
@@ -47,12 +44,26 @@ func main() {
 	if err := db.QueryRow(`SELECT count(*) FROM address`).Scan(&n); err != nil {
 		log.Fatalf("new dataset has no address table: %v", err)
 	}
-	fmt.Printf("new dataset opened: address rows=%d\n", n)
+	// The dataset carries its own version (buildaddr -version); the server
+	// rejects an activation whose requested version differs, so check here
+	// first and fail with a clear message.
+	var have string
+	if err := db.QueryRow(`SELECT dataset_version FROM address LIMIT 1`).Scan(&have); err != nil {
+		log.Fatalf("new dataset has no version: %v", err)
+	}
+	if *version != "" && *version != have {
+		log.Fatalf("dataset version is %q, not %q", have, *version)
+	}
+	fmt.Printf("new dataset opened: address rows=%d version=%s\n", n, have)
 
 	// Signal the running server. The control endpoint swaps the pool. The
 	// server must have the new file already on disk (it is, since we opened
 	// it). The server opens its own handle — we only signal.
-	body := fmt.Sprintf(`{"db":"%s","version":"%s"}`, *newDB, *version)
+	payload, err := json.Marshal(map[string]string{"db": *newDB, "version": have})
+	if err != nil {
+		log.Fatalf("encode request: %v", err)
+	}
+	body := string(payload)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, *ctrlURL, strings.NewReader(body))

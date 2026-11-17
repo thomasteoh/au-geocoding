@@ -22,6 +22,11 @@ func (r *Reader) ReadAll() ([]Locality, error) {
 	if _, err := r.shp.Seek(shpPos, io.SeekStart); err != nil {
 		return nil, fmt.Errorf("shp seek records: %w", err)
 	}
+	fi, err := r.shp.Stat()
+	if err != nil {
+		return nil, fmt.Errorf("shp stat: %w", err)
+	}
+	remaining := fi.Size() - shpPos
 	recNum := 0
 	for recNum < r.records {
 		// Read the 8-byte record header.
@@ -32,7 +37,14 @@ func (r *Reader) ReadAll() ([]Locality, error) {
 			}
 			return nil, fmt.Errorf("shp record %d header: %w", recNum, err)
 		}
-		contentLen := int(binary.BigEndian.Uint32(hdr[4:8])) * 2 // words -> bytes
+		contentLen := int64(binary.BigEndian.Uint32(hdr[4:8])) * 2 // words -> bytes
+		remaining -= 8
+		// The length is read from the file; a corrupt one must not drive a
+		// multi-gigabyte allocation.
+		if contentLen > remaining {
+			return nil, fmt.Errorf("shp record %d: content length %d exceeds the %d bytes left in the file", recNum, contentLen, remaining)
+		}
+		remaining -= contentLen
 		payload := make([]byte, contentLen)
 		if _, err := io.ReadFull(r.shp, payload); err != nil {
 			return nil, fmt.Errorf("shp record %d payload: %w", recNum, err)
@@ -80,6 +92,14 @@ func parsePolygon(p []byte) (Polygon, error) {
 	}
 	numParts := int(binary.LittleEndian.Uint32(p[36:40]))
 	numPoints := int(binary.LittleEndian.Uint32(p[40:44]))
+	// Both counts come from the file. Check them against the payload before
+	// allocating or indexing: a corrupt or truncated record would otherwise
+	// panic on a slice bound, or ask for gigabytes, instead of returning an
+	// error naming the record. Each part costs 4 bytes, each point 16.
+	if numParts < 0 || numPoints < 0 || numParts > (len(p)-44)/4 ||
+		numPoints > (len(p)-44-numParts*4)/16 {
+		return Polygon{}, fmt.Errorf("polygon counts exceed payload: %d parts, %d points in %d bytes", numParts, numPoints, len(p))
+	}
 	off := 44
 	parts := make([]int, numParts)
 	for i := 0; i < numParts; i++ {
